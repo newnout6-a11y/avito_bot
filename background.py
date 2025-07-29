@@ -1,19 +1,16 @@
-from flask import Flask
-from flask import request
-from threading import Thread
-import time
-import requests
+  # background.py
+  from flask import Flask
+  from threading import Thread
 
+  app = Flask(__name__)
 
-app = Flask('')
+  @app.get("/")
+  def home():
+      return "OK"
 
-@app.route('/')
-def home():
-  return "I'm alive"
+  def _run():
+      app.run(host="0.0.0.0", port=8080)
 
-def run():
-  app.run(host='0.0.0.0', port=80)
-
-def keep_alive():
-  t = Thread(target=run)
-  t.start()
+  def keep_alive():
+      t = Thread(target=_run, daemon=True)
+      t.start()
