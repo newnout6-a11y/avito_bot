@@ -33,11 +33,15 @@ router = Router(name="alert")
 def _load_bindings():
     """Безопасная загрузка привязок"""
     if not os.path.exists(BINDINGS_FILE):
+        logger.info(f"Файл привязок {BINDINGS_FILE} не существует")
         return {}
     try:
         with open(BINDINGS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f) or {}
-            return {str(k): int(v) for k, v in data.items()}
+            raw_data = json.load(f) or {}
+            logger.info(f"Сырые данные из файла: {raw_data}")
+            data = {str(k): int(v) for k, v in raw_data.items()}
+            logger.info(f"Обработанные привязки: {data}")
+            return data
     except Exception as e:
         logger.error(f"Ошибка загрузки привязок: {e}")
         return {}
@@ -83,6 +87,7 @@ async def start_cmd(m: types.Message):
         _save_bindings(data)
         
         logger.info(f"Создана привязка: main_user_id={main_user_id} -> alert_chat_id={m.chat.id}")
+        logger.info(f"Все привязки после сохранения: {data}")
         
         await m.answer(
             "✅ Привязка выполнена успешно!\n\n"
@@ -113,17 +118,26 @@ async def status_cmd(m: types.Message):
     """Проверить статус привязок"""
     try:
         data = _load_bindings()
+        logger.info(f"Загружены привязки: {data}")
+        logger.info(f"Текущий chat_id: {m.chat.id}")
+        
         # Ищем привязку для текущего chat_id
         found_bindings = []
         for main_user_id, alert_chat_id in data.items():
-            if alert_chat_id == m.chat.id:
+            logger.info(f"Проверяем: main_user_id={main_user_id}, alert_chat_id={alert_chat_id}, тип={type(alert_chat_id)}")
+            if int(alert_chat_id) == int(m.chat.id):
                 found_bindings.append(main_user_id)
         
         if found_bindings:
             bindings_text = "\n".join([f"• Main user ID: <code>{uid}</code>" for uid in found_bindings])
             await m.answer(f"✅ Активные привязки:\n{bindings_text}")
         else:
-            await m.answer("❌ Привязки не найдены")
+            # Показываем все привязки для отладки
+            if data:
+                debug_text = "\n".join([f"• {mid} -> {aid}" for mid, aid in data.items()])
+                await m.answer(f"❌ Привязки для вашего chat_id ({m.chat.id}) не найдены\n\nВсе привязки:\n{debug_text}")
+            else:
+                await m.answer("❌ Привязки не найдены (файл пустой)")
             
     except Exception as e:
         logger.error(f"Ошибка в status_cmd: {e}")
