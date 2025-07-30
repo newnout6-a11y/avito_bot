@@ -599,7 +599,7 @@ class Watcher:
                 if isinstance(href, list):
                     href = href[0] if href else ""
                     
-                url = ("https://www.avito.ru" + href) if href.startswith("/") else href
+                url = ("https://www.avito.ru" "+" href) if href.startswith("/") else href
                 
                 # ID объявления
                 m = re.search(r"/(\d{7,})", href)
