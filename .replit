@@ -30,3 +30,12 @@ mode = "sequential"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "python avito_monitor_bot.py"
+
+[[workflows.workflow]]
+name = "Run Alert Bot"
+author = 45692858
+mode = "sequential"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python alert_bot.py"

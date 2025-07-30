@@ -32,29 +32,84 @@ router = Router(name="alert")
 
 def _load_bindings():
     """Безопасная загрузка привязок"""
-    if not os.path.exists(BINDINGS_FILE):
-        logger.info(f"Файл привязок {BINDINGS_FILE} не существует")
-        return {}
     try:
+        if not os.path.exists(BINDINGS_FILE):
+            logger.info(f"Файл привязок {BINDINGS_FILE} не существует, создаем пустой")
+            # Создаем пустой файл
+            _save_bindings({})
+            return {}
+        
         with open(BINDINGS_FILE, "r", encoding="utf-8") as f:
-            raw_data = json.load(f) or {}
-            logger.info(f"Сырые данные из файла: {raw_data}")
-            data = {str(k): int(v) for k, v in raw_data.items()}
-            logger.info(f"Обработанные привязки: {data}")
+            content = f.read().strip()
+            if not content:
+                logger.info("Файл привязок пустой")
+                return {}
+            
+            raw_data = json.loads(content)
+            if not raw_data:
+                logger.info("Данные привязок пустые")
+                return {}
+                
+            # Конвертируем в правильный формат
+            data = {}
+            for k, v in raw_data.items():
+                try:
+                    data[str(k)] = int(v)
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Пропускаем некорректную запись {k}: {v}, ошибка: {e}")
+                    continue
+            
+            logger.info(f"Загружены привязки: {data}")
             return data
+            
     except Exception as e:
-        logger.error(f"Ошибка загрузки привязок: {e}")
+        logger.error(f"Критическая ошибка загрузки привязок: {e}")
         return {}
 
 def _save_bindings(data):
     """Безопасное сохранение привязок"""
     try:
-        os.makedirs(os.path.dirname(BINDINGS_FILE) or ".", exist_ok=True)
-        with open(BINDINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        logger.info(f"Привязки сохранены: {data}")
+        # Создаем директорию если нужно
+        dir_path = os.path.dirname(BINDINGS_FILE)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+        
+        # Конвертируем данные в правильный формат
+        save_data = {}
+        for k, v in data.items():
+            try:
+                save_data[str(k)] = int(v)
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Пропускаем некорректную запись при сохранении {k}: {v}, ошибка: {e}")
+                continue
+        
+        # Сохраняем с блокировкой
+        temp_file = BINDINGS_FILE + ".tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(save_data, f, ensure_ascii=False, indent=2)
+        
+        # Атомарно перемещаем временный файл
+        os.replace(temp_file, BINDINGS_FILE)
+        
+        logger.info(f"Привязки успешно сохранены: {save_data}")
+        
+        # Проверяем, что файл действительно сохранился
+        if os.path.exists(BINDINGS_FILE):
+            with open(BINDINGS_FILE, "r", encoding="utf-8") as f:
+                verify_data = json.load(f)
+                logger.info(f"Проверка сохранения: {verify_data}")
+        else:
+            logger.error("Файл не был создан!")
+            
     except Exception as e:
-        logger.error(f"Ошибка сохранения привязок: {e}")
+        logger.error(f"Критическая ошибка сохранения привязок: {e}")
+        # Удаляем временный файл если он остался
+        temp_file = BINDINGS_FILE + ".tmp"
+        if os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except:
+                pass
 
 @router.message(Command("start"))
 async def start_cmd(m: types.Message):
@@ -117,31 +172,62 @@ async def id_cmd(m: types.Message):
 async def status_cmd(m: types.Message):
     """Проверить статус привязок"""
     try:
+        # Детальная диагностика
+        logger.info(f"=== ДИАГНОСТИКА STATUS ===")
+        logger.info(f"Файл привязок: {BINDINGS_FILE}")
+        logger.info(f"Файл существует: {os.path.exists(BINDINGS_FILE)}")
+        
+        if os.path.exists(BINDINGS_FILE):
+            try:
+                with open(BINDINGS_FILE, "r", encoding="utf-8") as f:
+                    raw_content = f.read()
+                logger.info(f"Содержимое файла: '{raw_content}'")
+                logger.info(f"Размер файла: {len(raw_content)} символов")
+            except Exception as read_e:
+                logger.error(f"Ошибка чтения файла: {read_e}")
+        
         data = _load_bindings()
-        logger.info(f"Загружены привязки: {data}")
-        logger.info(f"Текущий chat_id: {m.chat.id}")
+        logger.info(f"Загружены привязки: {data} (тип: {type(data)})")
+        logger.info(f"Текущий chat_id: {m.chat.id} (тип: {type(m.chat.id)})")
         
         # Ищем привязку для текущего chat_id
         found_bindings = []
         for main_user_id, alert_chat_id in data.items():
-            logger.info(f"Проверяем: main_user_id={main_user_id}, alert_chat_id={alert_chat_id}, тип={type(alert_chat_id)}")
-            if int(alert_chat_id) == int(m.chat.id):
-                found_bindings.append(main_user_id)
+            logger.info(f"Проверяем: main_user_id={main_user_id} (тип: {type(main_user_id)}), alert_chat_id={alert_chat_id} (тип: {type(alert_chat_id)})")
+            try:
+                if int(alert_chat_id) == int(m.chat.id):
+                    found_bindings.append(main_user_id)
+                    logger.info(f"Найдено совпадение: {main_user_id}")
+            except Exception as comp_e:
+                logger.error(f"Ошибка сравнения для {main_user_id}->{alert_chat_id}: {comp_e}")
+        
+        logger.info(f"Найденные привязки: {found_bindings}")
         
         if found_bindings:
             bindings_text = "\n".join([f"• Main user ID: <code>{uid}</code>" for uid in found_bindings])
             await m.answer(f"✅ Активные привязки:\n{bindings_text}")
         else:
-            # Показываем все привязки для отладки
+            # Показываем детальную диагностику
+            status_lines = [
+                f"❌ Привязки для chat_id {m.chat.id} не найдены",
+                f"",
+                f"📋 Диагностика:",
+                f"• Файл существует: {os.path.exists(BINDINGS_FILE)}",
+                f"• Всего привязок: {len(data)}",
+            ]
+            
             if data:
-                debug_text = "\n".join([f"• {mid} -> {aid}" for mid, aid in data.items()])
-                await m.answer(f"❌ Привязки для вашего chat_id ({m.chat.id}) не найдены\n\nВсе привязки:\n{debug_text}")
+                status_lines.append(f"• Все привязки:")
+                for mid, aid in data.items():
+                    status_lines.append(f"  {mid} → {aid}")
             else:
-                await m.answer("❌ Привязки не найдены (файл пустой)")
+                status_lines.append(f"• Файл пустой или данные не загружены")
+            
+            await m.answer("\n".join(status_lines))
             
     except Exception as e:
-        logger.error(f"Ошибка в status_cmd: {e}")
-        await m.answer("Ошибка проверки статуса")
+        logger.error(f"Критическая ошибка в status_cmd: {e}")
+        await m.answer(f"Критическая ошибка проверки статуса: {e}")
 
 @router.message(F.text)
 async def echo(m: types.Message):
