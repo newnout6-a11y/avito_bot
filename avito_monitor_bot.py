@@ -1,16 +1,35 @@
 
-# avito_monitor_bot_full_v3_fix.py
 # -*- coding: utf-8 -*-
 """
-v3-fix: как v3, но:
-- экранирование HTML в сообщении для админа (имя/username), чтобы избежать "Unsupported start tag"
-- все многострочные тексты в одной строке с \n (устойчиво к редакторам на Windows)
+Avito Monitor Bot (aiogram 3.x)
+— v4.2 (stable)
+   • «Только свежие»: строгое окно FRESH_WINDOW_SEC (по умолчанию 180 сек)
+   • «С 0 минут после создания слота»: START_STRICT=1 — исключаем объявления,
+     опубликованные РАНЬШЕ времени создания подписки (sub.started_ts)
+   • Анти‑дубликат: per‑user (persisted) + глобальный (опция DEDUP_GLOBAL=1)
+   • Карточки как на скрине №3 (фото + аккуратная подпись)
+   • Экран «Поиски» — одно сообщение; «❌ Закрыть» гасит меню и FSM, не «перекидывает»
+   • «⚙️ Аккаунт» с кнопкой «Продлить» (ссылка SUPPORT_LINK) и списком истёкших ключей
+   • Ключи: срок исчисляется от МОМЕНТА АКТИВАЦИИ (а не выдачи)
+   • Часовой пояс показа дат: DISPLAY_TZ=Europe/Moscow (или DISPLAY_TZ_OFFSET_MIN=180)
+   • /diag и /test_alert (админ) для диагностики
 """
-import os, re, time, asyncio, html
+
+import os
+import re
+import time
+import asyncio
+import html
+import base64
+import json
+import aiohttp
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Deque, Callable
+from typing import Dict, List, Optional, Deque, Callable, cast, Any, Set
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse, urlunparse, parse_qs, parse_qsl, urlencode, unquote
+import uuid
+import logging
 
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.enums import ParseMode
@@ -19,23 +38,110 @@ from aiogram.filters import Command
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from dotenv import load_dotenv
-from background import keep_alive
+from bs4.element import Tag
+from bs4.element import Tag, PageElement, NavigableString
+from typing import Optional, Union
+from bs4 import BeautifulSoup  # type: ignore[reportMissingImports]
+from bs4.element import Tag, NavigableString, PageElement
 
 
-import aiohttp
-from bs4 import BeautifulSoup
+logger = logging.getLogger(__name__)
 
+try:
+    from zoneinfo import ZoneInfo  # py>=3.9
+except Exception:
+    ZoneInfo = None  # type: ignore
+
+try:
+    from dotenv import load_dotenv  # type: ignore
+except Exception:
+    def load_dotenv(*args, **kwargs):  # type: ignore
+        return None
+
+# keep-alive (Replit/Render). Если модуля нет — no-op.
+try:
+    from background import keep_alive  # type: ignore
+except Exception:
+    def keep_alive():  # type: ignore
+        return None
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# ===== ENV =====
 FRESH_WINDOW_SEC = int(os.getenv("FRESH_WINDOW_SEC", "180"))
-PRIME_ON_START = os.getenv("PRIME_ON_START", "1") == "1"
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+POLL_PERIOD_SEC = int(os.getenv("POLL_PERIOD_SEC", "60"))
+SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/Multiscan_service1")
+PRIME_ON_START = os.getenv("PRIME_ON_START", "0") == "1"
+START_STRICT = os.getenv("START_STRICT", "1") == "1"
+START_GRACE_SEC = int(os.getenv("START_GRACE_SEC", "5"))
+DISPLAY_TZ_NAME = os.getenv("DISPLAY_TZ", "Europe/Moscow")
+DISPLAY_TZ_OFFSET_MIN = int(os.getenv("DISPLAY_TZ_OFFSET_MIN", "180"))
+
+# ADMIN_CHAT_ID как int (или None)
+_ADMIN_STR = os.getenv("ADMIN_CHAT_ID")
+ADMIN_CHAT_ID: Optional[int] = int(_ADMIN_STR) if (_ADMIN_STR and _ADMIN_STR.lstrip("-").isdigit()) else None
+
+# ===== Настройки alert-бота =====
+ALERT_BOT_TOKEN   = os.getenv("ALERT_BOT_TOKEN")              # токен бота-оповещателя
+ALERT_BOT_USERNAME = os.getenv("ALERT_BOT_USERNAME", "")      # юзернейм бота-оповещателя без @
+BINDINGS_FILE     = os.getenv("BINDINGS_FILE", "user_bindings.json")  # привязки main_user_id -> alert_chat_id
+
+# ===== Файлы хранения =====
+KEYS_FILE = os.getenv("KEYS_FILE", "issued_keys.json")
+SENT_FILE = os.getenv("SENT_FILE", "sent_ads.json")           # { user_id: { ad_id: ts }, "_global": {...} }
+ACCOUNTS_FILE = os.getenv("ACCOUNTS_FILE", "accounts.json")   # учётка пользователя
+DEDUP_TTL_DAYS = int(os.getenv("DEDUP_TTL_DAYS", "14"))       # сколько хранить следы
+DEDUP_GLOBAL = os.getenv("DEDUP_GLOBAL", "1") == "1"          # глобальный антидубликат
+
+# ===== Регэксп ключа =====
+KEY_RE = re.compile(
+    r'^\s*(?:ключ\s*:\s*)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*$',
+    re.I
+)
+
+# ===== helpers =====
+def _tz():
+    if ZoneInfo:
+        try:
+            return ZoneInfo(DISPLAY_TZ_NAME)
+        except Exception:
+            pass
+    # fallback — фиксированный сдвиг
+    return timezone(timedelta(minutes=DISPLAY_TZ_OFFSET_MIN))
+
+def _fmt_dt(ts: Optional[float]) -> str:
+    if not ts:
+        return "—"
+    return datetime.fromtimestamp(float(ts), _tz()).strftime("%d.%m.%Y %H:%M:%S")
+
+# ==== LICENSE ====
+class LicenseManager:
+    def __init__(self):
+        self._expires: Dict[int, float] = {}  # user_id -> epoch_seconds (UTC)
+
+    def activate_for(self, user_id: int, hours: int = 24):
+        self._expires[user_id] = (time.time() + hours * 3600)
+
+    def activate_until(self, user_id: int, expires_ts: float):
+        self._expires[user_id] = float(expires_ts)
+
+    def is_active(self, user_id: int) -> bool:
+        ts = self._expires.get(user_id)
+        return (ts is not None) and (ts > time.time())
+
+    def expiry_dt(self, user_id: int) -> Optional[datetime]:
+        ts = self._expires.get(user_id)
+        return datetime.fromtimestamp(ts, _tz()) if ts else None
+
 
 @dataclass
 class SubscriberFilter:
-    keywords_all: List[str] = field(default_factory=list)
+    keywords_all: List[str] = field(default_factory=list)  # целевые
     keywords_any: List[str] = field(default_factory=list)
+    keywords_stop: List[str] = field(default_factory=list)  # СТОП-слова
     price_min: Optional[int] = None
     price_max: Optional[int] = None
+
 
 @dataclass
 class Subscription:
@@ -44,44 +150,88 @@ class Subscription:
     search_key: str
     url: str
     flt: SubscriberFilter = field(default_factory=SubscriberFilter)
+    name: Optional[str] = None            # название
+    only_new: bool = True                 # «только новые»
+    forward_chat_id: Optional[int] = None # не используется
+    started_ts: float = field(default_factory=lambda: time.time())  # точка отсечения «до создания слота»
+
 
 def _normalize_url(url: str) -> str:
-    from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
     u = urlparse(url.strip())
-    if not u.scheme: u = u._replace(scheme="https")
+    if not u.scheme:
+        u = u._replace(scheme="https")
     netloc = u.netloc or "www.avito.ru"
-    keep = {}
+    keep: Dict[str, str] = {}
     for k, v in parse_qsl(u.query, keep_blank_values=True):
-        if k.lower().startswith("utm_"): continue
+        if k.lower().startswith("utm_"):
+            continue
         keep[k] = v
     query = urlencode(sorted(keep.items()))
     u2 = u._replace(netloc=netloc, query=query)
     return urlunparse(u2)
 
+
 def search_key_from_url(url: str) -> str:
     return _normalize_url(url)
 
-_MONTHS_RU = {"января":1,"февраля":2,"марта":3,"апреля":4,"мая":5,"июня":6,"июля":7,"августа":8,"сентября":9,"октября":10,"ноября":11,"декабря":12}
-def _parse_avito_date(date_str: str):
-    if not date_str: return None
-    s = date_str.strip().lower(); now = datetime.now()
-    if "только что" in s: return now.timestamp()
-    m = re.search(r"(\d+)\s*минут", s)
-    if m: return (now - timedelta(minutes=int(m.group(1)))).timestamp()
-    if "минуту назад" in s: return (now - timedelta(minutes=1)).timestamp()
-    m = re.search(r"(\d+)\s*час", s)
-    if m: return (now - timedelta(hours=int(m.group(1)))).timestamp()
-    if "час назад" in s: return (now - timedelta(hours=1)).timestamp()
-    m = re.search(r"(сегодня|вчера)[,\s]+(\d{1,2}:\d{2})", s)
+
+def is_valid_avito_url(url: str) -> bool:
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    return bool(parsed.netloc) and parsed.netloc.endswith('avito.ru')
+
+
+def avito_short_url(full_url: str) -> str:
+    m = re.search(r"/(\\d{7,})", full_url)
     if m:
-        day = now.date() if m.group(1)=="сегодня" else (now - timedelta(days=1)).date()
+        return f"https://www.avito.ru/{m.group(1)}"
+    u = urlparse(full_url)
+    return urlunparse((u.scheme or "https", u.netloc or "www.avito.ru", u.path, "", "", ""))
+
+
+_MONTHS_RU = {
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+}
+
+
+def _parse_avito_date(date_str: str):
+    if not date_str:
+        return None
+    s = date_str.strip().lower()
+    now = datetime.now()
+    if "только что" in s:
+        return now.timestamp()
+    m = re.search(r"(\\d+)\\s*минут", s)
+    if m:
+        return (now - timedelta(minutes=int(m.group(1)))).timestamp()
+    if "минуту назад" in s:
+        return (now - timedelta(minutes=1)).timestamp()
+    m = re.search(r"(\\d+)\\s*час", s)
+    if m:
+        return (now - timedelta(hours=int(m.group(1)))).timestamp()
+    if "час назад" in s:
+        return (now - timedelta(hours=1)).timestamp()
+    m = re.search(r"(сегодня|вчера)[,\\s]+(\\d{1,2}:\\d{2})", s)
+    if m:
+        day = now.date() if m.group(1) == "сегодня" else (now - timedelta(days=1)).date()
         hh, mm = map(int, m.group(2).split(":"))
         return datetime(day.year, day.month, day.day, hh, mm).timestamp()
-    m = re.search(r"(\d{1,2})\s+([а-я]+)[,\s]+(\d{1,2}:\d{2})", s)
+    m = re.search(r"(\\d{1,2})\\s+([а-я]+)[,\\s]+(\\d{1,2}:\\d{2})", s)
     if m:
-        dd = int(m.group(1)); mon = _MONTHS_RU.get(m.group(2)); hh, mm = map(int, m.group(3).split(":"))
-        if mon: return datetime(datetime.now().year, mon, dd, hh, mm).timestamp()
+        dd = int(m.group(1))
+        mon = _MONTHS_RU.get(m.group(2))
+        hh, mm = map(int, m.group(3).split(":"))
+        if mon:
+            return datetime(datetime.now().year, mon, dd, hh, mm).timestamp()
+    m = re.search(r"(\\d{1,2})\\s+([а-я]+)$", s)
+    if m:
+        dd = int(m.group(1))
+        mon = _MONTHS_RU.get(m.group(2))
+        if mon:
+            return datetime(datetime.now().year, mon, dd, 0, 0).timestamp()
     return None
+
 
 @dataclass
 class Ad:
@@ -93,142 +243,466 @@ class Ad:
     date_str: str = ""
     published_ts: Optional[float] = None
     description: str = ""
+    image_url: Optional[str] = None
+    seller_name: Optional[str] = None
+    seller_id: Optional[str] = None
+    price_badge: Optional[str] = None
+    features: List[str] = field(default_factory=list)  # например: "Рассрочка"
+    views: Optional[int] = None
+    is_verified: bool = False
+
+
+def _attr_to_str(v: object) -> str:
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (list, tuple)) and v and isinstance(v[0], str):
+        return v[0]
+    return ""
+
+
+
+
+
+
+def _get_text(tag: Optional[Union[Tag, NavigableString, PageElement]]) -> str:
+    """
+    Безопасно извлекает текст из bs4-объекта или string-представления.
+    Если tag == None — возвращает пустую строку.
+    Если у объекта есть метод get_text — вызываем его.
+    Иначе приводим тег к строке.
+    """
+    if tag is None:
+        return ""
+    # если это BS4-элемент (Tag или NavigableString или PageElement), у которого есть get_text
+    if hasattr(tag, "get_text"):
+        try:
+            return tag.get_text(strip=True)
+        except Exception:
+            return ""
+    # во всех других случаях — просто str()
+    return str(tag)
+
+
+
+
+
+def try_extract_filters_from_url(url: str) -> SubscriberFilter:
+    flt = SubscriberFilter()
+    try:
+        u = urlparse(url)
+        qs = parse_qs(u.query)
+        if "q" in qs and qs["q"]:
+            qval = unquote(qs["q"][0]).strip()
+            words = [w for w in re.split(r"[,\s]+", qval) if w]
+            if words:
+                flt.keywords_all = words
+
+        fval = qs.get("f", [None])[0]
+        if fval:
+            s = fval.strip()
+            pad = '=' * ((4 - len(s) % 4) % 4)
+            raw = base64.urlsafe_b64decode(s + pad)
+            try:
+                j = json.loads(raw.decode("utf-8", errors="ignore"))
+                text_parts: List[str] = []
+                if isinstance(j, dict):
+                    def pick(obj, keys):
+                        for k in keys:
+                            v = obj.get(k)
+                            if isinstance(v, str) and v:
+                                text_parts.append(v)
+                    pick(j, ["brand", "model", "storage", "keyword", "q"])
+                    if "params" in j and isinstance(j["params"], list):
+                        for p in j["params"]:
+                            if isinstance(p, dict):
+                                pick(p, ["brand", "model", "storage", "value", "name"])
+                if text_parts:
+                    for token in text_parts:
+                        for w in re.split(r"[,\s/]+", str(token)):
+                            w = w.strip()
+                            if w and w.lower() not in [x.lower() for x in flt.keywords_all]:
+                                flt.keywords_all.append(w)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return flt
+
 
 class Watcher:
-    def __init__(self, search_key: str, url: str, bot: Bot, on_deliver=None):
-        self.search_key = search_key; self.url = url; self.bot = bot
-        self.subscribers: Dict[int, Subscription] = {}; self.task = None; self.seen: Dict[str, float] = {}
-        self.interval_min = 0.30; self.interval_max = 0.85; self._interval = 0.45
-        self._session: Optional[aiohttp.ClientSession] = None
+    def __init__(
+        self,
+        search_key: str,
+        url: str,
+        bot: Bot,
+        on_deliver: Optional[Callable[[int, Ad], None]] = None,
+    ):
+        self.search_key = search_key
+        self.url = url
+        self.bot = bot
+        self.subscribers: Dict[int, Subscription] = {}
+        self.task: Optional[asyncio.Task] = None
+        self.seen: Dict[str, float] = {}
+        self.interval_min = self.interval_max = self._interval = max(1.0, float(POLL_PERIOD_SEC))
+        self._session: Optional["aiohttp.ClientSession"] = None
         self.on_deliver = on_deliver
+        self._enrich_cache: set[str] = set()
+
 
     async def start(self):
-        if self.task and not self.task.done(): return
-        if PRIME_ON_START: await self._prime_seen(20)
+        if self.task and not self.task.done():
+            return
+        if PRIME_ON_START:
+            await self._prime_seen(20)
         self.task = asyncio.create_task(self._run(), name=f"watch:{self.search_key}")
 
     async def stop(self):
         if self.task:
             self.task.cancel()
-            try: await self.task
-            except asyncio.CancelledError: pass
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
             self.task = None
-        if self._session: await self._session.close(); self._session = None
+        if self._session:
+            await self._session.close()
+            self._session = None
 
-    def has_subscribers(self): return bool(self.subscribers)
-    def add_sub(self, sub: Subscription): self.subscribers[sub.user_id] = sub
-    def remove_sub(self, user_id: int): self.subscribers.pop(user_id, None)
+    def has_subscribers(self):
+        return bool(self.subscribers)
+
+    def add_sub(self, sub: Subscription):
+        self.subscribers[sub.user_id] = sub
+
+    def remove_sub(self, user_id: int):
+        self.subscribers.pop(user_id, None)
 
     async def _ensure_session(self):
-        if self._session and not self._session.closed: return self._session
-        self._session = aiohttp.ClientSession(); return self._session
+        import aiohttp
+        if self._session and not self._session.closed:
+            return self._session
+        self._session = aiohttp.ClientSession()
+        return self._session
+
+    def _fmt_price(self, v: Optional[int]) -> str:
+        if v is None:
+            return "—"
+        return f"{v:,}".replace(",", " ") + " ₽"
+
+    async def _enrich_ad_details(self, ad: Ad):
+        try:
+            import aiohttp
+            from bs4 import BeautifulSoup
+            session = await self._ensure_session()
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+                "Accept-Language": "ru,en;q=0.9",
+                "Cache-Control": "no-cache",
+            }
+            async with session.get(ad.url, headers=headers, timeout=aiohttp.ClientTimeout(total=7.5)) as r:
+                if r.status != 200:
+                    return
+                txt = await r.text()
+                soup = BeautifulSoup(txt, "html.parser")
+                name_pe = soup.find(attrs={"data-marker": "seller-info/name"}) or soup.find(attrs={"data-marker": "seller-link"})
+                if name_pe:
+                    ad.seller_name = _get_text(name_pe)
+                m = re.search(r'"ownerId"\\s*:\\s*"?(?P<id>\\d+)"?', txt)
+                if m:
+                    ad.seller_id = m.group("id")
+                for b in ["Ниже рынка", "Хорошая цена", "Рыночная цена", "Выше рынка"]:
+                    if b in txt:
+                        ad.price_badge = b
+                if "рассроч" in txt.lower():
+                    if "Рассрочка" not in ad.features:
+                        ad.features.append("Рассрочка")
+                
+                verified_tag = soup.find("span", {"data-marker": "verified"})
+                ad.is_verified = bool(verified_tag)
+                # extract views
+                views_tag = soup.find("span", {"data-marker": "total-views"})
+                if views_tag:
+                    vm = re.search(r"\d+", views_tag.get_text())
+                    if vm:
+                        try:
+                            ad.views = int(vm.group())
+                        except Exception:
+                            pass
+                # remember we've enriched this URL
+                self._enrich_cache.add(ad.url)
+
+        except Exception:
+            pass
+
+    def _build_caption(self, ad: Ad) -> str:
+        short = avito_short_url(ad.url)
+        lines = [f"<b>{html.escape(ad.title)}</b>", ""]
+        if ad.price is not None:
+            price_line = f"💸 <b>{self._fmt_price(ad.price)}</b>"
+            badge_parts: List[str] = []
+            if ad.price_badge:
+                badge_parts.append(f"✅ «{html.escape(ad.price_badge)}»")
+            if ad.features:
+                for f in ad.features:
+                    badge_parts.append(f"«{html.escape(f)}»")
+            if badge_parts:
+                price_line += " " + " ".join(badge_parts)
+            lines.append(price_line)
+        if ad.published_ts:
+            lines.append("🗓 " + _fmt_dt(ad.published_ts))
+        elif ad.date_str:
+            lines.append("🗓 " + html.escape(ad.date_str))
+        if ad.seller_name:
+            icon = "🏪" if "магазин" in ad.seller_name.lower() else "👤"
+            lines.append(f"{icon} {html.escape(ad.seller_name)}")
+        if ad.seller_id:
+            lines.append(f"🆔 {ad.seller_id}")
+        lines.append("")
+        lines.append(short)
+        return "\n".join(lines)
 
     async def _fetch(self):
+        import aiohttp
         session = await self._ensure_session()
-        headers = {"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36","Accept-Language":"ru,en;q=0.9","Cache-Control":"no-cache"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            "Accept-Language": "ru,en;q=0.9",
+            "Cache-Control": "no-cache",
+        }
         try:
-            async with session.get(self.url, headers=headers, timeout=aiohttp.ClientTimeout(total=2.5)) as r:
-                if r.status==200: return await r.text()
-        except Exception:
+            async with session.get(self.url, headers=headers, timeout=aiohttp.ClientTimeout(total=7.5)) as r:
+                if r.status == 200:
+                    return await r.text()
+        except Exception as e:
+            try:
+                if ADMIN_CHAT_ID is not None:
+                    await self.bot.send_message(ADMIN_CHAT_ID, f"Ошибка в Watcher: {e}")
+            except Exception:
+                pass
             return None
         return None
 
     async def _prime_seen(self, limit=20):
         html_text = await self._fetch()
-        if not html_text: return
-        for ad in self._parse_top(html_text, limit): self.seen[ad.ad_id] = time.time()
+        if not html_text:
+            return
+        for ad in self._parse_top(html_text, limit):
+            # помечаем всё, что было ДО старта, как seen
+            self.seen[ad.ad_id] = time.time()
 
     def _parse_top(self, html_text: str, limit=20):
+        from bs4 import BeautifulSoup
+        from bs4.element import Tag
         soup = BeautifulSoup(html_text, "html.parser")
-        root = soup.find("div", {"data-marker":"catalog-serp"})
-        if not root: return []
+        root_pe = soup.find("div", {"data-marker": "catalog-serp"})
+        if not isinstance(root_pe, Tag):
+            return []
+        root: Tag = cast(Tag, root_pe)
+        items_pe = root.select("div[data-marker='item']")[:limit]
+        items: List[Tag] = [cast(Tag, it) for it in items_pe if isinstance(it, Tag)]
+
         ads: List[Ad] = []
-        for item in root.find_all("div", {"data-marker":"item"}, limit=limit):
-            a = item.find("a", {"data-marker":"item-title"})
+        for item in items:
+            a_pe = item.find("a", {"data-marker": "item-title"})
+            a: Optional[Tag] = cast(Tag, a_pe) if isinstance(a_pe, Tag) else None
             if not a:
                 continue
+            href = _attr_to_str(a.get("href"))
+            url = ("https://www.avito.ru" + href) if href.startswith("/") else href
+            m = re.search(r"/(\\d{7,})", href or "")
+            ad_id = m.group(1) if m else url
+            title = _get_text(a)
 
-            href = a.get("href") or ""
-            url = ("https://www.avito.ru"+href) if href.startswith("/") else href
-            m = re.search(r"/(\d{7,})", href or ""); ad_id = (m.group(1) if m else url)
-            title = a.get_text(strip=True)
-            pr = item.find("meta", {"itemprop":"price"}); price = None
-            if pr and pr.get("content","").isdigit():
-                try: price = int(pr["content"])
-                except: price = None
-            date_tag = item.find("p", {"data-marker":"item-date"}); date_str = date_tag.get_text(strip=True) if date_tag else ""
+            price: Optional[int] = None
+            pr = item.find("meta", {"itemprop": "price"})
+            if isinstance(pr, Tag):
+                content = _attr_to_str(pr.get("content"))
+                if content.isdigit():
+                    try:
+                        price = int(content)
+                    except Exception:
+                        price = None
+
+            date_tag_pe = item.find("p", {"data-marker": "item-date"})
+            date_tag: Optional[Tag] = cast(Tag, date_tag_pe) if isinstance(date_tag_pe, Tag) else None
+            date_str = _get_text(date_tag)
             published_ts = _parse_avito_date(date_str)
-            geo_div = item.select_one("div[class^=geo-root-]"); location = geo_div.get_text(strip=True) if geo_div else ""
-            desc_meta = item.find("meta", {"itemprop":"description"}); description = desc_meta.get("content","").strip() if desc_meta else ""
-            ads.append(Ad(ad_id=ad_id, url=url, title=title, price=price, location=location, date_str=date_str, published_ts=published_ts, description=description))
+
+            geo_div_pe = item.select_one("div[class^=geo-root-]")
+            geo_div: Optional[Tag] = cast(Tag, geo_div_pe) if isinstance(geo_div_pe, Tag) else None
+            location = _get_text(geo_div)
+
+            desc_meta = item.find("meta", {"itemprop": "description"})
+            description = _attr_to_str(desc_meta.get("content")).strip() if isinstance(desc_meta, Tag) else ""
+
+            img_pe = item.find("img")
+            image_url = None
+            if isinstance(img_pe, Tag):
+                _src = _attr_to_str(img_pe.get("src")) or _attr_to_str(img_pe.get("data-src"))
+                if _src:
+                    image_url = ("https:" + _src) if _src.startswith("//") else _src
+
+            ads.append(Ad(
+                ad_id=ad_id, url=url, title=title, price=price,
+                location=location, date_str=date_str, published_ts=published_ts,
+                description=description, image_url=image_url
+            ))
         return ads
+
+    def _ad_text(self, ad: Ad) -> str:
+        return f"{ad.title}\n{ad.description}".lower()
 
     def _ad_passes_filters(self, ad: Ad, sub: Subscription) -> bool:
         flt = sub.flt
-        if flt.price_min is not None and (ad.price is None or ad.price < flt.price_min): return False
-        if flt.price_max is not None and (ad.price is None or ad.price > flt.price_max): return False
-        t = f"{ad.title}\n{ad.description}".lower()
-        return all(w.lower() in t for w in flt.keywords_all) if flt.keywords_all else True
+        t = self._ad_text(ad)
+        if flt.price_min is not None and (ad.price is None or ad.price < flt.price_min):
+            return False
+        if flt.price_max is not None and (ad.price is None or ad.price > flt.price_max):
+            return False
+        if flt.keywords_all and not all(w.lower() in t for w in flt.keywords_all):
+            return False
+        if flt.keywords_stop and any(w.lower() in t for w in flt.keywords_stop):
+            return False
+        return True
 
     def _bump_interval(self, found_new: bool):
-        self._interval = max(self.interval_min, self._interval*0.7) if found_new else min(self.interval_max, self._interval*1.1)
+        # фиксированный период опроса, но слегка адаптивный
+        self._interval = max(self.interval_min, self._interval * 0.85) if found_new else min(self.interval_max, self._interval * 1.05)
 
-    def _cleanup_seen(self, ttl=7*24*3600):
+    def _cleanup_seen(self, ttl=7 * 24 * 3600):
         now = time.time()
-        if len(self.seen)>20000:
+        # чистим карту seen и не даём бесконечно расти
+        if len(self.seen) > 20000:
             items = sorted(self.seen.items(), key=lambda kv: kv[1])
-            for k,_ in items[:len(items)//2]: self.seen.pop(k, None)
+            for k, _ in items[: len(self.seen) // 2]:
+                self.seen.pop(k, None)
         for k, ts in list(self.seen.items()):
-            if now - ts > ttl: self.seen.pop(k, None)
+            if now - ts > ttl:
+                self.seen.pop(k, None)
 
     async def _run(self):
+        app = cast(Any, self.bot).app
+        lic: "LicenseManager" = app.license
         while self.has_subscribers():
             found_new = False
             html_text = await self._fetch()
             if html_text:
-                for ad in self._parse_top(html_text, limit=12):
-                    if ad.ad_id in self.seen: continue
-                    now_ts = time.time()
-                    if ad.published_ts is not None and (now_ts - ad.published_ts) > FRESH_WINDOW_SEC:
-                        self.seen[ad.ad_id] = now_ts; continue
-                    self.seen[ad.ad_id] = now_ts
-                    for sub in list(self.subscribers.values()):
-                        if not self._ad_passes_filters(ad, sub): continue
-                        lines = [f"<b>{ad.title}</b>"]
-                        if ad.price is not None: lines.append(f"Цена: {ad.price} ₽")
-                        if ad.location: lines.append(f"Город: {ad.location}")
-                        if ad.date_str: lines.append(f"Дата: {ad.date_str}")
-                        if ad.description: lines.append("\n"+ad.description)
-                        lines.append(f"\n<a href='{ad.url}'>Открыть объявление</a>")
+                now_ts = time.time()
+                ads_list = []
+                try:
+                    ads_list = self._parse_top(html_text, limit=12)
+                except Exception as e:
+                    logger.exception("Ошибка парсинга Avito списка: %s", e)
+                    if ADMIN_CHAT_ID is not None:
                         try:
-                            await self.bot.send_message(sub.user_id, "\n".join(lines), disable_web_page_preview=True)
-                            found_new = True
-                            if self.on_deliver: self.on_deliver(sub.user_id, ad)
+                            await self.bot.send_message(ADMIN_CHAT_ID, f"Ошибка парсинга: {e}")
                         except Exception:
                             pass
-            self._cleanup_seen(); self._bump_interval(found_new); await asyncio.sleep(max(0.25, self._interval))
+                for ad in ads_list:
+                    if ad.ad_id in self.seen:
+                        continue
+
+                    delivered_any = False
+
+                    for sub in list(self.subscribers.values()):
+                        if not lic.is_active(sub.user_id):
+                            continue
+
+                        # «только новые» относительно текущего времени
+                        if sub.only_new and (ad.published_ts is None or (now_ts - ad.published_ts) > FRESH_WINDOW_SEC):
+                            continue
+
+                        # «после создания слота» (жёсткий отсев старых позиций)
+                        if START_STRICT and ad.published_ts is not None and ad.published_ts + START_GRACE_SEC < sub.started_ts:
+                            continue
+
+                        if not self._ad_passes_filters(ad, sub):
+                            continue
+
+                        # глобальный и персональный антидубликаты
+                        if app.sent_was_delivered(sub.user_id, ad.ad_id):
+                            continue
+                        if app.dedup_global_enabled() and app.sent_global_was_delivered(ad.ad_id):
+                            continue
+
+                        await self._enrich_ad_details(ad)
+                        caption = self._build_caption(ad)
+
+                        chat_id = app.get_alert_chat_id(sub.user_id)
+                        if chat_id and await app.send_to_alert(chat_id, caption, ad.image_url):
+                            if self.on_deliver:
+                                self.on_deliver(sub.user_id, ad)
+                            app.sent_mark(sub.user_id, ad.ad_id, now_ts)  # per-user
+                            if app.dedup_global_enabled():
+                                app.sent_global_mark(ad.ad_id, now_ts)     # глобально
+                            delivered_any = True
+                            found_new = True
+                        else:
+                            # один раз подсказываем про привязку alert-бота
+                            if app.missing_alert_hint_once(sub.user_id):
+                                link = app.alert_deeplink(sub.user_id)
+                                kb = types.InlineKeyboardMarkup(inline_keyboard=[
+                                    [types.InlineKeyboardButton(text="Подключить оповещения", url=link)]
+                                ])
+                                try:
+                                    await self.bot.send_message(sub.user_id,
+                                        "Чтобы получать объявления, подключите бота-оповещателя:",
+                                        reply_markup=kb, disable_web_page_preview=True)
+                                except Exception:
+                                    pass
+
+                    # помечаем объявление увиденным, если его получили хотя бы один подписчик
+                    if delivered_any:
+                        self.seen[ad.ad_id] = now_ts
+
+            self._cleanup_seen()
+            self._bump_interval(found_new)
+            await asyncio.sleep(max(0.25, self._interval))
+
 
 @dataclass
 class FeedItem:
-    ts: float; title: str; price: Optional[int]; url: str; date_str: str
+    ts: float
+    title: str
+    price: Optional[int]
+    url: str
+    date_str: str
+
 
 class WatcherManager:
     def __init__(self, bot: Bot):
-        self.bot = bot; self.watchers: Dict[str, Watcher] = {}; self.subs_by_user: Dict[int, List[Subscription]] = {}; self._sub_id_seq = 1
+        self.bot = bot
+        self.watchers: Dict[str, Watcher] = {}
+        self.subs_by_user: Dict[int, List[Subscription]] = {}
+        self._sub_id_seq = 1
         self.feed: Dict[int, Deque[FeedItem]] = {}
-    def list_user_subs(self, user_id: int): return self.subs_by_user.get(user_id, [])
-    def _next_sub_id(self): v=self._sub_id_seq; self._sub_id_seq+=1; return v
+
+    def list_user_subs(self, user_id: int):
+        return self.subs_by_user.get(user_id, [])
+
+    def _next_sub_id(self):
+        v = self._sub_id_seq
+        self._sub_id_seq += 1
+        return v
+
     def _on_deliver(self, user_id: int, ad: Ad):
         d = self.feed.setdefault(user_id, deque(maxlen=50))
         d.appendleft(FeedItem(ts=time.time(), title=ad.title, price=ad.price, url=ad.url, date_str=ad.date_str))
-    async def add_subscription(self, user_id: int, url: str, flt: Optional[SubscriberFilter]=None) -> Subscription:
-        if flt is None: flt = SubscriberFilter()
+
+    async def add_subscription(self, user_id: int, url: str, flt: Optional[SubscriberFilter] = None) -> Subscription:
+        if flt is None:
+            flt = SubscriberFilter()
         key = search_key_from_url(url)
         sub = Subscription(id=self._next_sub_id(), user_id=user_id, search_key=key, url=url, flt=flt)
         w = self.watchers.get(key)
         if not w:
-            w = Watcher(search_key=key, url=url, bot=self.bot, on_deliver=self._on_deliver); self.watchers[key]=w; await w.start()
-        w.add_sub(sub); self.subs_by_user.setdefault(user_id, []).append(sub); return sub
+            w = Watcher(search_key=key, url=url, bot=self.bot, on_deliver=self._on_deliver)
+            self.watchers[key] = w
+            await w.start()
+        w.add_sub(sub)
+        self.subs_by_user.setdefault(user_id, []).append(sub)
+        return sub
+
     async def remove_subscription(self, user_id: int, sub_id: int) -> bool:
         subs = self.subs_by_user.get(user_id, [])
         for i, sub in enumerate(subs):
@@ -236,276 +710,1002 @@ class WatcherManager:
                 w = self.watchers.get(sub.search_key)
                 if w:
                     w.remove_sub(user_id)
-                    if not w.has_subscribers(): await w.stop(); self.watchers.pop(sub.search_key, None)
-                subs.pop(i); return True
+                    if not w.has_subscribers():
+                        await w.stop()
+                        self.watchers.pop(sub.search_key, None)
+                subs.pop(i)
+                return True
         return False
+
+    def get_sub_by_id(self, user_id: int, sub_id: int) -> Optional[Subscription]:
+        for s in self.subs_by_user.get(user_id, []):
+            if s.id == sub_id:
+                return s
+        return None
+
     def recent_feed(self, user_id: int, limit=10) -> List[FeedItem]:
         return list(self.feed.get(user_id, deque()))[:limit]
 
+
+# === Главное меню — без «Лента», добавлен «⚙️ Аккаунт» ===
 MAIN_KB = types.ReplyKeyboardMarkup(
-    keyboard=[[types.KeyboardButton(text="📘 Инструкция"), types.KeyboardButton(text="🧭 Поиски")],
-              [types.KeyboardButton(text="🛟 Поддержка"), types.KeyboardButton(text="🗂 Лента")]],
-    resize_keyboard=True, is_persistent=True, input_field_placeholder="Выберите пункт меню…",
+    keyboard=[
+        [types.KeyboardButton(text="📘 Инструкция"), types.KeyboardButton(text="🧭 Поиски")],
+        [types.KeyboardButton(text="🛟 Поддержка"), types.KeyboardButton(text="⚙️ Аккаунт")],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Выберите пункт меню…",
 )
 
+
+# ===== Мастер добавления поиска =====
 class SearchWizard(StatesGroup):
-    region = State(); category = State(); keywords = State(); price_min = State(); price_max = State(); sort_date = State(); confirm = State()
+    url = State()
+    price_min = State()
+    price_max = State()
+    name = State()
+
 
 wizard_router = Router(name="wizard")
 
-@wizard_router.message(F.text.in_(["🧭 Поиски", "Поиски", "/newsearch"]))
+@wizard_router.message(F.text.in_(["/newsearch"]))
 async def wizard_start(message: types.Message, state: FSMContext):
-    await state.clear(); await state.set_state(SearchWizard.region)
-    kb = types.ReplyKeyboardMarkup(keyboard=[[types.KeyboardButton(text="moskva"), types.KeyboardButton(text="sankt-peterburg")],
-                                             [types.KeyboardButton(text="rossiya"), types.KeyboardButton(text="Другой регион")],
-                                             [types.KeyboardButton(text="Отмена")]], resize_keyboard=True)
-    await message.answer("Мастер поиска: выберите регион (slug Avito, например: <code>moskva</code>)\nМожно нажать готовую кнопку или ввести свой.\n\nНапишите <b>Отмена</b> чтобы выйти.", reply_markup=kb)
+    await state.clear()
+    await state.set_state(SearchWizard.url)
+    await message.answer(
+        "Шаг 1/3.\nПришлите ссылку с авито указав все фильтры на сайте  <a href='https://avito.ru'>Avito.ru</a>.\n\n"
+        "‼️ <b>Обязательно укажите максимальную цену</b> в фильтрах Авито (если неважна — 100000000).",
+        reply_markup=types.ReplyKeyboardRemove(),
+        disable_web_page_preview=True,
+    )
 
-@wizard_router.message(SearchWizard.region, F.text.casefold() == "отмена")
-async def wizard_cancel_r(message: types.Message, state: FSMContext):
-    await state.clear(); await message.answer("Мастер отменён.", reply_markup=MAIN_KB)
+@wizard_router.message(SearchWizard.url, F.text.casefold() == "отмена")
+@wizard_router.message(SearchWizard.url, F.text.casefold() == "назад")
+@wizard_router.message(SearchWizard.url, F.text.in_(["📘 Инструкция", "🛟 Поддержка", "🧭 Поиски", "⚙️ Аккаунт", "Аккаунт"]))
+async def wizard_cancel_from_url(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Мастер прерван. Вы в главном меню.", reply_markup=MAIN_KB)
 
-@wizard_router.message(SearchWizard.region)
-async def wizard_got_r(message: types.Message, state: FSMContext):
-    text = (message.text or "").strip()
-    if text.lower() == "другой регион":
-        await message.answer("Введите slug региона вручную (например, <code>ekaterinburg</code>):"); return
-    await state.update_data(region=text); await state.set_state(SearchWizard.category)
-    kb = types.ReplyKeyboardMarkup(keyboard=[[types.KeyboardButton(text="telefony"), types.KeyboardButton(text="bytovaya_tehnika")],
-                                             [types.KeyboardButton(text="kvartiry"), types.KeyboardButton(text="avtomobili")],
-                                             [types.KeyboardButton(text="Другая категория")], [types.KeyboardButton(text="Отмена")]], resize_keyboard=True)
-    await message.answer("Категория (slug Avito). Можно выбрать из быстрых вариантов или ввести свою.", reply_markup=kb)
-
-@wizard_router.message(SearchWizard.category, F.text.casefold() == "отмена")
-async def wizard_cancel_c(message: types.Message, state: FSMContext):
-    await state.clear(); await message.answer("Мастер отменён.", reply_markup=MAIN_KB)
-
-@wizard_router.message(SearchWizard.category)
-async def wizard_got_c(message: types.Message, state: FSMContext):
-    text = (message.text or "").strip()
-    if text.lower() == "другая категория":
-        await message.answer("Введите slug категории вручную (например, <code>telefony</code>):"); return
-    await state.update_data(category=text); await state.set_state(SearchWizard.keywords)
-    await message.answer("Ключевые слова (через запятую) или «-»:", reply_markup=types.ReplyKeyboardMarkup(keyboard=[[types.KeyboardButton(text="-")],[types.KeyboardButton(text="Отмена")]], resize_keyboard=True))
-
-@wizard_router.message(SearchWizard.keywords, F.text.casefold() == "отмена")
-async def wizard_cancel_k(message: types.Message, state: FSMContext):
-    await state.clear(); await message.answer("Мастер отменён.", reply_markup=MAIN_KB)
-
-@wizard_router.message(SearchWizard.keywords)
-async def wizard_got_k(message: types.Message, state: FSMContext):
+@wizard_router.message(SearchWizard.url)
+async def wizard_got_url(message: types.Message, state: FSMContext):
     raw = (message.text or "").strip()
-    kws = [] if raw == "-" else [w.strip() for w in raw.replace(";", ",").replace("|", ",").split(",") if w.strip()]
-    await state.update_data(keywords=kws); await state.set_state(SearchWizard.price_min)
-    await message.answer("Минимальная цена (или «-»):", reply_markup=types.ReplyKeyboardMarkup(keyboard=[[types.KeyboardButton(text="-")],[types.KeyboardButton(text="Отмена")]], resize_keyboard=True))
+    m = re.search(r"https?://\\S+", raw)
+    url_in = m.group(0) if m else raw
+    if not is_valid_avito_url(url_in):
+        await message.answer("Похоже, это не ссылка Авито. Вставьте корректный URL.")
+        return
+
+    url = search_key_from_url(url_in)
+    guessed = try_extract_filters_from_url(url)
+
+    await state.update_data(url=url, guessed_kw=guessed.keywords_all)
+    await state.set_state(SearchWizard.price_min)
+    kw_txt = f"\n\nНайдены ключевые слова: <code>{', '.join(guessed.keywords_all)}</code>" if guessed.keywords_all else ""
+    await message.answer(
+        "Шаг 2/3.\nМинимальная цена (или «-», если без минимума):" + kw_txt,
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="-")], [types.KeyboardButton(text="Отмена")]],
+            resize_keyboard=True
+        ),
+    )
 
 @wizard_router.message(SearchWizard.price_min, F.text.casefold() == "отмена")
 async def wizard_cancel_min(message: types.Message, state: FSMContext):
-    await state.clear(); await message.answer("Мастер отменён.", reply_markup=MAIN_KB)
+    await state.clear()
+    await message.answer("Мастер отменён.", reply_markup=MAIN_KB)
 
 @wizard_router.message(SearchWizard.price_min)
 async def wizard_got_min(message: types.Message, state: FSMContext):
-    txt = (message.text or "").strip(); pmin = None
+    txt = (message.text or "").strip()
+    pmin = None
     if txt != "-":
-        if not txt.isdigit(): await message.answer("Введите число или «-»."); return
+        if not txt.isdigit():
+            await message.answer("Введите число или «-».")
+            return
         pmin = int(txt)
-    await state.update_data(price_min=pmin); await state.set_state(SearchWizard.price_max)
-    await message.answer("Максимальная цена (или «-»):", reply_markup=types.ReplyKeyboardMarkup(keyboard=[[types.KeyboardButton(text="-")],[types.KeyboardButton(text="Отмена")]], resize_keyboard=True))
+    await state.update_data(price_min=pmin)
+    await state.set_state(SearchWizard.price_max)
+    await message.answer(
+        "Теперь <b>максимальная цена</b> (обязательно число):",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="100000000")], [types.KeyboardButton(text="Отмена")]],
+            resize_keyboard=True
+        ),
+    )
 
 @wizard_router.message(SearchWizard.price_max, F.text.casefold() == "отмена")
 async def wizard_cancel_max(message: types.Message, state: FSMContext):
-    await state.clear(); await message.answer("Мастер отменён.", reply_markup=MAIN_KB)
+    await state.clear()
+    await message.answer("Мастер отменён.", reply_markup=MAIN_KB)
 
 @wizard_router.message(SearchWizard.price_max)
 async def wizard_got_max(message: types.Message, state: FSMContext):
-    txt = (message.text or "").strip(); pmax = None
-    if txt != "-":
-        if not txt.isdigit(): await message.answer("Введите число или «-»."); return
-        pmax = int(txt)
-    await state.update_data(price_max=pmax); await state.set_state(SearchWizard.sort_date)
-    kb = types.ReplyKeyboardMarkup(keyboard=[[types.KeyboardButton(text="Да, сортировка по дате")],
-                                             [types.KeyboardButton(text="Нет, оставить как есть")],
-                                             [types.KeyboardButton(text="Отмена")]], resize_keyboard=True)
-    await message.answer("Добавить к ссылке сортировку «по дате»?", reply_markup=kb)
+    txt = (message.text or "").strip()
+    if not txt.isdigit():
+        await message.answer("Максимальная цена обязательна. Введите число, например 100000000.")
+        return
+    pmax = int(txt)
 
-@wizard_router.message(SearchWizard.sort_date, F.text.casefold() == "отмена")
-async def wizard_cancel_sort(message: types.Message, state: FSMContext):
-    await state.clear(); await message.answer("Мастер отменён.", reply_markup=MAIN_KB)
-
-@wizard_router.message(SearchWizard.sort_date)
-async def wizard_got_sort(message: types.Message, state: FSMContext):
-    sort = "date" if "да" in (message.text or "").lower() else "none"
-    await state.update_data(sort=sort)
     data = await state.get_data()
-    region = data.get("region") or "rossiya"; category = data.get("category") or ""
-    kws = data.get("keywords", []); pmin = data.get("price_min"); pmax = data.get("price_max"); sort = data.get("sort", "none")
-    from urllib.parse import urlencode
-    query = {}; 
-    if kws: query["q"] = " ".join(kws)
-    if sort == "date": query["s"] = "104"
-    url = f"https://www.avito.ru/{region}" + (f"/{category}" if category and category != "-" else "")
-    url += ("?" + urlencode(query)) if query else ""
-    parts = [f"<b>Регион:</b> {region}"]
-    if category and category != "-": parts.append(f"<b>Категория:</b> {category}")
-    if kws: parts.append(f"<b>Ключевые слова:</b> {', '.join(kws)}")
-    if pmin is not None: parts.append(f"<b>Мин. цена:</b> {pmin}")
-    if pmax is not None: parts.append(f"<b>Макс. цена:</b> {pmax}")
-    if sort == "date": parts.append("<b>Сортировка:</b> по дате")
-    parts.append(f"<b>URL:</b> {url}")
-    await state.set_state(SearchWizard.confirm)
-    await message.answer("\n".join(parts), reply_markup=types.ReplyKeyboardMarkup(keyboard=[[types.KeyboardButton(text="Создать"), types.KeyboardButton(text="Отмена")]], resize_keyboard=True), disable_web_page_preview=True)
+    url = data.get("url") or ""
+    pmin = data.get("price_min")
+    kw = data.get("guessed_kw") or []
 
-class SupportDialog(StatesGroup):
-    message = State()
+    await state.update_data(price_max=pmax)
 
+    summary = [
+        "<b>Проверим настройки:</b>",
+        f"• URL: {url}",
+        f"• Мин. цена: {pmin if pmin is not None else '—'}",
+        f"• Макс. цена: {pmax}",
+        f"• Слова: {', '.join(kw) if kw else '—'}",
+        "\nОтправьте название поиска (например «тест»).",
+    ]
+    await state.set_state(SearchWizard.name)
+    await message.answer("\n".join(summary), disable_web_page_preview=True)
+
+@wizard_router.message(SearchWizard.name, F.text.casefold() == "отмена")
+async def wizard_cancel_name(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Мастер отменён.", reply_markup=MAIN_KB)
+
+@wizard_router.message(SearchWizard.name)
+async def wizard_finish_create(message: types.Message, state: FSMContext):
+    lic: LicenseManager = cast(Any, message.bot).app.license
+    if not lic.is_active(message.chat.id):
+        await message.answer("Слот не активирован. Получите ключ у поддержки и отправьте его боту (формат «Ключ: xxxxx-…»).")
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    url = data.get("url") or ""
+    pmin = data.get("price_min")
+    pmax = data.get("price_max")
+    kw = data.get("guessed_kw") or []
+    name = (message.text or "").strip() or None
+
+    flt = SubscriberFilter(price_min=pmin, price_max=pmax, keywords_all=kw)
+    sub = await cast(Any, message.bot).app.manager.add_subscription(message.chat.id, url, flt)
+    sub.name = name
+
+    await state.clear()
+    await message.answer(
+        "Поиск создан ✅\n"
+        f"Название: <b>{html.escape(name or f'Поиск №{sub.id}')}</b>\n"
+        f"URL: {url}\n"
+        + (f"min={pmin} " if pmin is not None else "")
+        + (f"max={pmax} " if pmax is not None else "") + "\n\n"
+        "Как только появятся новые объявления — пришлю в бот-оповещателя.",
+        reply_markup=MAIN_KB,
+        disable_web_page_preview=True,
+    )
+
+
+# ===== Поддержка =====
 support_router = Router(name="support")
 
 @support_router.message(F.text.in_(["🛟 Поддержка", "Поддержка"]))
-async def support_start(message: types.Message, state: FSMContext):
-    if not ADMIN_CHAT_ID:
-        await message.answer("Поддержка не настроена. Администратор не указал ADMIN_CHAT_ID в .env"); return
-    await state.set_state(SupportDialog.message)
-    await message.answer("Опишите проблему одним или несколькими сообщениями. Я всё перешлю администратору.\nНапишите «Отмена» чтобы выйти.")
+async def support_info(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "По любым вопросам — техподдержка:\n👉 <a href='{}'>@Vladlmerr</a>".format(SUPPORT_LINK),
+        reply_markup=MAIN_KB,
+        disable_web_page_preview=True
+    )
 
-@support_router.message(SupportDialog.message, F.text.casefold() == "отмена")
-async def support_cancel(message: types.Message, state: FSMContext):
-    await state.clear(); await message.answer("Диалог с поддержкой завершён.", reply_markup=MAIN_KB)
 
-@support_router.message(SupportDialog.message)
-async def support_relay(message: types.Message, state: FSMContext):
+# ===== Экран «Поиски» =====
+def build_searches_kb(
+    subs: List[Subscription],
+    lic: LicenseManager,
+    user_id: int,
+) -> types.InlineKeyboardMarkup:
+    rows: List[List[types.InlineKeyboardButton]] = []
+    if lic.is_active(user_id) and not subs:
+        rows.append([types.InlineKeyboardButton(text="Свободный слот", callback_data="slot_new")])
+    for s in subs:
+        label = s.name or f"Поиск №{s.id}"
+        rows.append([types.InlineKeyboardButton(text=label, callback_data=f"open_sub:{s.id}")])
+    rows.append([types.InlineKeyboardButton(text="➕ Получить слот", callback_data="get_slot")])
+    rows.append([types.InlineKeyboardButton(text="❌ Закрыть", callback_data="close_menu")])
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+def format_sub_panel(sub: Subscription, lic: LicenseManager) -> str:
+    parts = [f"<b>{html.escape(sub.name or f'Подписка №{sub.id}')}</b>"]
+    exp = lic.expiry_dt(sub.user_id)
+    parts.append(f"\nКлюч: <code>{'активен' if lic.is_active(sub.user_id) else '—'}</code>")
+    if exp:
+        parts.append(f"Активен до: <b>{exp.strftime('%d.%m.%Y %H:%M:%S')}</b>")
+    if sub.flt.price_max is not None:
+        parts.append(f"\n💰 <b>Максимальная цена:</b> {sub.flt.price_max} ₽")
+    else:
+        parts.append("\n💰 <b>Максимальная цена:</b> не задана")
+    if sub.flt.keywords_stop:
+        parts.append(f"❌ <b>СТОП слова:</b> {', '.join(sub.flt.keywords_stop)}")
+    else:
+        parts.append("❌ <b>СТОП слова:</b> ")
+    if sub.flt.keywords_all:
+        parts.append(f"✅ <b>ЦЕЛЕВЫЕ слова:</b> {', '.join(sub.flt.keywords_all)}")
+    else:
+        parts.append("✅ <b>ЦЕЛЕВЫЕ слова:</b> ")
+    parts.append(f"\n🌐 <b>URL:</b> {sub.url}")
+    parts.append("\n<b>Продвинутые фильтры</b>")
+    parts.append(f"📦 Только новые: {'✅' if sub.only_new else '❌'}")
+    return "\n".join(parts)
+
+def build_sub_inline_kb(sub: Subscription) -> types.InlineKeyboardMarkup:
+    rid = sub.id
+    rows = [
+        [types.InlineKeyboardButton(text="💰 Максимальная цена", callback_data=f"sub:{rid}:max")],
+        [types.InlineKeyboardButton(text="❌ СТОП слова", callback_data=f"sub:{rid}:stop"),
+         types.InlineKeyboardButton(text="✅ ЦЕЛЕВЫЕ слова", callback_data=f"sub:{rid}:pos")],
+        [types.InlineKeyboardButton(text=f"📦 Только новые: {'✅' if sub.only_new else '❌'}",
+                                    callback_data=f"sub:{rid}:toggle_new")],
+        [types.InlineKeyboardButton(text="🗑 Удалить", callback_data=f"sub:{rid}:delete"),
+         types.InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_list")],
+    ]
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+class EditPrice(StatesGroup):
+    value = State()
+
+class EditWords(StatesGroup):
+    mode = State()
+    sub_id = State()
+    text = State()
+
+
+searches_router = Router(name="searches")
+
+@searches_router.message(F.text.in_(["🧭 Поиски", "Поиски"]))
+async def searches_screen(message: types.Message, state: FSMContext):
+    await state.clear()
+    app = cast(Any, message.bot).app
+    subs = app.manager.list_user_subs(message.chat.id)
+    kb = build_searches_kb(subs, app.license, message.chat.id)
+    await message.answer("Выберите поиск или получите новый слот:", reply_markup=kb)
+
+@searches_router.callback_query(F.data == "get_slot")
+async def cb_get_slot(cq: types.CallbackQuery):
+    if isinstance(cq.message, types.Message):
+        await cq.message.answer(
+            "Для покупки ключа или получения тестового доступа свяжитесь с\n"
+            f"👉 <a href='{SUPPORT_LINK}'>@Vladlmerr</a>\n\n"
+            "Когда получите ключ, отправьте его сюда (формат: <b>Ключ: xxxxx-…</b>).",
+            disable_web_page_preview=True
+        )
+    await cq.answer()
+
+@searches_router.callback_query(F.data == "slot_new")
+async def cb_slot_new(cq: types.CallbackQuery, state: FSMContext):
+    if not isinstance(cq.message, types.Message):
+        await cq.answer(); return
+    await state.clear()
+    await state.set_state(SearchWizard.url)
+    await cq.message.answer(
+        "Шаг 1/3. Пришлите ссылку категории с <a href='https://avito.ru'>Avito.ru</a>.\n\n"
+        "‼️ <b>Обязательно укажите максимальную цену</b> в фильтрах Авито (если неважна — 100000000).",
+        reply_markup=types.ReplyKeyboardRemove(),
+        disable_web_page_preview=True,
+    )
+    await cq.answer()
+
+@searches_router.callback_query(F.data == "close_menu")
+async def cb_close_menu(cq: types.CallbackQuery, state: FSMContext):
+    # закрываем меню и чистим состояние
+    await state.clear()
+    if isinstance(cq.message, types.Message):
+        try:
+            await cq.message.delete()
+        except Exception:
+            try:
+                await cq.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+    await cq.answer("Закрыто")
+
+@searches_router.callback_query(F.data == "back_to_list")
+async def cb_back_to_list(cq: types.CallbackQuery):
+    if isinstance(cq.message, types.Message):
+        app = cast(Any, cq.bot).app
+        subs = app.manager.list_user_subs(cq.from_user.id)
+        kb = build_searches_kb(subs, app.license, cq.from_user.id)
+        await cq.message.answer("Выберите поиск или получите новый слот:", reply_markup=kb)
+    await cq.answer()
+
+@searches_router.callback_query(F.data.startswith("open_sub:"))
+async def cb_open_sub(cq: types.CallbackQuery, state: FSMContext):
+    data_str: str = cq.data or ""
     try:
-        username = ("@"+message.from_user.username) if message.from_user and message.from_user.username else "username отсутствует"
-        fn = (message.from_user.first_name or "").strip() if message.from_user else ""
-        ln = (message.from_user.last_name or "").strip() if message.from_user else ""
-        full_name = (fn + (" " + ln if ln else "")).strip() or "Без имени"
-        safe_header = "📩 <b>Новое сообщение в поддержку</b>\nОт: " + html.escape(full_name) + " (" + html.escape(username) + ")"
-        await message.bot.send_message(int(ADMIN_CHAT_ID), safe_header, disable_web_page_preview=True)
-        await message.bot.copy_message(int(ADMIN_CHAT_ID), from_chat_id=message.chat.id, message_id=message.message_id)
-        await message.answer("✅ Отправлено в поддержку. Мы свяжемся с вами в личке, как только ответим.", reply_markup=MAIN_KB)
-        await state.clear()
+        sub_id = int(data_str.split(":", 1)[1])
     except Exception:
-        await message.answer("Не удалось отправить сообщение в поддержку. Попробуйте позже.", reply_markup=MAIN_KB)
-        await state.clear()
+        await cq.answer(); return
+    mng = cast(Any, cq.bot).app.manager
+    sub = mng.get_sub_by_id(cq.from_user.id, sub_id)
+    if not sub:
+        await cq.answer("Подписка не найдена", show_alert=True); return
+    if isinstance(cq.message, types.Message):
+        lic: LicenseManager = cast(Any, cq.bot).app.license
+        await cq.message.answer(format_sub_panel(sub, lic), reply_markup=build_sub_inline_kb(sub), disable_web_page_preview=True)
+    await cq.answer()
 
+@searches_router.callback_query(F.data.startswith("sub:"))
+async def cb_sub_actions(cq: types.CallbackQuery, state: FSMContext):
+    data_str: str = cq.data or ""
+    m = re.match(r"sub:(\\d+):(\\w+)", data_str)
+    if not m:
+        await cq.answer(); return
+    sub_id = int(m.group(1))
+    action = m.group(2)
+    mng = cast(Any, cq.bot).app.manager
+    sub = mng.get_sub_by_id(cq.from_user.id, sub_id)
+    if not sub:
+        await cq.answer("Подписка не найдена", show_alert=True); return
+
+    if action == "max":
+        await state.set_state(EditPrice.value)
+        await state.update_data(field="max", sub_id=sub.id)
+        if isinstance(cq.message, types.Message):
+            await cq.message.answer("Введите новую <b>максимальную</b> цену (число). Если не важна — укажите 100000000:")
+        await cq.answer(); return
+
+    if action in ("pos", "stop"):
+        await state.set_state(EditWords.text)
+        await state.update_data(mode=action, sub_id=sub.id)
+        if isinstance(cq.message, types.Message):
+            hint = "целевые" if action == "pos" else "СТОП"
+            curr = ", ".join(sub.flt.keywords_all if action == "pos" else sub.flt.keywords_stop) or "—"
+            await cq.message.answer(f"Отправьте {hint} слова через запятую.\nТекущие: <code>{curr}</code>")
+        await cq.answer(); return
+
+    if action == "toggle_new":
+        sub.only_new = not sub.only_new
+        if isinstance(cq.message, types.Message):
+            lic: LicenseManager = cast(Any, cq.bot).app.license
+            await cq.message.answer(format_sub_panel(sub, lic), reply_markup=build_sub_inline_kb(sub), disable_web_page_preview=True)
+        await cq.answer("Обновлено"); return
+
+    if action == "delete":
+        ok = await mng.remove_subscription(cq.from_user.id, sub.id)
+        if isinstance(cq.message, types.Message):
+            await cq.message.answer("Подписка удалена." if ok else "Не удалось удалить.")
+        await cq.answer(); return
+
+    await cq.answer()
+
+# ====== Применение изменений из FSM ======
+@searches_router.message(EditPrice.value)
+async def ui_edit_apply_max(m: types.Message, state: FSMContext):
+    data = await state.get_data()
+    field = data.get("field")
+    raw = data.get("sub_id")
+    if raw is None:
+        await state.clear()
+        await m.reply("Ошибка: нет идентификатора поиска.", reply_markup=MAIN_KB)
+        return
+    sub_id = int(raw)
+
+    txt = (m.text or "").strip()
+    mng = cast(Any, m.bot).app.manager
+    sub = mng.get_sub_by_id(m.chat.id, sub_id)
+    if not sub:
+        await state.clear()
+        await m.reply("Подписка не найдена.", reply_markup=MAIN_KB)
+        return
+    if field == "max":
+        if not txt.isdigit():
+            await m.reply("Максимальная цена должна быть числом, например 100000000.")
+            return
+        sub.flt.price_max = int(txt)
+    await state.clear()
+    lic: LicenseManager = cast(Any, m.bot).app.license
+    await m.reply("Готово.\n" + format_sub_panel(sub, lic), reply_markup=MAIN_KB, disable_web_page_preview=True)
+
+@searches_router.message(EditWords.text)
+async def ui_edit_words_apply(m: types.Message, state: FSMContext):
+    data = await state.get_data()
+    mode = (data.get("mode") or "pos")
+    raw = data.get("sub_id")
+    if raw is None:
+        await state.clear()
+        await m.reply("Ошибка: нет идентификатора поиска.", reply_markup=MAIN_KB)
+        return
+    sub_id = int(raw)
+
+    mng = cast(Any, m.bot).app.manager
+    sub = mng.get_sub_by_id(m.chat.id, sub_id)
+    if not sub:
+        await state.clear()
+        await m.reply("Подписка не найдена.", reply_markup=MAIN_KB)
+        return
+    words = [w.strip() for w in (m.text or "").replace(";", ",").split(",") if w.strip()]
+    if mode == "pos":
+        sub.flt.keywords_all = words
+    else:
+        sub.flt.keywords_stop = words
+    await state.clear()
+    lic: LicenseManager = cast(Any, m.bot).app.license
+    await m.reply("Обновлено.\n" + format_sub_panel(sub, lic), reply_markup=MAIN_KB, disable_web_page_preview=True)
+
+
+# ===== Приём ключа (устойчивый) =====
+key_router = Router(name="keys")
+
+async def _accept_key_impl(m: types.Message, state: FSMContext):
+    app = cast(Any, m.bot).app
+    lic: LicenseManager = app.license
+
+    txt = (m.text or "").strip()
+    m_uuid = KEY_RE.match(txt)
+    if not m_uuid:
+        return  # не ключ — передадим дальше другим хендлерам
+
+    key_value = m_uuid.group(1)
+    try:
+        uuid.UUID(key_value)
+    except Exception:
+        await m.reply("Ключ недействителен.")
+        return
+
+    res = app.redeem_key(key_value)
+    if not res:
+        await state.clear()
+        await m.reply("Ключ недействителен или уже использован.")
+        return
+
+    hours, expires_ts = res  # expires_ts формируется в момент активации!
+    logger.info(f"User {m.chat.id} activated key: {key_value}")
+    await state.clear()
+    lic.activate_until(m.chat.id, expires_ts)
+    exp_str = _fmt_dt(expires_ts)
+
+    # учёт аккаунта
+    app.account_register_if_needed(m.chat.id)
+    app.account_add_key(m.chat.id, key_value, hours, expires_ts)
+
+    # Кнопка для привязки alert-бота
+    deeplink = app.alert_deeplink(m.chat.id)
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [types.InlineKeyboardButton(text="Подключить оповещения (alert-бот)", url=deeplink)],
+            [types.InlineKeyboardButton(text="Создать поиск (Свободный слот)", callback_data="slot_new")],
+        ]
+    )
+
+    await m.reply(
+        f"Ключ принят ✅\nСлот активен до: <b>{exp_str}</b>\n\n"
+        "1) Нажмите кнопку ниже и запустите бота-оповещателя (для привязки).\n"
+        "2) Затем вернитесь и создайте поиск.",
+        disable_web_page_preview=True,
+        reply_markup=kb,
+    )
+
+@key_router.message(F.text.regexp(KEY_RE))
+async def accept_key_regexp(m: types.Message, state: FSMContext):
+    await _accept_key_impl(m, state)
+
+# Catch any text message and try to treat it as a key.
+# If the message does not match the key format we deliberately skip the handler
+# to allow other routers (e.g. "Поиски" and "Аккаунт" menu buttons) to process
+# the update. Without raising SkipHandler every text message was consumed here,
+# which broke the main menu buttons.
+from aiogram.dispatcher.event.bases import SkipHandler  # type: ignore
+
+
+
+@key_router.message(F.text)
+async def accept_key_fallback(m: types.Message, state: FSMContext):
+    """
+    Fallback handler for text messages in the key router.
+
+    If the incoming message looks like a license key it is processed by the
+    `_accept_key_impl` function. Otherwise the handler explicitly raises
+    `SkipHandler` so that the message can be handled by other routers (for
+    example, the searches or account menu buttons). This avoids capturing
+    unrelated messages and fixes the broken menu buttons.
+    """
+    # Normalize text
+    text = (m.text or "").strip()
+    # Process valid keys
+    if KEY_RE.match(text):
+        await _accept_key_impl(m, state)
+        return
+    # Skip all other messages so they fall through to subsequent handlers
+    raise SkipHandler()
+
+
+# ===== Аккаунт =====
+account_router = Router(name="account")
+
+def account_panel_text(app: Any, user_id: int) -> str:
+    lic: LicenseManager = app.license
+    acc = app.account_get(user_id)
+    subs = app.manager.list_user_subs(user_id)
+    exp_dt = lic.expiry_dt(user_id)
+
+    key_txt = "—"
+    if acc and acc.get("keys"):
+        # ищем актуальный ключ (с экспирацией в будущем)
+        now = time.time()
+        current = None
+        for k in sorted(acc["keys"], key=lambda x: x.get("activated", 0), reverse=True):
+            if float(k.get("expires", 0) or 0) > now:
+                current = k; break
+        if not current:
+            # нет активного — возьмём последний выданный
+            current = sorted(acc["keys"], key=lambda x: x.get("activated", 0), reverse=True)[0]
+        key_txt = current.get("key", "—")[:36]
+
+    lines = [
+        "<b>Аккаунт</b>",
+        f"👤 <b>ID:</b> <code>{user_id}</code>",
+        f"📅 <b>Дата регистрации:</b> {_fmt_dt((acc or {}).get('registered')) if acc else '—'}",
+        "",
+        f"🔑 <b>Ключ:</b> <code>{key_txt}</code>",
+        f"⏳ <b>Действителен до:</b> {exp_dt.strftime('%d.%m.%Y %H:%M:%S') if exp_dt else '—'}",
+        f"🧭 <b>Поисков:</b> {len(subs) if subs else 0}" + ("" if subs else " (не создан)"),
+    ]
+    return "\n".join(lines)
+
+def build_account_kb() -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [types.InlineKeyboardButton(text="Показать истекшие ключи", callback_data="account:expired")],
+            [types.InlineKeyboardButton(text="Продлить", url=SUPPORT_LINK)],
+            [types.InlineKeyboardButton(text="❌ Закрыть", callback_data="account:close")],
+        ]
+    )
+
+@account_router.message(F.text.in_(["⚙️ Аккаунт", "Аккаунт", "/account"]))
+async def account_show(m: types.Message, state: FSMContext):
+    app = cast(Any, m.bot).app
+    app.account_register_if_needed(m.chat.id)
+    txt = account_panel_text(app, m.chat.id)
+    await m.answer(txt, reply_markup=MAIN_KB)
+    await m.answer(" ", reply_markup=build_account_kb())
+
+@account_router.callback_query(F.data == "account:close")
+async def account_close(cq: types.CallbackQuery):
+    if isinstance(cq.message, types.Message):
+        try:
+            await cq.message.delete()
+        except Exception:
+            pass
+    await cq.answer()
+
+@account_router.callback_query(F.data == "account:expired")
+async def account_expired(cq: types.CallbackQuery):
+    app = cast(Any, cq.bot).app
+    acc = app.account_get(cq.from_user.id) or {}
+    items = []
+    now = time.time()
+    for k in (acc.get("keys") or []):
+        exp_ts = float(k.get("expires") or 0)
+        if exp_ts and exp_ts < now:
+            items.append(f"• <code>{k.get('key','')}</code> — истёк {_fmt_dt(exp_ts)}")
+    text = "Истёкших ключей не найдено." if not items else "<b>Истёкшие ключи:</b>\n" + "\n".join(items)
+    if isinstance(cq.message, types.Message):
+        await cq.message.answer(text)
+    await cq.answer()
+
+
+# ===== Главное приложение =====
 class App:
     def __init__(self, token: str):
         self.bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        cast(Any, self.bot).app = self
         self.dp = Dispatcher(storage=MemoryStorage())
         self.manager = WatcherManager(self.bot)
+        self.license = LicenseManager()
+
+        # alert
+        self.alert_token: Optional[str] = ALERT_BOT_TOKEN
+        self.alert_username: str = ALERT_BOT_USERNAME
+        self.bindings_file: str = BINDINGS_FILE
+        self._alert_warned: Set[int] = set()  # чтобы не спамить подсказкой
+
+        # storage
+        self.keys_file: str = KEYS_FILE
+        self.sent_file: str = SENT_FILE
+        self.accounts_file: str = ACCOUNTS_FILE
+
         self._register()
 
-    async def setup_menu(self):
-        await self.bot.set_my_commands([
-            types.BotCommand(command="start", description="Начать работу"),
-            types.BotCommand(command="add", description="Добавить ссылку для мониторинга"),
-            types.BotCommand(command="list", description="Список ваших подписок"),
-            types.BotCommand(command="remove", description="Удалить подписку по ID"),
-            types.BotCommand(command="feed", description="Лента присланных объявлений"),
-            types.BotCommand(command="newsearch", description="Мастер подбора фильтров"),
-        ])
+    # ===== работа с привязками main_user_id -> alert_chat_id
+    def _load_bindings(self) -> Dict[str, int]:
+        if not os.path.exists(self.bindings_file):
+            return {}
+        try:
+            with open(self.bindings_file, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+                return {str(k): int(v) for k, v in data.items()}
+        except Exception:
+            return {}
+
+    def _save_bindings(self, data: Dict[str, int]) -> None:
+        os.makedirs(os.path.dirname(self.bindings_file) or ".", exist_ok=True)
+        with open(self.bindings_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def get_alert_chat_id(self, main_user_id: int) -> Optional[int]:
+        b = self._load_bindings()
+        val = b.get(str(main_user_id))
+        return int(val) if val else None
+
+    def alert_deeplink(self, main_user_id: int) -> str:
+        uname = self.alert_username or "<УКАЖИТЕ_ALERT_BOT_USERNAME>"
+        return f"https://t.me/{uname}?start={main_user_id}"
+
+    def missing_alert_hint_once(self, user_id: int) -> bool:
+        if user_id in self._alert_warned:
+            return False
+        self._alert_warned.add(user_id)
+        return True
+
+    async def send_to_alert(self, alert_chat_id: int, caption: str, image_url: Optional[str]) -> bool:
+        """Отправка в alert-бота через его Bot API."""
+        if not self.alert_token:
+            return False
+        import aiohttp
+        api = f"https://api.telegram.org/bot{self.alert_token}"
+        try:
+            async with aiohttp.ClientSession() as s:
+                if image_url:
+                    form = aiohttp.FormData()
+                    form.add_field("chat_id", str(alert_chat_id))
+                    form.add_field("caption", caption)
+                    form.add_field("parse_mode", "HTML")
+                    form.add_field("photo", image_url)
+                    async with s.post(f"{api}/sendPhoto", data=form, timeout=10) as r:
+                        return (r.status == 200)
+                else:
+                    payload = {"chat_id": alert_chat_id, "text": caption, "parse_mode": "HTML", "disable_web_page_preview": True}
+                    async with s.post(f"{api}/sendMessage", json=payload, timeout=10) as r:
+                        return (r.status == 200)
+        except Exception:
+            return False
+
+    # ===== ключи =====
+    def _load_keys(self) -> Dict[str, Dict[str, Any]]:
+        if not os.path.exists(self.keys_file):
+            return {}
+        try:
+            with open(self.keys_file, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+                return {str(k): dict(v) for k, v in data.items()}
+        except Exception:
+            return {}
+
+    def _save_keys(self, data: Dict[str, Dict[str, Any]]) -> None:
+        os.makedirs(os.path.dirname(self.keys_file) or ".", exist_ok=True)
+        with open(self.keys_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def issue_key(self, hours: int = 24, uses: int = 1) -> str:
+        data = self._load_keys()
+        k = str(uuid.uuid4())
+        data[k] = {"hours": int(hours), "uses_left": int(uses), "created": time.time()}
+        self._save_keys(data)
+        return k
+
+    def redeem_key(self, key: str) -> Optional[tuple[int, float]]:
+        """
+        Возвращает (hours, expires_ts). ВАЖНО: expires_ts формируется в МОМЕНТ АКТИВАЦИИ,
+        то есть ровно «сейчас + hours*3600», независимо от времени выдачи ключа.
+        """
+        data = self._load_keys()
+        rec = data.get(key)
+        if not rec:
+            return None
+        left = int(rec.get("uses_left", 0))
+        if left <= 0:
+            return None
+        hours = int(rec.get("hours", 24))
+        expires_ts = time.time() + hours * 3600  # ← ключ действует 24ч С МОМЕНТА АКТИВАЦИИ
+        rec["uses_left"] = left - 1
+        data[key] = rec
+        self._save_keys(data)
+        return hours, float(expires_ts)
+
+    # ===== антидубликаты per-user + global =====
+    def _load_sent(self) -> Dict[str, Dict[str, float]]:
+        if not os.path.exists(self.sent_file):
+            return {}
+        try:
+            with open(self.sent_file, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+                out: Dict[str, Dict[str, float]] = {}
+                for uk, mp in data.items():
+                    if isinstance(mp, dict):
+                        out[str(uk)] = {str(aid): float(ts) for aid, ts in mp.items()}
+                return out
+        except Exception:
+            return {}
+
+    def _save_sent(self, data: Dict[str, Dict[str, float]]) -> None:
+        os.makedirs(os.path.dirname(self.sent_file) or ".", exist_ok=True)
+        with open(self.sent_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _cleanup_sent_locked(self, data: Dict[str, Dict[str, float]]) -> None:
+        cutoff = time.time() - DEDUP_TTL_DAYS * 86400
+        for uk in list(data.keys()):
+            inner = data.get(uk, {})
+            for ad_id in list(inner.keys()):
+                if inner[ad_id] < cutoff:
+                    del inner[ad_id]
+            if not inner:
+                del data[uk]
+
+    def sent_was_delivered(self, user_id: int, ad_id: str) -> bool:
+        data = self._load_sent()
+        inner = data.get(str(user_id), {})
+        return ad_id in inner
+
+    def sent_mark(self, user_id: int, ad_id: str, ts: Optional[float] = None) -> None:
+        data = self._load_sent()
+        inner = data.setdefault(str(user_id), {})
+        inner[ad_id] = float(ts or time.time())
+        self._cleanup_sent_locked(data)
+        self._save_sent(data)
+
+    def dedup_global_enabled(self) -> bool:
+        return DEDUP_GLOBAL
+
+    def sent_global_was_delivered(self, ad_id: str) -> bool:
+        data = self._load_sent()
+        inner = data.get("_global", {})
+        return ad_id in inner
+
+    def sent_global_mark(self, ad_id: str, ts: Optional[float] = None) -> None:
+        data = self._load_sent()
+        inner = data.setdefault("_global", {})
+        inner[ad_id] = float(ts or time.time())
+        self._cleanup_sent_locked(data)
+        self._save_sent(data)
+
+    # ===== аккаунты =====
+    def _load_accounts(self) -> Dict[str, Dict[str, Any]]:
+        if not os.path.exists(self.accounts_file):
+            return {}
+        try:
+            with open(self.accounts_file, "r", encoding="utf-8") as f:
+                return json.load(f) or {}
+        except Exception:
+            return {}
+
+    def _save_accounts(self, data: Dict[str, Dict[str, Any]]) -> None:
+        os.makedirs(os.path.dirname(self.accounts_file) or ".", exist_ok=True)
+        with open(self.accounts_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def account_register_if_needed(self, user_id: int) -> None:
+        data = self._load_accounts()
+        u = data.get(str(user_id))
+        if not u:
+            data[str(user_id)] = {"registered": time.time(), "keys": []}
+            self._save_accounts(data)
+
+    def account_add_key(self, user_id: int, key_value: str, hours: int, exp_ts: Optional[float]):
+        data = self._load_accounts()
+        u = data.setdefault(str(user_id), {"registered": time.time(), "keys": []})
+        u.setdefault("keys", []).append({
+            "key": key_value,
+            "activated": time.time(),
+            "hours": int(hours),
+            "expires": float(exp_ts or 0.0),
+        })
+        self._save_accounts(data)
+
+    def account_get(self, user_id: int) -> Optional[Dict[str, Any]]:
+        return self._load_accounts().get(str(user_id))
 
     def _register(self):
-        self.dp.include_router(wizard_router); self.dp.include_router(support_router)
+        self.dp.include_router(wizard_router)
+        self.dp.include_router(support_router)
+        self.dp.include_router(searches_router)
+        self.dp.include_router(key_router)
+        self.dp.include_router(account_router)
+
+        @self.dp.message(Command("test_alert"))
+        async def test_alert(m: types.Message):
+            if ADMIN_CHAT_ID is None or m.chat.id != ADMIN_CHAT_ID:
+                await m.reply("Команда доступна только админу."); return
+            chat_id = self.get_alert_chat_id(m.chat.id)
+            if not chat_id:
+                await m.reply("Alert binding не найден. Нажмите кнопку привязки после активации ключа."); return
+            ok = await self.send_to_alert(chat_id, "Тестовое сообщение из основного бота ✅", None)
+            await m.reply("Отправлено." if ok else "Не удалось отправить (проверь токен ALERT_BOT_TOKEN и привязку).")
+
+        @self.dp.message(F.text == "Назад")
+        async def back_btn(m: types.Message, state: FSMContext):
+            await state.clear()
+            await m.answer("Главное меню.", reply_markup=MAIN_KB)
+
+        @self.dp.message(F.text.in_(["📘 Инструкция", "Инструкция", "/help"]))
+        async def help_cmd(m: types.Message):
+            self.account_register_if_needed(m.chat.id)
+            await m.answer(
+                "📘 <b>Инструкция</b>\n"
+                "1) Получите ключ у поддержки.\n"
+                "2) Отправьте: <code>Ключ: xxxxx-…</code> — активируется слот.\n"
+                "3) Подключите alert-бота по кнопке в ответе на ключ.\n"
+                "4) Создайте поиск (Свободный слот) — объявления придут в alert-бот.",
+                reply_markup=MAIN_KB,
+                disable_web_page_preview=True
+            )
 
         @self.dp.message(Command("start"))
         async def start_cmd(m: types.Message):
-            await m.answer("Я пришлю вам <b>только что опубликованные</b> объявления по вашим фильтрам.\n\n• Быстрый старт: <code>/add https://www.avito.ru/...</code>\n• Мастер: <code>/newsearch</code> или кнопка «🧭 Поиски»\n• Смотреть, что пришло: <code>/feed</code> или кнопка «🗂 Лента»", reply_markup=MAIN_KB, disable_web_page_preview=True)
+            self.account_register_if_needed(m.chat.id)
+            await m.answer(
+                "Я пришлю вам <b>только что опубликованные</b> объявления по вашим фильтрам.\n\n"
+                "• Активируйте доступ: отправьте ключ (формат «Ключ: …»)\n"
+                "• Подключите бота-оповещателя по кнопке в ответе на ключ\n"
+                "• Мастер: <code>/newsearch</code>\n"
+                "• Экран слотов: «🧭 Поиски»\n"
+                "• Аккаунт: «⚙️ Аккаунт»",
+                reply_markup=MAIN_KB,
+                disable_web_page_preview=True,
+            )
 
         @self.dp.message(Command("add"))
         async def add_cmd(m: types.Message):
-            txt = (m.text or ""); parts = txt.split(maxsplit=2)
+            self.account_register_if_needed(m.chat.id)
+            lic: LicenseManager = self.license
+            if not lic.is_active(m.chat.id):
+                await m.reply("Слот не активирован. Получите ключ у поддержки и отправьте его боту (формат «Ключ: …»).")
+                return
+            txt = (m.text or "")
+            parts = txt.split(maxsplit=2)
             if len(parts) < 2:
-                await m.reply("Укажите ссылку после /add. Пример:\n/add https://www.avito.ru/... kw=iphone,min=10000"); return
-            url = parts[1].strip(); params = parts[2].strip() if len(parts) >= 3 else ""
-            flt = SubscriberFilter()
+                await m.reply("Укажите ссылку после /add. Пример:\n/add https://www.avito.ru/... max=100000000,min=10000")
+                return
+            url = parts[1].strip()
+            params = parts[2].strip() if len(parts) >= 3 else ""
+            flt = try_extract_filters_from_url(url)
             if params:
                 p = params.replace(" ", "")
                 for token in p.split(","):
-                    if not token: continue
+                    if not token:
+                        continue
                     if token.startswith("kw="):
                         kws = token[3:].replace(";", ",").replace("|", ",")
                         flt.keywords_all = [w for w in kws.split(",") if w]
                     elif token.startswith("min="):
-                        try: flt.price_min = int(token[4:])
-                        except: pass
+                        try:
+                            flt.price_min = int(token[4:])
+                        except Exception:
+                            pass
                     elif token.startswith("max="):
-                        try: flt.price_max = int(token[4:])
-                        except: pass
+                        try:
+                            flt.price_max = int(token[4:])
+                        except Exception:
+                            pass
+            if flt.price_max is None:
+                await m.reply("⚠️ Укажите максимальную цену (параметр <code>max=</code>) или воспользуйтесь мастером «/newsearch».")
+                return
             sub = await self.manager.add_subscription(m.chat.id, url, flt)
-            await m.reply(f"Подписка добавлена: <b>{sub.id}</b>\nСсылка: {sub.url}\nПодсказка: нажмите «🗂 Лента», чтобы посмотреть, что уже пришло по вашим фильтрам.")
+            await m.reply(
+                f"Подписка добавлена: <b>{sub.id}</b>\nСсылка: {url}\n"
+                "Карточки будут приходить в бот-оповещатель."
+            )
 
         @self.dp.message(Command("list"))
         async def list_cmd(m: types.Message):
+            self.account_register_if_needed(m.chat.id)
             subs = self.manager.list_user_subs(m.chat.id)
-            if not subs: await m.reply("У вас нет активных подписок."); return
+            if not subs:
+                await m.reply("У вас нет активных подписок."); return
             lines = ["Ваши подписки:"]
             for s in subs:
                 desc = []
+                if s.name: desc.append(f"name={s.name}")
                 if s.flt.keywords_all: desc.append(f"kw={','.join(s.flt.keywords_all)}")
+                if s.flt.keywords_stop: desc.append(f"stop={','.join(s.flt.keywords_stop)}")
                 if s.flt.price_min is not None: desc.append(f"min={s.flt.price_min}")
                 if s.flt.price_max is not None: desc.append(f"max={s.flt.price_max}")
-                lines.append(f"{s.id}: {s.url} " + (f"({'; '.join(desc)})" if desc else ""))
-            lines.append("\nПодсказка: /feed — последние присланные карточки.")
+                lines.append(f"{s.id}: {s.url} " + (f"({' ; '.join(desc)})" if desc else ""))
+            lines.append("\nПодсказка: карточки приходят в бот-оповещатель после привязки.")
             await m.reply("\n".join(lines), disable_web_page_preview=True)
 
         @self.dp.message(Command("remove"))
+
         async def remove_cmd(m: types.Message):
+            self.account_register_if_needed(m.chat.id)
             parts = (m.text or "").split(maxsplit=1)
             if len(parts) < 2 or not parts[1].strip().isdigit():
                 await m.reply("Укажите ID: /remove 3"); return
             ok = await self.manager.remove_subscription(m.chat.id, int(parts[1].strip()))
             await m.reply("Удалено." if ok else "Подписка не найдена.")
 
-        @self.dp.message(Command("feed"))
-        async def feed_cmd(m: types.Message):
-            items = self.manager.recent_feed(m.chat.id, limit=10)
-            if not items:
-                await m.reply("Пока в ленте пусто. Как только появятся новые — они будут здесь."); return
-            lines = ["🗂 Последние присланные объявления:"]
-            for it in items:
-                price_txt = f"{it.price} ₽" if it.price is not None else "—"
-                dt = datetime.fromtimestamp(it.ts).strftime("%H:%M:%S")
-                lines.append(f"• {it.title} — {price_txt} — {dt}\n{it.url}")
+        @self.dp.message(Command("genkey"))
+        async def genkey_cmd(m: types.Message):
+            if ADMIN_CHAT_ID is None or m.chat.id != ADMIN_CHAT_ID:
+                await m.reply("Команда доступна только админу."); return
+            parts = (m.text or "").split()
+            hours = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 24
+            uses = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 1
+            key = self.issue_key(hours=hours, uses=uses)
+            await m.reply(
+                "Сгенерирован ключ ✅\n"
+                f"Ключ: <code>{key}</code>\n"
+                f"Срок: {hours} ч\n"
+                f"Использований: {uses}\n\n"
+                "Отправьте пользователю в виде: <b>Ключ: </b><code>значение</code>"
+            )
+
+        @self.dp.message(Command("diag"))
+        async def diag_cmd(m: types.Message):
+            if ADMIN_CHAT_ID is None or m.chat.id != ADMIN_CHAT_ID:
+                await m.reply("Команда доступна только админу."); return
+            lic = "✅" if self.license.is_active(m.chat.id) else "❌"
+            bind = self.get_alert_chat_id(m.chat.id)
+            subs = self.manager.list_user_subs(m.chat.id)
+            watchers = list(self.manager.watchers.keys())
+            lines = [
+                "<b>Диагностика</b>",
+                f"Лицензия: {lic}",
+                f"Alert binding: {'✅ '+str(bind) if bind else '❌'}",
+                f"Подписок у этого юзера: {len(subs)}",
+                f"Активных вотчеров: {len(watchers)}",
+            ]
+            if watchers:
+                lines.append("Ключи вотчеров:")
+                for k in watchers:
+                    lines.append("• " + html.escape(k)[:80])
             await m.reply("\n".join(lines), disable_web_page_preview=True)
 
-        @self.dp.message(F.text.in_(["🗂 Лента", "Лента"]))
-        async def feed_btn(m: types.Message):
-            items = self.manager.recent_feed(m.chat.id, limit=10)
-            if not items:
-                await m.reply("Пока в ленте пусто. Как только появятся новые — они будут здесь."); return
-            lines = ["🗂 Последние присланные объявления:"]
-            for it in items:
-                price_txt = f"{it.price} ₽" if it.price is not None else "—"
-                dt = datetime.fromtimestamp(it.ts).strftime("%H:%M:%S")
-                lines.append(f"• {it.title} — {price_txt} — {dt}\n{it.url}")
-            await m.reply("\n".join(lines), disable_web_page_preview=True)
+        @self.dp.message(Command("dedup_clear"))
+        async def dedup_clear_cmd(m: types.Message):
+            if ADMIN_CHAT_ID is None or m.chat.id != ADMIN_CHAT_ID:
+                await m.reply("Команда доступна только админу."); return
+            parts = (m.text or "").split(maxsplit=1)
+            target = parts[1].strip().lower() if len(parts) > 1 else ""
+            data = self._load_sent()
+            if not target or target == "all":
+                data = {}; self._save_sent(data)
+                await m.reply("Антидубликат очищен полностью (per-user и global)."); return
+            if target == "global":
+                if "_global" in data: del data["_global"]
+                self._save_sent(data); await m.reply("Глобальный антидубликат очищен."); return
+            if target.isdigit():
+                if target in data:
+                    del data[target]; self._save_sent(data)
+                    await m.reply(f"Антидубликат очищен для user_id={target}.")
+                else:
+                    await m.reply(f"Для user_id={target} записей не было.")
+                return
+            await m.reply("Формат: /dedup_clear [all|global|<user_id>]")
 
-        @self.dp.message(SearchWizard.confirm, F.text.casefold() == "создать")
-        async def wizard_confirm(m: types.Message, state: FSMContext):
-            data = await state.get_data()
-            region = data.get("region") or "rossiya"; category = data.get("category") or ""
-            kws = data.get("keywords", []); pmin = data.get("price_min"); pmax = data.get("price_max"); sort = data.get("sort", "none")
-            from urllib.parse import urlencode
-            query = {}
-            if kws: query["q"] = " ".join(kws)
-            if sort == "date": query["s"] = "104"
-            url = f"https://www.avito.ru/{region}" + (f"/{category}" if category and category != "-" else "")
-            url += ("?" + urlencode(query)) if query else ""
-            flt = SubscriberFilter(keywords_all=kws, price_min=pmin, price_max=pmax)
-            sub = await self.manager.add_subscription(m.chat.id, url, flt)
-            await state.clear()
-            await m.answer(f"Подписка создана: <b>{sub.id}</b>\nURL: {url}\nФильтры: " + (f"kw={','.join(kws)} " if kws else "") + (f"min={pmin} " if pmin is not None else "") + (f"max={pmax} " if pmax is not None else "") + (" сортировка=по дате" if sort == "date" else "") + "\n\nНажмите «🗂 Лента», чтобы смотреть последние присланные карточки.", reply_markup=MAIN_KB, disable_web_page_preview=True)
+    async def setup_menu(self):
+        await self.bot.set_my_commands(
+            [
+                types.BotCommand(command="start", description="Начать работу"),
+                types.BotCommand(command="add", description="Добавить ссылку для мониторинга"),
+                types.BotCommand(command="list", description="Список ваших подписок"),
+                types.BotCommand(command="remove", description="Удалить подписку по ID"),
+                types.BotCommand(command="newsearch", description="Мастер подбора фильтров"),
+                types.BotCommand(command="account", description="⚙️ Аккаунт"),
+                types.BotCommand(command="genkey", description="(админ) Выдать ключ"),
+                types.BotCommand(command="diag", description="(админ) Диагностика"),
+                types.BotCommand(command="dedup_clear", description="(админ) Очистка антидубликата"),
+            ]
+        )
 
+
+# ===== main =====
 async def main():
-    load_dotenv()  # это уже есть в файле
-    keep_alive()   # добавь эту строку
+    load_dotenv()
+    keep_alive()  # no-op если нет
     token = os.getenv("BOT_TOKEN")
     if not token:
-        raise RuntimeError("BOT_TOKEN отсутствует в .env")
+        raise RuntimeError("BOT_TOKEN отсутствует в .env/Secrets")
     app = App(token)
     await app.setup_menu()
     await app.dp.start_polling(app.bot)
-
 
 if __name__ == "__main__":
     try:
