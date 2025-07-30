@@ -9,10 +9,15 @@ Alert (notifier) bot for Avito Monitor
 import os
 import json
 import asyncio
+import logging
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -26,60 +31,157 @@ SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/Multiscan_service1")
 router = Router(name="alert")
 
 def _load_bindings():
+    """Безопасная загрузка привязок"""
     if not os.path.exists(BINDINGS_FILE):
         return {}
     try:
         with open(BINDINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f) or {}
             return {str(k): int(v) for k, v in data.items()}
-    except Exception:
+    except Exception as e:
+        logger.error(f"Ошибка загрузки привязок: {e}")
         return {}
 
 def _save_bindings(data):
-    os.makedirs(os.path.dirname(BINDINGS_FILE) or ".", exist_ok=True)
-    with open(BINDINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    """Безопасное сохранение привязок"""
+    try:
+        os.makedirs(os.path.dirname(BINDINGS_FILE) or ".", exist_ok=True)
+        with open(BINDINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logger.info(f"Привязки сохранены: {data}")
+    except Exception as e:
+        logger.error(f"Ошибка сохранения привязок: {e}")
 
 @router.message(Command("start"))
 async def start_cmd(m: types.Message):
-    args = (m.text or "").split(maxsplit=1)
-    main_user_id = None
-    if len(args) == 2 and args[1].lstrip("-").isdigit():
-        main_user_id = int(args[1])
-    if main_user_id is None:
+    """Обработка команды /start с улучшенной проверкой аргументов"""
+    try:
+        args = (m.text or "").split()
+        main_user_id = None
+        
+        # Проверяем аргументы команды
+        if len(args) >= 2:
+            arg = args[1].strip()
+            # Убираем возможные префиксы и проверяем, что это число
+            if arg.lstrip("-").isdigit():
+                main_user_id = int(arg)
+            else:
+                logger.warning(f"Некорректный аргумент start: {arg}")
+        
+        if main_user_id is None:
+            await m.answer(
+                "Это бот-оповещатель для Avito Monitor.\n\n"
+                "Для привязки используйте кнопку из основного бота после активации ключа.\n\n"
+                f"Поддержка: {SUPPORT_LINK}",
+                disable_web_page_preview=True
+            )
+            return
+        
+        # Сохраняем привязку
+        data = _load_bindings()
+        data[str(main_user_id)] = int(m.chat.id)
+        _save_bindings(data)
+        
+        logger.info(f"Создана привязка: main_user_id={main_user_id} -> alert_chat_id={m.chat.id}")
+        
         await m.answer(
-            "Это бот-оповещатель. Запустите меня кнопкой из основного бота после активации ключа.\n"
-            "Поддержка: {}".format(SUPPORT_LINK),
+            "✅ Привязка выполнена успешно!\n\n"
+            f"Ваш chat_id: <code>{m.chat.id}</code>\n"
+            f"Основной пользователь: <code>{main_user_id}</code>\n\n"
+            "Теперь вернитесь в основной бот и создайте поиск."
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка в start_cmd: {e}")
+        await m.answer(
+            "Произошла ошибка при обработке команды. Попробуйте еще раз или обратитесь в поддержку.\n\n"
+            f"Поддержка: {SUPPORT_LINK}",
             disable_web_page_preview=True
         )
-        return
-    # save binding
-    data = _load_bindings()
-    data[str(main_user_id)] = int(m.chat.id)
-    _save_bindings(data)
-    await m.answer("Привязка выполнена ✅\nВаш chat_id: <code>{}</code>\nТеперь вернитесь в основной бот и создайте поиск.".format(m.chat.id))
 
 @router.message(Command("id"))
 async def id_cmd(m: types.Message):
-    await m.answer(f"Ваш chat_id: <code>{m.chat.id}</code>")
+    """Показать chat_id пользователя"""
+    try:
+        await m.answer(f"Ваш chat_id: <code>{m.chat.id}</code>")
+    except Exception as e:
+        logger.error(f"Ошибка в id_cmd: {e}")
+        await m.answer("Ошибка получения ID")
+
+@router.message(Command("status"))
+async def status_cmd(m: types.Message):
+    """Проверить статус привязок"""
+    try:
+        data = _load_bindings()
+        # Ищем привязку для текущего chat_id
+        found_bindings = []
+        for main_user_id, alert_chat_id in data.items():
+            if alert_chat_id == m.chat.id:
+                found_bindings.append(main_user_id)
+        
+        if found_bindings:
+            bindings_text = "\n".join([f"• Main user ID: <code>{uid}</code>" for uid in found_bindings])
+            await m.answer(f"✅ Активные привязки:\n{bindings_text}")
+        else:
+            await m.answer("❌ Привязки не найдены")
+            
+    except Exception as e:
+        logger.error(f"Ошибка в status_cmd: {e}")
+        await m.answer("Ошибка проверки статуса")
 
 @router.message(F.text)
 async def echo(m: types.Message):
-    # чтобы бот был «живой» при тестах
-    await m.answer("Оповещатель активен. Ваш chat_id: <code>{}</code>.\n/start <main_user_id> — привязка.".format(m.chat.id))
+    """Эхо-обработчик для проверки работы бота"""
+    try:
+        await m.answer(
+            f"🤖 Бот-оповещатель активен\n"
+            f"Ваш chat_id: <code>{m.chat.id}</code>\n\n"
+            f"Команды:\n"
+            f"• /start <main_user_id> — привязка\n"
+            f"• /id — показать ваш chat_id\n"
+            f"• /status — проверить привязки"
+        )
+    except Exception as e:
+        logger.error(f"Ошибка в echo: {e}")
 
 async def main():
-    load_dotenv()
-    token = os.getenv("ALERT_BOT_TOKEN")
-    if not token:
-        raise RuntimeError("ALERT_BOT_TOKEN не задан")
-    bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher()
-    dp.include_router(router)
-    await dp.start_polling(bot)
+    """Главная функция запуска бота"""
+    try:
+        load_dotenv()
+        token = os.getenv("ALERT_BOT_TOKEN")
+        
+        if not token:
+            logger.error("ALERT_BOT_TOKEN не задан в переменных окружения!")
+            print("ОШИБКА: ALERT_BOT_TOKEN не задан!")
+            print("Добавьте токен в Secrets или .env файл")
+            return
+        
+        logger.info("Запуск alert-бота...")
+        
+        bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        dp = Dispatcher()
+        dp.include_router(router)
+        
+        # Устанавливаем команды бота
+        await bot.set_my_commands([
+            types.BotCommand(command="start", description="Привязать к основному боту"),
+            types.BotCommand(command="id", description="Показать ваш chat_id"),
+            types.BotCommand(command="status", description="Проверить привязки"),
+        ])
+        
+        logger.info("Alert-бот запущен успешно")
+        await dp.start_polling(bot)
+        
+    except Exception as e:
+        logger.error(f"Критическая ошибка в main: {e}")
+        print(f"КРИТИЧЕСКАЯ ОШИБКА: {e}")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        pass
+        logger.info("Alert-бот остановлен")
+        print("Alert-бот остановлен")
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка: {e}")
+        print(f"НЕОЖИДАННАЯ ОШИБКА: {e}")
