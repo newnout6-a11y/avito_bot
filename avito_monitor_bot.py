@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 Avito Monitor Bot (aiogram 3.x)
-— v4.2 (stable) - FIXED VERSION
-   • Исправлен парсинг элементов страницы
-   • Исправлена обработка дат
-   • Увеличено окно свежести до 300 секунд
-   • Исправлены проблемы с типизацией
+— v4.3 (fixed) - ИСПРАВЛЕННАЯ ВЕРСИЯ
+   • Исправлены критические ошибки парсинга
+   • Обновлены селекторы под текущую версию Авито
+   • Исправлена обработка URL и изображений
+   • Улучшена обработка цен и дат
 """
 
 import os
@@ -544,7 +544,8 @@ class Watcher:
             'div[data-marker="catalog-serp"]',
             '.catalog-serp',
             '.items-items',
-            '.snippet-list'
+            '.snippet-list',
+            '[data-marker="items-list"]'
         ]
         
         root = None
@@ -557,9 +558,10 @@ class Watcher:
             logger.warning("Не найден контейнер объявлений")
             return []
 
-        # Ищем элементы объявлений
+        # Ищем элементы объявлений с обновленными селекторами
         item_selectors = [
             'div[data-marker="item"]',
+            '[data-marker="catalog-serp"] > div',
             '.item',
             '.snippet-horizontal',
             '.js-catalog-item-enum'
@@ -569,6 +571,7 @@ class Watcher:
         for selector in item_selectors:
             items = root.select(selector)[:limit]
             if items:
+                logger.info(f"Найдено {len(items)} объявлений с селектором: {selector}")
                 break
         
         if not items:
@@ -578,12 +581,13 @@ class Watcher:
         ads: List[Ad] = []
         for item in items:
             try:
-                # Ссылка на объявление
+                # Ссылка на объявление - обновленные селекторы
                 link_selectors = [
                     'a[data-marker="item-title"]',
+                    'h3 a',
                     '.item-title a',
                     '.snippet-link',
-                    'h3 a'
+                    'a[href*="/items/"]'
                 ]
                 
                 a = None
@@ -599,7 +603,8 @@ class Watcher:
                 if isinstance(href, list):
                     href = href[0] if href else ""
                     
-                url = ("https://www.avito.ru" "+" href) if href.startswith("/") else href
+                # ИСПРАВЛЕНА ОШИБКА: правильная конкатенация URL
+                url = f"https://www.avito.ru{href}" if href.startswith("/") else href
                 
                 # ID объявления
                 m = re.search(r"/(\d{7,})", href)
@@ -609,13 +614,14 @@ class Watcher:
                 if not title:
                     continue
 
-                # Цена
+                # Цена - обновленные селекторы и обработка
                 price: Optional[int] = None
                 price_selectors = [
                     'meta[itemprop="price"]',
+                    '[data-marker="item-price"]',
                     '.price-text',
                     '.snippet-price',
-                    '[data-marker="item-price"]'
+                    '.price'
                 ]
                 
                 for selector in price_selectors:
@@ -625,16 +631,16 @@ class Watcher:
                             content = price_elem.get("content", "")
                             if isinstance(content, list):
                                 content = content[0] if content else ""
-                            if str(content).isdigit():
+                            if str(content).replace(" ", "").isdigit():
                                 try:
-                                    price = int(content)
+                                    price = int(str(content).replace(" ", ""))
                                     break
                                 except Exception:
                                     pass
                         else:
                             price_text = _get_text(price_elem)
-                            # Извлекаем только цифры
-                            price_match = re.search(r'(\d+(?:\s*\d+)*)', price_text.replace(' ', ''))
+                            # Извлекаем цифры из текста цены
+                            price_match = re.search(r'(\d+(?:\s+\d+)*)', price_text)
                             if price_match:
                                 try:
                                     price = int(price_match.group(1).replace(' ', ''))
@@ -645,6 +651,7 @@ class Watcher:
                 # Дата публикации
                 date_selectors = [
                     'p[data-marker="item-date"]',
+                    '[data-marker="item-date"]',
                     '.item-date',
                     '.snippet-date-info',
                     '.item-date-text'
@@ -662,9 +669,9 @@ class Watcher:
                 # Локация
                 location_selectors = [
                     'div[class*="geo-root"]',
+                    '[data-marker="item-address"]',
                     '.item-address',
-                    '.snippet-location',
-                    '[data-marker="item-address"]'
+                    '.snippet-location'
                 ]
                 
                 location = ""
@@ -691,10 +698,11 @@ class Watcher:
                             description = _get_text(desc_elem)
                         break
 
-                # Изображение
+                # Изображение - исправленная обработка
                 image_url = None
                 img_selectors = [
-                    'img',
+                    'img[src]',
+                    'img[data-src]',
                     '.snippet-image img',
                     '.item-photo img'
                 ]
@@ -705,8 +713,14 @@ class Watcher:
                         src = img_elem.get("src") or img_elem.get("data-src")
                         if isinstance(src, list):
                             src = src[0] if src else ""
-                        if src:
-                            image_url = ("https:" + src) if str(src).startswith("//") else str(src)
+                        if src and str(src) != "":
+                            # Исправляем URL картинки
+                            if str(src).startswith("//"):
+                                image_url = f"https:{src}"
+                            elif str(src).startswith("/"):
+                                image_url = f"https://www.avito.ru{src}"
+                            else:
+                                image_url = str(src)
                             break
 
                 ads.append(Ad(
@@ -833,8 +847,6 @@ class Watcher:
             self._bump_interval(found_new)
             await asyncio.sleep(max(1.0, self._interval))  # Минимум 1 секунда между запросами
 
-
-# Остальной код остается прежним...
 
 @dataclass
 class FeedItem:
