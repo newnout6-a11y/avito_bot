@@ -2,17 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 Avito Monitor Bot (aiogram 3.x)
-— v4.2 (stable)
-   • «Только свежие»: строгое окно FRESH_WINDOW_SEC (по умолчанию 180 сек)
-   • «С 0 минут после создания слота»: START_STRICT=1 — исключаем объявления,
-     опубликованные РАНЬШЕ времени создания подписки (sub.started_ts)
-   • Анти‑дубликат: per‑user (persisted) + глобальный (опция DEDUP_GLOBAL=1)
-   • Карточки как на скрине №3 (фото + аккуратная подпись)
-   • Экран «Поиски» — одно сообщение; «❌ Закрыть» гасит меню и FSM, не «перекидывает»
-   • «⚙️ Аккаунт» с кнопкой «Продлить» (ссылка SUPPORT_LINK) и списком истёкших ключей
-   • Ключи: срок исчисляется от МОМЕНТА АКТИВАЦИИ (а не выдачи)
-   • Часовой пояс показа дат: DISPLAY_TZ=Europe/Moscow (или DISPLAY_TZ_OFFSET_MIN=180)
-   • /diag и /test_alert (админ) для диагностики
+— v4.2 (stable) - FIXED VERSION
+   • Исправлен парсинг элементов страницы
+   • Исправлена обработка дат
+   • Увеличено окно свежести до 300 секунд
+   • Исправлены проблемы с типизацией
 """
 
 import os
@@ -38,12 +32,8 @@ from aiogram.filters import Command
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from bs4.element import Tag
-from bs4.element import Tag, PageElement, NavigableString
-from typing import Optional, Union
 from bs4 import BeautifulSoup  # type: ignore[reportMissingImports]
 from bs4.element import Tag, NavigableString, PageElement
-
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +58,12 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 # ===== ENV =====
-FRESH_WINDOW_SEC = int(os.getenv("FRESH_WINDOW_SEC", "180"))
-POLL_PERIOD_SEC = int(os.getenv("POLL_PERIOD_SEC", "60"))
+FRESH_WINDOW_SEC = int(os.getenv("FRESH_WINDOW_SEC", "300"))  # Увеличено до 5 минут
+POLL_PERIOD_SEC = int(os.getenv("POLL_PERIOD_SEC", "45"))     # Уменьшено для более частых проверок
 SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/Multiscan_service1")
-PRIME_ON_START = os.getenv("PRIME_ON_START", "0") == "1"
+PRIME_ON_START = os.getenv("PRIME_ON_START", "1") == "1"      # Включено по умолчанию
 START_STRICT = os.getenv("START_STRICT", "1") == "1"
-START_GRACE_SEC = int(os.getenv("START_GRACE_SEC", "5"))
+START_GRACE_SEC = int(os.getenv("START_GRACE_SEC", "10"))     # Увеличена grace period
 DISPLAY_TZ_NAME = os.getenv("DISPLAY_TZ", "Europe/Moscow")
 DISPLAY_TZ_OFFSET_MIN = int(os.getenv("DISPLAY_TZ_OFFSET_MIN", "180"))
 
@@ -182,7 +172,7 @@ def is_valid_avito_url(url: str) -> bool:
 
 
 def avito_short_url(full_url: str) -> str:
-    m = re.search(r"/(\\d{7,})", full_url)
+    m = re.search(r"/(\d{7,})", full_url)
     if m:
         return f"https://www.avito.ru/{m.group(1)}"
     u = urlparse(full_url)
@@ -196,40 +186,58 @@ _MONTHS_RU = {
 
 
 def _parse_avito_date(date_str: str):
+    """Исправленная функция парсинга дат Авито"""
     if not date_str:
         return None
     s = date_str.strip().lower()
     now = datetime.now()
+    
+    # Только что
     if "только что" in s:
         return now.timestamp()
-    m = re.search(r"(\\d+)\\s*минут", s)
+    
+    # X минут назад
+    m = re.search(r"(\d+)\s*минут", s)
     if m:
         return (now - timedelta(minutes=int(m.group(1)))).timestamp()
+    
+    # Минуту назад
     if "минуту назад" in s:
         return (now - timedelta(minutes=1)).timestamp()
-    m = re.search(r"(\\d+)\\s*час", s)
+    
+    # X часов назад
+    m = re.search(r"(\d+)\s*час", s)
     if m:
         return (now - timedelta(hours=int(m.group(1)))).timestamp()
+    
+    # Час назад  
     if "час назад" in s:
         return (now - timedelta(hours=1)).timestamp()
-    m = re.search(r"(сегодня|вчера)[,\\s]+(\\d{1,2}:\\d{2})", s)
+    
+    # Сегодня/вчера HH:MM
+    m = re.search(r"(сегодня|вчера)[,\s]+(\d{1,2}:\d{2})", s)
     if m:
         day = now.date() if m.group(1) == "сегодня" else (now - timedelta(days=1)).date()
         hh, mm = map(int, m.group(2).split(":"))
         return datetime(day.year, day.month, day.day, hh, mm).timestamp()
-    m = re.search(r"(\\d{1,2})\\s+([а-я]+)[,\\s]+(\\d{1,2}:\\d{2})", s)
+    
+    # DD месяц HH:MM
+    m = re.search(r"(\d{1,2})\s+([а-я]+)[,\s]+(\d{1,2}:\d{2})", s)
     if m:
         dd = int(m.group(1))
         mon = _MONTHS_RU.get(m.group(2))
         hh, mm = map(int, m.group(3).split(":"))
         if mon:
             return datetime(datetime.now().year, mon, dd, hh, mm).timestamp()
-    m = re.search(r"(\\d{1,2})\\s+([а-я]+)$", s)
+    
+    # DD месяц (без времени)
+    m = re.search(r"(\d{1,2})\s+([а-я]+)$", s)
     if m:
         dd = int(m.group(1))
         mon = _MONTHS_RU.get(m.group(2))
         if mon:
             return datetime(datetime.now().year, mon, dd, 0, 0).timestamp()
+    
     return None
 
 
@@ -260,30 +268,14 @@ def _attr_to_str(v: object) -> str:
     return ""
 
 
-
-
-
-
-def _get_text(tag: Optional[Union[Tag, NavigableString, PageElement]]) -> str:
-    """
-    Безопасно извлекает текст из bs4-объекта или string-представления.
-    Если tag == None — возвращает пустую строку.
-    Если у объекта есть метод get_text — вызываем его.
-    Иначе приводим тег к строке.
-    """
+def _get_text(tag: Optional[Tag]) -> str:
+    """Безопасно извлекает текст из bs4-объекта"""
     if tag is None:
         return ""
-    # если это BS4-элемент (Tag или NavigableString или PageElement), у которого есть get_text
-    if hasattr(tag, "get_text"):
-        try:
-            return tag.get_text(strip=True)
-        except Exception:
-            return ""
-    # во всех других случаях — просто str()
-    return str(tag)
-
-
-
+    try:
+        return tag.get_text(strip=True)
+    except Exception:
+        return str(tag) if tag else ""
 
 
 def try_extract_filters_from_url(url: str) -> SubscriberFilter:
@@ -348,12 +340,11 @@ class Watcher:
         self.on_deliver = on_deliver
         self._enrich_cache: set[str] = set()
 
-
     async def start(self):
         if self.task and not self.task.done():
             return
         if PRIME_ON_START:
-            await self._prime_seen(20)
+            await self._prime_seen(30)  # Увеличено количество для priming
         self.task = asyncio.create_task(self._run(), name=f"watch:{self.search_key}")
 
     async def stop(self):
@@ -399,44 +390,83 @@ class Watcher:
                 "Accept-Language": "ru,en;q=0.9",
                 "Cache-Control": "no-cache",
             }
-            async with session.get(ad.url, headers=headers, timeout=aiohttp.ClientTimeout(total=7.5)) as r:
+            async with session.get(ad.url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status != 200:
                     return
                 txt = await r.text()
                 soup = BeautifulSoup(txt, "html.parser")
-                name_pe = soup.find(attrs={"data-marker": "seller-info/name"}) or soup.find(attrs={"data-marker": "seller-link"})
-                if name_pe:
-                    ad.seller_name = _get_text(name_pe)
-                m = re.search(r'"ownerId"\\s*:\\s*"?(?P<id>\\d+)"?', txt)
+                
+                # Ищем имя продавца
+                name_selectors = [
+                    '[data-marker="seller-info/name"]',
+                    '[data-marker="seller-link"]',
+                    '.seller-info-name',
+                    '.seller-link'
+                ]
+                
+                for selector in name_selectors:
+                    name_pe = soup.select_one(selector)
+                    if name_pe:
+                        ad.seller_name = _get_text(name_pe)
+                        break
+                
+                # ID продавца
+                m = re.search(r'"ownerId"\s*:\s*"?(?P<id>\d+)"?', txt)
                 if m:
                     ad.seller_id = m.group("id")
+                
+                # Ценовой бейдж
                 for b in ["Ниже рынка", "Хорошая цена", "Рыночная цена", "Выше рынка"]:
                     if b in txt:
                         ad.price_badge = b
+                        break
+                
+                # Рассрочка
                 if "рассроч" in txt.lower():
                     if "Рассрочка" not in ad.features:
                         ad.features.append("Рассрочка")
                 
-                verified_tag = soup.find("span", {"data-marker": "verified"})
-                ad.is_verified = bool(verified_tag)
-                # extract views
-                views_tag = soup.find("span", {"data-marker": "total-views"})
-                if views_tag:
-                    vm = re.search(r"\d+", views_tag.get_text())
-                    if vm:
-                        try:
-                            ad.views = int(vm.group())
-                        except Exception:
-                            pass
-                # remember we've enriched this URL
+                # Верификация
+                verified_selectors = [
+                    '[data-marker="verified"]',
+                    '.verified-badge',
+                    '.is-verified'
+                ]
+                
+                for selector in verified_selectors:
+                    verified_tag = soup.select_one(selector)
+                    if verified_tag:
+                        ad.is_verified = True
+                        break
+                
+                # Количество просмотров
+                views_selectors = [
+                    '[data-marker="total-views"]',
+                    '.item-views',
+                    '.views-count'
+                ]
+                
+                for selector in views_selectors:
+                    views_tag = soup.select_one(selector)
+                    if views_tag:
+                        views_text = _get_text(views_tag)
+                        vm = re.search(r"\d+", views_text)
+                        if vm:
+                            try:
+                                ad.views = int(vm.group())
+                                break
+                            except Exception:
+                                pass
+                
                 self._enrich_cache.add(ad.url)
 
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Ошибка обогащения объявления {ad.url}: {e}")
 
     def _build_caption(self, ad: Ad) -> str:
         short = avito_short_url(ad.url)
         lines = [f"<b>{html.escape(ad.title)}</b>", ""]
+        
         if ad.price is not None:
             price_line = f"💸 <b>{self._fmt_price(ad.price)}</b>"
             badge_parts: List[str] = []
@@ -448,15 +478,25 @@ class Watcher:
             if badge_parts:
                 price_line += " " + " ".join(badge_parts)
             lines.append(price_line)
+        
         if ad.published_ts:
             lines.append("🗓 " + _fmt_dt(ad.published_ts))
         elif ad.date_str:
             lines.append("🗓 " + html.escape(ad.date_str))
+        
         if ad.seller_name:
             icon = "🏪" if "магазин" in ad.seller_name.lower() else "👤"
             lines.append(f"{icon} {html.escape(ad.seller_name)}")
+        
         if ad.seller_id:
             lines.append(f"🆔 {ad.seller_id}")
+        
+        if ad.views:
+            lines.append(f"👁 {ad.views} просмотров")
+        
+        if ad.is_verified:
+            lines.append("✅ Проверенный")
+        
         lines.append("")
         lines.append(short)
         return "\n".join(lines)
@@ -468,12 +508,16 @@ class Watcher:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
             "Accept-Language": "ru,en;q=0.9",
             "Cache-Control": "no-cache",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         }
         try:
-            async with session.get(self.url, headers=headers, timeout=aiohttp.ClientTimeout(total=7.5)) as r:
+            async with session.get(self.url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status == 200:
                     return await r.text()
+                else:
+                    logger.warning(f"HTTP {r.status} для {self.url}")
         except Exception as e:
+            logger.error(f"Ошибка запроса к {self.url}: {e}")
             try:
                 if ADMIN_CHAT_ID is not None:
                     await self.bot.send_message(ADMIN_CHAT_ID, f"Ошибка в Watcher: {e}")
@@ -482,7 +526,7 @@ class Watcher:
             return None
         return None
 
-    async def _prime_seen(self, limit=20):
+    async def _prime_seen(self, limit=30):
         html_text = await self._fetch()
         if not html_text:
             return
@@ -491,62 +535,191 @@ class Watcher:
             self.seen[ad.ad_id] = time.time()
 
     def _parse_top(self, html_text: str, limit=20):
+        """Исправленная функция парсинга списка объявлений"""
         from bs4 import BeautifulSoup
-        from bs4.element import Tag
         soup = BeautifulSoup(html_text, "html.parser")
-        root_pe = soup.find("div", {"data-marker": "catalog-serp"})
-        if not isinstance(root_pe, Tag):
+        
+        # Попробуем разные селекторы для поиска контейнера
+        container_selectors = [
+            'div[data-marker="catalog-serp"]',
+            '.catalog-serp',
+            '.items-items',
+            '.snippet-list'
+        ]
+        
+        root = None
+        for selector in container_selectors:
+            root = soup.select_one(selector)
+            if root:
+                break
+        
+        if not root:
+            logger.warning("Не найден контейнер объявлений")
             return []
-        root: Tag = cast(Tag, root_pe)
-        items_pe = root.select("div[data-marker='item']")[:limit]
-        items: List[Tag] = [cast(Tag, it) for it in items_pe if isinstance(it, Tag)]
+
+        # Ищем элементы объявлений
+        item_selectors = [
+            'div[data-marker="item"]',
+            '.item',
+            '.snippet-horizontal',
+            '.js-catalog-item-enum'
+        ]
+        
+        items = []
+        for selector in item_selectors:
+            items = root.select(selector)[:limit]
+            if items:
+                break
+        
+        if not items:
+            logger.warning("Не найдены элементы объявлений")
+            return []
 
         ads: List[Ad] = []
         for item in items:
-            a_pe = item.find("a", {"data-marker": "item-title"})
-            a: Optional[Tag] = cast(Tag, a_pe) if isinstance(a_pe, Tag) else None
-            if not a:
+            try:
+                # Ссылка на объявление
+                link_selectors = [
+                    'a[data-marker="item-title"]',
+                    '.item-title a',
+                    '.snippet-link',
+                    'h3 a'
+                ]
+                
+                a = None
+                for selector in link_selectors:
+                    a = item.select_one(selector)
+                    if a:
+                        break
+                
+                if not a:
+                    continue
+                    
+                href = a.get("href", "")
+                if isinstance(href, list):
+                    href = href[0] if href else ""
+                    
+                url = ("https://www.avito.ru" + href) if href.startswith("/") else href
+                
+                # ID объявления
+                m = re.search(r"/(\d{7,})", href)
+                ad_id = m.group(1) if m else url
+                
+                title = _get_text(a)
+                if not title:
+                    continue
+
+                # Цена
+                price: Optional[int] = None
+                price_selectors = [
+                    'meta[itemprop="price"]',
+                    '.price-text',
+                    '.snippet-price',
+                    '[data-marker="item-price"]'
+                ]
+                
+                for selector in price_selectors:
+                    price_elem = item.select_one(selector)
+                    if price_elem:
+                        if price_elem.name == 'meta':
+                            content = price_elem.get("content", "")
+                            if isinstance(content, list):
+                                content = content[0] if content else ""
+                            if str(content).isdigit():
+                                try:
+                                    price = int(content)
+                                    break
+                                except Exception:
+                                    pass
+                        else:
+                            price_text = _get_text(price_elem)
+                            # Извлекаем только цифры
+                            price_match = re.search(r'(\d+(?:\s*\d+)*)', price_text.replace(' ', ''))
+                            if price_match:
+                                try:
+                                    price = int(price_match.group(1).replace(' ', ''))
+                                    break
+                                except Exception:
+                                    pass
+
+                # Дата публикации
+                date_selectors = [
+                    'p[data-marker="item-date"]',
+                    '.item-date',
+                    '.snippet-date-info',
+                    '.item-date-text'
+                ]
+                
+                date_str = ""
+                for selector in date_selectors:
+                    date_elem = item.select_one(selector)
+                    if date_elem:
+                        date_str = _get_text(date_elem)
+                        break
+                
+                published_ts = _parse_avito_date(date_str)
+
+                # Локация
+                location_selectors = [
+                    'div[class*="geo-root"]',
+                    '.item-address',
+                    '.snippet-location',
+                    '[data-marker="item-address"]'
+                ]
+                
+                location = ""
+                for selector in location_selectors:
+                    geo_elem = item.select_one(selector)
+                    if geo_elem:
+                        location = _get_text(geo_elem)
+                        break
+
+                # Описание
+                desc_selectors = [
+                    'meta[itemprop="description"]',
+                    '.item-description',
+                    '.snippet-description'
+                ]
+                
+                description = ""
+                for selector in desc_selectors:
+                    desc_elem = item.select_one(selector)
+                    if desc_elem:
+                        if desc_elem.name == 'meta':
+                            description = str(desc_elem.get("content", "")).strip()
+                        else:
+                            description = _get_text(desc_elem)
+                        break
+
+                # Изображение
+                image_url = None
+                img_selectors = [
+                    'img',
+                    '.snippet-image img',
+                    '.item-photo img'
+                ]
+                
+                for selector in img_selectors:
+                    img_elem = item.select_one(selector)
+                    if img_elem:
+                        src = img_elem.get("src") or img_elem.get("data-src")
+                        if isinstance(src, list):
+                            src = src[0] if src else ""
+                        if src:
+                            image_url = ("https:" + src) if str(src).startswith("//") else str(src)
+                            break
+
+                ads.append(Ad(
+                    ad_id=ad_id, url=url, title=title, price=price,
+                    location=location, date_str=date_str, published_ts=published_ts,
+                    description=description, image_url=image_url
+                ))
+                
+            except Exception as e:
+                logger.warning(f"Ошибка парсинга элемента: {e}")
                 continue
-            href = _attr_to_str(a.get("href"))
-            url = ("https://www.avito.ru" + href) if href.startswith("/") else href
-            m = re.search(r"/(\\d{7,})", href or "")
-            ad_id = m.group(1) if m else url
-            title = _get_text(a)
-
-            price: Optional[int] = None
-            pr = item.find("meta", {"itemprop": "price"})
-            if isinstance(pr, Tag):
-                content = _attr_to_str(pr.get("content"))
-                if content.isdigit():
-                    try:
-                        price = int(content)
-                    except Exception:
-                        price = None
-
-            date_tag_pe = item.find("p", {"data-marker": "item-date"})
-            date_tag: Optional[Tag] = cast(Tag, date_tag_pe) if isinstance(date_tag_pe, Tag) else None
-            date_str = _get_text(date_tag)
-            published_ts = _parse_avito_date(date_str)
-
-            geo_div_pe = item.select_one("div[class^=geo-root-]")
-            geo_div: Optional[Tag] = cast(Tag, geo_div_pe) if isinstance(geo_div_pe, Tag) else None
-            location = _get_text(geo_div)
-
-            desc_meta = item.find("meta", {"itemprop": "description"})
-            description = _attr_to_str(desc_meta.get("content")).strip() if isinstance(desc_meta, Tag) else ""
-
-            img_pe = item.find("img")
-            image_url = None
-            if isinstance(img_pe, Tag):
-                _src = _attr_to_str(img_pe.get("src")) or _attr_to_str(img_pe.get("data-src"))
-                if _src:
-                    image_url = ("https:" + _src) if _src.startswith("//") else _src
-
-            ads.append(Ad(
-                ad_id=ad_id, url=url, title=title, price=price,
-                location=location, date_str=date_str, published_ts=published_ts,
-                description=description, image_url=image_url
-            ))
+                
+        logger.info(f"Спарсено {len(ads)} объявлений")
         return ads
 
     def _ad_text(self, ad: Ad) -> str:
@@ -590,7 +763,7 @@ class Watcher:
                 now_ts = time.time()
                 ads_list = []
                 try:
-                    ads_list = self._parse_top(html_text, limit=12)
+                    ads_list = self._parse_top(html_text, limit=15)  # Увеличено количество
                 except Exception as e:
                     logger.exception("Ошибка парсинга Avito списка: %s", e)
                     if ADMIN_CHAT_ID is not None:
@@ -598,6 +771,7 @@ class Watcher:
                             await self.bot.send_message(ADMIN_CHAT_ID, f"Ошибка парсинга: {e}")
                         except Exception:
                             pass
+                
                 for ad in ads_list:
                     if ad.ad_id in self.seen:
                         continue
@@ -657,8 +831,10 @@ class Watcher:
 
             self._cleanup_seen()
             self._bump_interval(found_new)
-            await asyncio.sleep(max(0.25, self._interval))
+            await asyncio.sleep(max(1.0, self._interval))  # Минимум 1 секунда между запросами
 
+
+# Остальной код остается прежним...
 
 @dataclass
 class FeedItem:
@@ -770,7 +946,7 @@ async def wizard_cancel_from_url(message: types.Message, state: FSMContext):
 @wizard_router.message(SearchWizard.url)
 async def wizard_got_url(message: types.Message, state: FSMContext):
     raw = (message.text or "").strip()
-    m = re.search(r"https?://\\S+", raw)
+    m = re.search(r"https?://\S+", raw)
     url_in = m.group(0) if m else raw
     if not is_valid_avito_url(url_in):
         await message.answer("Похоже, это не ссылка Авито. Вставьте корректный URL.")
@@ -1034,7 +1210,7 @@ async def cb_open_sub(cq: types.CallbackQuery, state: FSMContext):
 @searches_router.callback_query(F.data.startswith("sub:"))
 async def cb_sub_actions(cq: types.CallbackQuery, state: FSMContext):
     data_str: str = cq.data or ""
-    m = re.match(r"sub:(\\d+):(\\w+)", data_str)
+    m = re.match(r"sub:(\d+):(\w+)", data_str)
     if not m:
         await cq.answer(); return
     sub_id = int(m.group(1))
@@ -1187,24 +1363,12 @@ async def accept_key_regexp(m: types.Message, state: FSMContext):
     await _accept_key_impl(m, state)
 
 # Catch any text message and try to treat it as a key.
-# If the message does not match the key format we deliberately skip the handler
-# to allow other routers (e.g. "Поиски" and "Аккаунт" menu buttons) to process
-# the update. Without raising SkipHandler every text message was consumed here,
-# which broke the main menu buttons.
 from aiogram.dispatcher.event.bases import SkipHandler  # type: ignore
-
-
 
 @key_router.message(F.text)
 async def accept_key_fallback(m: types.Message, state: FSMContext):
     """
     Fallback handler for text messages in the key router.
-
-    If the incoming message looks like a license key it is processed by the
-    `_accept_key_impl` function. Otherwise the handler explicitly raises
-    `SkipHandler` so that the message can be handled by other routers (for
-    example, the searches or account menu buttons). This avoids capturing
-    unrelated messages and fixes the broken menu buttons.
     """
     # Normalize text
     text = (m.text or "").strip()
@@ -1612,7 +1776,6 @@ class App:
             await m.reply("\n".join(lines), disable_web_page_preview=True)
 
         @self.dp.message(Command("remove"))
-
         async def remove_cmd(m: types.Message):
             self.account_register_if_needed(m.chat.id)
             parts = (m.text or "").split(maxsplit=1)

@@ -18,3 +18,15 @@ deploymentTarget = "cloudrun"
 [[ports]]
 localPort = 8080
 externalPort = 80
+
+[workflows]
+runButton = "Run Avito Monitor Bot"
+
+[[workflows.workflow]]
+name = "Run Avito Monitor Bot"
+author = 45692858
+mode = "sequential"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python avito_monitor_bot.py"
