@@ -254,7 +254,7 @@ class Watcher:
         await asyncio.to_thread(invalidate_cached_api_url, self.url, API_URLS_FILE)
 
     async def _fetch_ads(self) -> Optional[List[Ad]]:
-        """Fetch the JSON feed with per-watcher and shared-route cooldowns."""
+        """Fetch the feed with per-watcher and shared-route cooldowns."""
         now = time.monotonic()
         route_key = self._route_key()
         route_blocked_until = Watcher._route_blocked_until.get(route_key, 0.0)
@@ -263,17 +263,6 @@ class Watcher:
             route_blocked_until = 0.0
         if now < max(self._blocked_until, route_blocked_until):
             return None
-        if not self._api_url:
-            api_url = await asyncio.to_thread(self.route_resolver.resolve, self.url)
-            self.conversion_status = getattr(self.route_resolver, "last_status", "ready" if api_url else "retry")
-            self.conversion_error = getattr(self.route_resolver, "last_error", None)
-            if not api_url:
-                logger.warning("Could not convert Avito URL to API URL: %s", self.url)
-                self._blocked_until = time.monotonic() + 60
-                return None
-            self._api_url = api_url
-            if self.conversion_status != "retry":
-                self.conversion_status = "ready"
 
         max_attempts = max(1, len(AVITO_PROXIES))
         if self._proxy_change_url():
@@ -281,7 +270,7 @@ class Watcher:
         for attempt in range(max_attempts):
             try:
                 await self._wait_global_rate_limit()
-                # 1. Сначала пробуем прямой HTML-парсинг поисковой выдачи (работает надежно через Safari-отпечаток)
+                # 1. Прямой HTML-парсинг поисковой выдачи Avito (Safari impersonation)
                 try:
                     raw_items = await asyncio.to_thread(self._client.get_search_page_items, self.url, 50)
                     if raw_items:
@@ -297,42 +286,46 @@ class Watcher:
                 except Exception as page_exc:
                     logger.debug("Парсинг страницы %s: %s", self.url, page_exc)
 
+                # 2. Опциональный fallback на JSON API, если URL был сконвертирован
                 if not self._api_url:
-                    return None
+                    api_url = await asyncio.to_thread(self.route_resolver.resolve, self.url)
+                    self._api_url = api_url
 
-                payload = await asyncio.to_thread(self._client.get_items, self._api_url)
-                self.last_http_status = self._client.last_status
-                self._consecutive_blocks = 0
-                self.last_block_kind = None
-                parsed = parse_api_feed(payload, limit=20)
-                self.parser_warnings = tuple(parsed.warnings)
-                if parsed.schema_mismatch:
-                    self.parser_health = "schema_mismatch"
-                    self.conversion_status = "retry"
-                    self.conversion_error = "; ".join(parsed.warnings)
-                    try:
-                        await self._invalidate_api_route(self.conversion_error)
-                    except Exception as cache_error:
-                        logger.warning("Could not invalidate schema-mismatched route: %s", cache_error)
-                    self._api_url = None
-                    logger.error(
-                        "Avito API schema mismatch for %s (%s): %s",
-                        self.url,
-                        parsed.schema_fingerprint,
-                        self.conversion_error,
-                    )
-                    return None
-                self.parser_health = "warning" if parsed.warnings else "ok"
-                if parsed.warnings:
-                    logger.warning(
-                        "Avito feed warnings for %s (%s): %s",
-                        self.url,
-                        parsed.schema_fingerprint,
-                        "; ".join(parsed.warnings),
-                    )
-                self.conversion_status = "ready"
-                self.conversion_error = None
-                return [Ad(**item) for item in parsed.items]
+                if self._api_url:
+                    payload = await asyncio.to_thread(self._client.get_items, self._api_url)
+                    self.last_http_status = self._client.last_status
+                    self._consecutive_blocks = 0
+                    self.last_block_kind = None
+                    parsed = parse_api_feed(payload, limit=20)
+                    self.parser_warnings = tuple(parsed.warnings)
+                    if parsed.schema_mismatch:
+                        self.parser_health = "schema_mismatch"
+                        self.conversion_status = "retry"
+                        self.conversion_error = "; ".join(parsed.warnings)
+                        try:
+                            await self._invalidate_api_route(self.conversion_error)
+                        except Exception as cache_error:
+                            logger.warning("Could not invalidate schema-mismatched route: %s", cache_error)
+                        self._api_url = None
+                        logger.error(
+                            "Avito API schema mismatch for %s (%s): %s",
+                            self.url,
+                            parsed.schema_fingerprint,
+                            self.conversion_error,
+                        )
+                        return None
+                    self.parser_health = "warning" if parsed.warnings else "ok"
+                    if parsed.warnings:
+                        logger.warning(
+                            "Avito feed warnings for %s (%s): %s",
+                            self.url,
+                            parsed.schema_fingerprint,
+                            "; ".join(parsed.warnings),
+                        )
+                    self.conversion_status = "ready"
+                    self.conversion_error = None
+                    return [Ad(**item) for item in parsed.items]
+                return None
             except AvitoBlock as block:
                 blocked_route = self._route_key()
                 self.last_http_status = block.status
