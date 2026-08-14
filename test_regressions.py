@@ -8,12 +8,12 @@ from email.utils import format_datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import avito_monitor_bot as appmod
-import avito_monitoring as monitoring
 import alert_bot
 import avito_api
-from storage import load_json, load_state, update_json, update_state
+import avito_monitor_bot as appmod
+import avito_monitoring as monitoring
 from avito_accounts import AccountService, LicenseManager
+from storage import load_json, load_state, update_json, update_state
 
 
 class FakeBot:

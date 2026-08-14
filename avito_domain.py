@@ -6,13 +6,13 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import List, Optional
 from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse, urlunparse
 
 from bs4.element import Tag
 
+from avito_accounts import LicenseManager  # noqa: F401
 from avito_settings import DISPLAY_TZ_NAME, DISPLAY_TZ_OFFSET_MIN
-from avito_accounts import LicenseManager
 
 try:
     from zoneinfo import ZoneInfo

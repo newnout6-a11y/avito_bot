@@ -16,5 +16,12 @@ JSON-файлы (`accounts.json`, `subscriptions.json` и другие) импо
 при первом чтении. Для разовой совместимости можно установить
 `STORAGE_BACKEND=json`.
 
-Основные настройки находятся в [avito_settings.py](avito_settings.py). Тесты:
-`python -m unittest -v`.
+Основные настройки находятся в [avito_settings.py](avito_settings.py).
+
+## Разработка
+
+Установить проект вместе с dev-зависимостями: `uv sync --dev`.
+
+- Проверка Ruff: `uv run ruff check .`
+- Автоисправление безопасных замечаний: `uv run ruff check . --fix`
+- Тесты: `uv run python -m unittest -v`

@@ -11,63 +11,81 @@ Avito Monitor Bot (aiogram 3.x)
     • Rerun `python test_regressions.py` — все тесты должны пройти
 """
 
-import os
-import re
-import time
 import asyncio
 import html
-import aiohttp
-from typing import Dict, List, Optional, cast, Any, Set
-import uuid
 import logging
+import os
+import re
 import secrets
+import time
+import uuid
+from typing import Any, Dict, List, Optional, Set, cast
 
+import aiohttp
+from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+
+from avito_accounts import AccountService
 from avito_api import parse_api_items as parse_api_items
 from avito_domain import (
-    Ad as Ad,
-    FeedItem as FeedItem,
     KEY_RE,
     LicenseManager,
     SubscriberFilter,
     Subscription,
-    _attr_to_str as _attr_to_str,
     _br,
-    _extract_ad_id as _extract_ad_id,
     _fmt_dt,
-    _get_text as _get_text,
     _parse_price_input,
     avito_short_url,
     is_valid_avito_url,
     search_key_from_url,
     try_extract_filters_from_url,
 )
+from avito_domain import (
+    Ad as Ad,
+)
+from avito_domain import (
+    FeedItem as FeedItem,
+)
+from avito_domain import (
+    _attr_to_str as _attr_to_str,
+)
+from avito_domain import (
+    _extract_ad_id as _extract_ad_id,
+)
+from avito_domain import (
+    _get_text as _get_text,
+)
 from avito_monitoring import Watcher, WatcherManager
-from avito_accounts import AccountService
 from avito_settings import (
     ACCOUNTS_FILE,
     ADMIN_CHAT_ID,
     ALERT_BOT_TOKEN,
     ALERT_BOT_USERNAME,
     ALERT_LINKS_FILE,
-    API_URLS_FILE as API_URLS_FILE,
-    AVITO_PROXIES as AVITO_PROXIES,
-    AVITO_PROXY_CHANGE_URLS as AVITO_PROXY_CHANGE_URLS,
     BINDINGS_FILE,
     DEDUP_GLOBAL,
     DEDUP_TTL_DAYS,
     KEYS_FILE,
     SENT_FILE,
-    SUBSCRIPTIONS_FILE as SUBSCRIPTIONS_FILE,
     SUPPORT_LINK,
 )
-
-from aiogram import Bot, Dispatcher, F, Router, types
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
+from avito_settings import (
+    API_URLS_FILE as API_URLS_FILE,
+)
+from avito_settings import (
+    AVITO_PROXIES as AVITO_PROXIES,
+)
+from avito_settings import (
+    AVITO_PROXY_CHANGE_URLS as AVITO_PROXY_CHANGE_URLS,
+)
+from avito_settings import (
+    SUBSCRIPTIONS_FILE as SUBSCRIPTIONS_FILE,
+)
 from storage import load_state, save_state, update_state
 
 logger = logging.getLogger(__name__)

@@ -6,14 +6,16 @@ Alert (notifier) bot for Avito Monitor
 — принимает /start <main_user_id>, показывает /id
 """
 
-import os
 import asyncio
 import logging
+import os
 import time
+
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
+
 from storage import load_state, save_state, update_state
 
 # Настройка логирования

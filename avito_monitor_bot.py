@@ -5,13 +5,13 @@ imports and executable entry point stable for deployments and integrations.
 """
 
 from avito_ui import (  # noqa: F401
-    App,
     API_URLS_FILE,
+    KEY_RE,
+    MAIN_INLINE_KB,
     Ad,
+    App,
     FeedItem,
     LicenseManager,
-    MAIN_INLINE_KB,
-    KEY_RE,
     SearchWizard,
     SubscriberFilter,
     Subscription,
@@ -48,7 +48,6 @@ __all__ = [name for name in globals() if not name.startswith("__")]
 
 
 if __name__ == "__main__":
-    import asyncio
 
     try:
         run()

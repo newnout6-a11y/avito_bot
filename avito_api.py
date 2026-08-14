@@ -305,7 +305,10 @@ def convert_url_to_api(url: str, cache_file: str, timeout: float = 25.0) -> Opti
     if is_valid_api_url(url):
         return _ensure_sort_date(url)
 
-    from storage import load_state, save_state  # локальный импорт, чтобы не тянуть при тестах парсера
+    from storage import (  # локальный импорт, чтобы не тянуть при тестах парсера
+        load_state,
+        save_state,
+    )
 
     cache: Dict[str, str] = {}
     try:

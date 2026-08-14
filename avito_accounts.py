@@ -3,10 +3,10 @@
 import logging
 import time
 import uuid
+from datetime import datetime
 from typing import Any, Dict, Optional
 
-from datetime import datetime
-from avito_settings import ACCOUNTS_FILE, KEYS_FILE, DISPLAY_TZ_NAME, DISPLAY_TZ_OFFSET_MIN
+from avito_settings import ACCOUNTS_FILE, DISPLAY_TZ_NAME, DISPLAY_TZ_OFFSET_MIN, KEYS_FILE
 from storage import load_state, save_state, update_state
 
 logger = logging.getLogger(__name__)
