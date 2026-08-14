@@ -360,11 +360,16 @@ class Watcher:
         return None
 
     async def _prime_seen(self, limit=30):
+        sub_names = [s.name or f"Поиск #{s.id}" for s in self.subscribers.values()]
+        name_hint = ", ".join(f"«{n}»" for n in sub_names) if sub_names else self.search_key[:40]
+        logger.info("[Мониторинг] Инициализация %s: загрузка текущих объявлений с Avito...", name_hint)
         ads = await self._fetch_ads()
         if not ads:
+            logger.warning("[Мониторинг] Инициализация %s: не удалось получить первичные объявления", name_hint)
             return
         for ad in ads[:limit]:
             self.seen[ad.ad_id] = time.time()
+        logger.info("[Мониторинг] Инициализация %s завершена: запомнено %d объявлений, запущен мониторинг новых", name_hint, len(self.seen))
 
     @staticmethod
     def _ad_passes_filters(ad: Ad, sub: Subscription) -> bool:
@@ -401,10 +406,20 @@ class Watcher:
 
     async def _run(self):
         app = cast(Any, self.bot).app
+        sub_names = [s.name or f"Поиск #{s.id}" for s in self.subscribers.values()]
+        name_hint = ", ".join(f"«{n}»" for n in sub_names) if sub_names else self.search_key[:40]
+        logger.info("[Мониторинг] Фоновый процесс активен для %s (интервал: ~%d сек)", name_hint, int(self._interval))
         while self.has_subscribers():
             found_new = False
+            sub_names = [s.name or f"Поиск #{s.id}" for s in self.subscribers.values()]
+            names_str = ", ".join(f"«{n}»" for n in sub_names) if sub_names else self.search_key[:40]
             ads = await self._fetch_ads()
-            if ads:
+            if ads is None:
+                logger.warning("[Мониторинг] %s: запрос отложен (cooldown/пауза)", names_str)
+            elif not ads:
+                logger.info("[Мониторинг] %s: получено 0 объявлений от Avito API", names_str)
+            else:
+                new_count = 0
                 now = time.time()
                 for ad in ads:
                     was_seen = ad.ad_id in self.seen
@@ -447,16 +462,22 @@ class Watcher:
                                 app.sent_global_mark(ad.ad_id, now)
                                 global_delivered = True
                             found_new = True
+                            new_count += 1
                             logger.info(
-                                "Отправлено объявление %s пользователю %s в alert_chat=%s",
+                                "Отправлено объявление %s пользователю %s в alert_chat=%s (%s)",
                                 ad.ad_id,
                                 sub.user_id,
                                 chat_id,
+                                ad.title,
                             )
                         else:
                             logger.warning("Не удалось отправить объявление %s: alert_chat=%s", ad.ad_id, chat_id)
                             await self._send_missing_alert_hint(app, sub.user_id)
                     self.seen[ad.ad_id] = now
+                if new_count == 0:
+                    logger.info("[Мониторинг] %s: получено %d объявлений, новых нет. След. проверка через ~%dс", names_str, len(ads), int(self._interval))
+                else:
+                    logger.info("[Мониторинг] %s: найдено и отправлено новых объявлений: %d! След. проверка через ~%dс", names_str, new_count, int(self._interval))
             self._cleanup_seen()
             self._bump_interval(found_new)
             await asyncio.sleep(max(1.0, self._interval) * random.uniform(0.9, 1.1))
@@ -625,6 +646,8 @@ class WatcherManager:
                 watcher.add_sub(sub)
             except (KeyError, TypeError, ValueError) as exc:
                 logger.warning("Пропущена поврежденная подписка: %s", exc)
+        total_subs = sum(len(s) for s in self.subs_by_user.values())
+        logger.info("[Мониторинг] Восстановлено подписок: %d, активных поисков: %d", total_subs, len(self.watchers))
         for watcher in self.watchers.values():
             await watcher.start()
 
