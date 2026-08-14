@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import alert_bot
 import avito_api
+import avito_domain
 import avito_monitor_bot as appmod
 import avito_monitoring as monitoring
 import avito_ui
@@ -119,6 +120,37 @@ class RegressionTests(unittest.TestCase):
 
         self.assertIsNone(filters.price_min)
         self.assertEqual(filters.price_max, 70000)
+
+    def test_price_filter_is_extracted_when_avito_splits_f_with_tilde(self):
+        payload = {"from": 0, "to": 70000}
+        encoded = base64.urlsafe_b64encode(
+            b"\x01(\x01\x01\x01\x02\x02D\xb4\xc0\r\x9c\xaf9\xb0\xc3\x04"
+            b"6#\xf0\xdc\x05\x03\xa3\xac8\x93\xeb\xf7l\x08\xfd\xdb\x02\x01E\xc6\x9a\x0c\x15"
+            + json.dumps(payload, separators=(",", ":")).encode()
+        ).decode().rstrip("=")
+        split = f"{encoded[:41]}~{encoded[41:]}"
+
+        filters = appmod.try_extract_filters_from_url(
+            f"https://www.avito.ru/all/telefony?f={split}&q=samsung"
+        )
+
+        self.assertIsNone(filters.price_min)
+        self.assertEqual(filters.price_max, 70000)
+        self.assertEqual(filters.keywords_all, ["samsung"])
+
+    def test_screenshot_avito_link_has_no_filter_warning(self):
+        url = (
+            "https://www.avito.ru/all/telefony/mobilnye_telefony/samsung-"
+            "ASgBAgICAgS0wA2crzmwwwQ2I_Dc?cd=1&context=H4sIAAAAAAAA_wEmANn_YToxOntzOjE6InkiO3M6MTY6IR5d0dNTkRnTUZQejVBOFciO32swxHelgAAAA"
+            "&f=ASgBAQECAkS0wA2crzmwwwQ2I_DcBQOjrDiT6_dsC~P3bAgFFxpoMFXsiZnJvbSI6MCwidG8iOjcwMDAwfQ"
+            "&q=samsung&s=104"
+        )
+
+        filters, warnings = avito_domain.parse_filters(url)
+
+        self.assertEqual((filters.price_min, filters.price_max), (None, 70000))
+        self.assertEqual(filters.keywords_all, ["samsung"])
+        self.assertNotIn("Не удалось разобрать фильтр f", " ".join(warnings))
 
     def test_wizard_uses_price_from_avito_url(self):
         async def scenario():

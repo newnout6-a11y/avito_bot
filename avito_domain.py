@@ -155,7 +155,7 @@ def parse_avito_url(url: str) -> SearchSpec:
             "q", "f", "pmin", "pmax", "pricemin", "pricemax",
             "price_min", "price_max", "pricefrom", "priceto",
             "minprice", "maxprice", "context", "s", "sort", "categoryid",
-            "locationid", "radius", "searchradius", "geocoords",
+            "locationid", "radius", "searchradius", "geocoords", "cd",
         } and not key.casefold().startswith("params["):
             warnings.append(f"Неподдерживаемый параметр: {key}")
     pairs.sort(key=lambda item: (item[0], item[1]))
@@ -281,6 +281,8 @@ def _parse_query_filters(query: dict[str, list[str]]) -> SubscriberFilter:
 
 def _decode_filter_payload(encoded_filter: str) -> dict[str, object]:
     token = encoded_filter.strip()
+    # Avito may split the base64url token with `~`; it is not payload data.
+    token = token.replace("~", "")
     if not re.fullmatch(r"[A-Za-z0-9_-]+={0,2}", token):
         raise ValueError("malformed base64")
     token = token.rstrip("=")
