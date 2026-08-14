@@ -267,7 +267,11 @@ async def _prompt_search_name(
         "Отправьте короткое название, например «Samsung до 70 000».",
     ]
     await state.set_state(SearchWizard.name)
-    await message.answer(_br("\\n".join(summary)), disable_web_page_preview=True)
+    await message.answer(
+        _br("\n".join(summary)),
+        disable_web_page_preview=True,
+        reply_markup=types.ReplyKeyboardRemove(),
+    )
 
 
 def _filter_from_data(data: Dict[str, Any]) -> SubscriberFilter:
@@ -348,8 +352,10 @@ async def _continue_after_filter_review(message: types.Message, state: FSMContex
             "<b>Минимальная цена</b>\nВведите число или «-», если ограничения нет.",
             reply_markup=types.ReplyKeyboardMarkup(
                 keyboard=[
-                    [_keyboard_button(text="-", style="primary")],
-                    [_keyboard_button(text="Отмена", style="danger")],
+                    [
+                        _keyboard_button(text="-", style="primary"),
+                        _keyboard_button(text="Отмена", style="danger"),
+                    ],
                 ],
                 resize_keyboard=True,
             ),
@@ -600,9 +606,10 @@ async def wizard_got_min(message: types.Message, state: FSMContext):
         "<b>Максимальная цена</b>\nВведите число или «-», если ограничения нет.",
         reply_markup=types.ReplyKeyboardMarkup(
             keyboard=[
-                [_keyboard_button(text="100000000", style="primary")],
-                [_keyboard_button(text="-", style="primary")],
-                [_keyboard_button(text="Отмена", style="danger")],
+                [
+                    _keyboard_button(text="-", style="primary"),
+                    _keyboard_button(text="Отмена", style="danger"),
+                ],
             ],
             resize_keyboard=True,
         ),
