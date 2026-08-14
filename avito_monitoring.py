@@ -347,13 +347,23 @@ class Watcher:
             if ads:
                 now = time.time()
                 for ad in ads:
-                    if ad.ad_id in self.seen:
-                        continue
+                    was_seen = ad.ad_id in self.seen
+                    global_dedup = app.dedup_global_enabled()
+                    global_delivered = global_dedup and app.sent_global_was_delivered(ad.ad_id)
                     for sub in list(self.subscribers.values()):
+                        if global_delivered:
+                            break
+                        if was_seen and sub.only_new:
+                            continue
                         if not app.license.is_active(sub.user_id):
                             logger.info("Пропуск %s для user=%s: лицензия неактивна", ad.ad_id, sub.user_id)
                             continue
-                        if START_STRICT and ad.published_ts is not None and ad.published_ts + START_GRACE_SEC < sub.started_ts:
+                        if (
+                            sub.only_new
+                            and START_STRICT
+                            and ad.published_ts is not None
+                            and ad.published_ts + START_GRACE_SEC < sub.started_ts
+                        ):
                             continue
                         if not self._ad_passes_filters(ad, sub):
                             logger.info(
@@ -373,6 +383,9 @@ class Watcher:
                             if self.on_deliver:
                                 self.on_deliver(sub.user_id, ad)
                             app.sent_mark(sub.user_id, ad.ad_id, now)
+                            if global_dedup:
+                                app.sent_global_mark(ad.ad_id, now)
+                                global_delivered = True
                             found_new = True
                             logger.info(
                                 "Отправлено объявление %s пользователю %s в alert_chat=%s",

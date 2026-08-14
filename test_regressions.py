@@ -41,6 +41,41 @@ class FakeState:
         self.state = state
 
 
+class FakeDeliveryApp:
+    def __init__(self, *, global_dedup=False):
+        self.license = MagicMock()
+        self.license.is_active.return_value = True
+        self.global_dedup = global_dedup
+        self.global_sent = set()
+        self.user_sent = set()
+        self.deliveries = []
+
+    def dedup_global_enabled(self):
+        return self.global_dedup
+
+    def sent_global_was_delivered(self, ad_id):
+        return ad_id in self.global_sent
+
+    def sent_global_mark(self, ad_id, ts=None):
+        self.global_sent.add(ad_id)
+
+    def sent_was_delivered(self, user_id, ad_id):
+        return (user_id, ad_id) in self.user_sent
+
+    def sent_mark(self, user_id, ad_id, ts=None):
+        self.user_sent.add((user_id, ad_id))
+
+    def get_alert_chat_id(self, user_id):
+        return user_id
+
+    async def send_to_alert(self, chat_id, caption, image_url):
+        self.deliveries.append(chat_id)
+        return True
+
+    def missing_alert_hint_once(self, user_id):
+        return False
+
+
 class RegressionTests(unittest.TestCase):
     def test_regexes_and_newlines(self):
         key = "123e4567-e89b-12d3-a456-426614174000"
@@ -148,6 +183,57 @@ class RegressionTests(unittest.TestCase):
     def test_monitoring_classes_are_reexported_from_entrypoint(self):
         self.assertIs(appmod.Watcher, monitoring.Watcher)
         self.assertIs(appmod.WatcherManager, monitoring.WatcherManager)
+
+    def test_entrypoint_imports_admin_chat_id(self):
+        self.assertIn("ADMIN_CHAT_ID", appmod.App.setup_menu.__globals__)
+
+    def test_only_new_skips_primed_ads_but_disabled_mode_delivers(self):
+        async def scenario():
+            bot = FakeBot()
+            bot.app = FakeDeliveryApp()
+            watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+            ad = appmod.Ad(ad_id="1", url="https://www.avito.ru/1", title="Phone")
+            watcher.seen[ad.ad_id] = time.time()
+            watcher.add_sub(appmod.Subscription(
+                id=1, user_id=1, search_key="key", url=watcher.url, only_new=True
+            ))
+            watcher.add_sub(appmod.Subscription(
+                id=2, user_id=2, search_key="key", url=watcher.url, only_new=False
+            ))
+            watcher._fetch_ads = AsyncMock(return_value=[ad])
+
+            with patch("avito_monitoring.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError)):
+                with self.assertRaises(asyncio.CancelledError):
+                    await watcher._run()
+
+            self.assertEqual(bot.app.deliveries, [2])
+            watcher._client.close()
+
+        asyncio.run(scenario())
+
+    def test_global_dedup_delivers_an_ad_only_once(self):
+        async def scenario():
+            bot = FakeBot()
+            bot.app = FakeDeliveryApp(global_dedup=True)
+            watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+            ad = appmod.Ad(ad_id="1", url="https://www.avito.ru/1", title="Phone")
+            watcher.add_sub(appmod.Subscription(
+                id=1, user_id=1, search_key="key", url=watcher.url, only_new=False
+            ))
+            watcher.add_sub(appmod.Subscription(
+                id=2, user_id=2, search_key="key", url=watcher.url, only_new=False
+            ))
+            watcher._fetch_ads = AsyncMock(return_value=[ad])
+
+            with patch("avito_monitoring.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError)):
+                with self.assertRaises(asyncio.CancelledError):
+                    await watcher._run()
+
+            self.assertEqual(bot.app.deliveries, [1])
+            self.assertEqual(bot.app.global_sent, {"1"})
+            watcher._client.close()
+
+        asyncio.run(scenario())
 
     def test_warmup_raises_challenge_without_second_request(self):
         response = MagicMock(

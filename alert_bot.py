@@ -129,7 +129,7 @@ async def start_cmd(m: types.Message):
         def bind(data):
             data[str(main_user_id)] = int(m.chat.id)
             return dict(data)
-        data = update_json(BINDINGS_FILE, {}, bind)
+        update_json(BINDINGS_FILE, {}, bind)
         
         logger.info(f"Создана привязка: main_user_id={main_user_id} -> alert_chat_id={m.chat.id}")
         
