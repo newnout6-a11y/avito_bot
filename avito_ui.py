@@ -294,29 +294,29 @@ def _filter_preview(spec: SearchSpec) -> str:
 
     extra_info: list[str] = []
     if spec.category:
-        extra_info.append(f"Категория: <b>{html.escape(spec.category)}</b>")
+        extra_info.append(f"📁 Категория: <b>{html.escape(spec.category)}</b>")
     if spec.location:
-        extra_info.append(f"Регион: <b>{html.escape(spec.location)}</b>")
+        extra_info.append(f"📍 Регион: <b>{html.escape(spec.location)}</b>")
     if spec.color:
-        extra_info.append(f"Цвет: <b>{html.escape(spec.color)}</b>")
+        extra_info.append(f"🎨 Цвет: <b>{html.escape(spec.color)}</b>")
     if spec.delivery:
-        extra_info.append("Доставка: <b>включена</b>")
+        extra_info.append("🚚 Доставка: <b>включена</b>")
     if spec.sort_title:
-        extra_info.append(f"Сортировка: <b>{html.escape(spec.sort_title)}</b>")
+        extra_info.append(f"⏱ Сортировка: <b>{html.escape(spec.sort_title)}</b>")
 
     extra_str = ("\n" + "\n".join(extra_info)) if extra_info else ""
 
     return (
-        "<b>Проверка ссылки</b>\n\n"
-        f"Тип: <b>{'поиск' if spec.kind == 'search' else 'объявление'}</b>\n"
-        f'<a href="{html.escape(spec.canonical_url, quote=True)}">Нормализованная ссылка</a>\n\n'
-        "<b>Найденные фильтры</b>\n"
-        f"Цена: {price(filters.price_min)} — {price(filters.price_max)}\n"
-        f"Все слова: {html.escape(', '.join(filters.keywords_all)) or 'не заданы'}\n"
-        f"Любое из слов: {html.escape(', '.join(filters.keywords_any)) or 'не заданы'}\n"
-        f"Стоп-слова: {html.escape(', '.join(filters.keywords_stop)) or 'не заданы'}"
+        "🔍 <b>Проверка ссылки</b>\n\n"
+        f"📌 Тип: <b>{'поиск' if spec.kind == 'search' else 'объявление'}</b>\n"
+        f'🔗 <a href="{html.escape(spec.canonical_url, quote=True)}">Нормализованная ссылка</a>\n\n'
+        "⚙️ <b>Найденные фильтры</b>\n"
+        f"💰 Цена: {price(filters.price_min)} — {price(filters.price_max)}\n"
+        f"🔤 Все слова: {html.escape(', '.join(filters.keywords_all)) or 'не заданы'}\n"
+        f"🔀 Любое из слов: {html.escape(', '.join(filters.keywords_any)) or 'не заданы'}\n"
+        f"🚫 Стоп-слова: {html.escape(', '.join(filters.keywords_stop)) or 'не заданы'}"
         f"{extra_str}\n\n"
-        f"<b>Предупреждения</b>\n{warnings}"
+        f"⚠️ <b>Предупреждения</b>\n{warnings}"
     )
 
 
@@ -850,15 +850,15 @@ def format_sub_panel(
     access = exp.strftime("%d.%m.%Y %H:%M") if exp else "не активен"
     return (
         f"🔎 <b>{title}</b>\n"
-        f"Доступ до: <b>{access}</b>\n\n"
-        f"<b>Фильтры</b>\n"
-        f"Цена: <b>{price_min} — {price_max}</b>\n"
-        f"Все слова: {target}\n"
-        f"Любое из слов: {any_words}\n"
-        f"Стоп-слова: {stop}\n"
-        f"Только новые: <b>{'включено' if sub.only_new else 'выключено'}</b>\n\n"
-        f"API: <b>{_conversion_text(watcher)}</b>\n\n"
-        f'<a href="{url}">Открыть поиск на Avito</a>'
+        f"⏳ Доступ до: <b>{access}</b>\n\n"
+        f"⚙️ <b>Фильтры</b>\n"
+        f"💰 Цена: <b>{price_min} — {price_max}</b>\n"
+        f"🔤 Все слова: {target}\n"
+        f"🔀 Любое из слов: {any_words}\n"
+        f"🚫 Стоп-слова: {stop}\n"
+        f"🆕 Только новые: <b>{'включено' if sub.only_new else 'выключено'}</b>\n\n"
+        f"📡 API: <b>{_conversion_text(watcher)}</b>\n\n"
+        f'🔗 <a href="{url}">Открыть поиск на Avito</a>'
     )
 
 
