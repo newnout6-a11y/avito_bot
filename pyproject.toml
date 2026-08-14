@@ -9,7 +9,7 @@ description = "Telegram-based Avito listing monitor with API polling and alert d
 authors = [{name = "Avito Monitor maintainers"}]
 requires-python = ">=3.11"
 dependencies = [
-    "aiogram>=3.29,<4",
+    "aiogram>=3.30,<4",
     "requests>=2.32.4",
     "aiohttp>=3.9.5",
     "beautifulsoup4>=4.12.3",

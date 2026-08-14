@@ -777,6 +777,72 @@ class RegressionTests(unittest.TestCase):
                 self.assertIsNone(alert_bot._consume_link_token("secret"))
                 self.assertIsNone(alert_bot._consume_link_token("777"))
 
+    def test_alert_keyboard_uses_styles_copy_text_and_custom_emoji(self):
+        with patch.dict(avito_ui._BUTTON_ICON_IDS, {"primary": "emoji-1"}):
+            markup = avito_ui._alert_reply_markup(
+                "<b>Samsung</b>\nhttps://www.avito.ru/123456789"
+            )
+
+        self.assertIsNotNone(markup)
+        open_button, copy_button = (row[0] for row in markup["inline_keyboard"])
+        self.assertEqual(open_button["style"], "primary")
+        self.assertEqual(open_button["icon_custom_emoji_id"], "emoji-1")
+        self.assertEqual(open_button["url"], "https://www.avito.ru/123456789")
+        self.assertEqual(copy_button["style"], "success")
+        self.assertEqual(
+            copy_button["copy_text"]["text"], "https://www.avito.ru/123456789"
+        )
+
+    def test_alert_message_effect_retries_without_effect(self):
+        class FakeResponse:
+            def __init__(self, status, body):
+                self.status = status
+                self.body = body
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def json(self, content_type=None):
+                return self.body
+
+        class FakeSession:
+            closed = False
+
+            def __init__(self):
+                self.calls = []
+                self.responses = [
+                    FakeResponse(400, {"ok": False, "description": "bad effect"}),
+                    FakeResponse(200, {"ok": True}),
+                ]
+
+            def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                return self.responses.pop(0)
+
+        async def scenario():
+            app = object.__new__(avito_ui.App)
+            app.alert_token = "token"
+            app.alert_message_effect_id = "effect-1"
+            app._alert_session = FakeSession()
+
+            sent = await app.send_to_alert(
+                42,
+                "<b>Samsung</b>\nhttps://www.avito.ru/123456789",
+                None,
+            )
+
+            self.assertTrue(sent)
+            first_payload = app._alert_session.calls[0][1]["json"]
+            second_payload = app._alert_session.calls[1][1]["json"]
+            self.assertEqual(first_payload["message_effect_id"], "effect-1")
+            self.assertNotIn("message_effect_id", second_payload)
+            self.assertIn("reply_markup", second_payload)
+
+        asyncio.run(scenario())
+
 
 if __name__ == "__main__":
     unittest.main()

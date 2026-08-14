@@ -13,6 +13,7 @@ Avito Monitor Bot (aiogram 3.x)
 
 import asyncio
 import html
+import json
 import logging
 import os
 import re
@@ -76,12 +77,16 @@ from avito_settings import (
     ALERT_BOT_TOKEN,
     ALERT_BOT_USERNAME,
     ALERT_LINKS_FILE,
+    ALERT_MESSAGE_EFFECT_ID,
     BINDINGS_FILE,
     DEDUP_GLOBAL,
     DEDUP_TTL_DAYS,
     KEYS_FILE,
     SENT_FILE,
     SUPPORT_LINK,
+    TELEGRAM_DANGER_BUTTON_ICON_ID,
+    TELEGRAM_PRIMARY_BUTTON_ICON_ID,
+    TELEGRAM_SUCCESS_BUTTON_ICON_ID,
 )
 from avito_settings import (
     API_URLS_FILE as API_URLS_FILE,
@@ -104,16 +109,49 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
+_BUTTON_ICON_IDS = {
+    "primary": TELEGRAM_PRIMARY_BUTTON_ICON_ID,
+    "success": TELEGRAM_SUCCESS_BUTTON_ICON_ID,
+    "danger": TELEGRAM_DANGER_BUTTON_ICON_ID,
+}
+
+
+def _inline_button(*, text: str, style: Optional[str] = None, **kwargs: Any):
+    style = style or "primary"
+    icon_id = _BUTTON_ICON_IDS.get(style)
+    return types.InlineKeyboardButton(
+        text=text,
+        style=style,
+        icon_custom_emoji_id=icon_id,
+        **kwargs,
+    )
+
+
+def _keyboard_button(*, text: str, style: Optional[str] = None, **kwargs: Any):
+    style = style or "primary"
+    icon_id = _BUTTON_ICON_IDS.get(style)
+    return types.KeyboardButton(
+        text=text,
+        style=style,
+        icon_custom_emoji_id=icon_id,
+        **kwargs,
+    )
+
+
 # === Главное меню ===
 MAIN_INLINE_KB = types.InlineKeyboardMarkup(
     inline_keyboard=[
         [
-            types.InlineKeyboardButton(text="🔎 Мои поиски", callback_data="searches"),
-            types.InlineKeyboardButton(text="👤 Аккаунт", callback_data="account"),
+            _inline_button(
+                text="🔎 Мои поиски", callback_data="searches", style="primary"
+            ),
+            _inline_button(
+                text="👤 Аккаунт", callback_data="account", style="primary"
+            ),
         ],
         [
-            types.InlineKeyboardButton(text="ℹ️ Помощь", callback_data="help"),
-            types.InlineKeyboardButton(text="Поддержка", callback_data="support"),
+            _inline_button(text="ℹ️ Помощь", callback_data="help", style="primary"),
+            _inline_button(text="Поддержка", callback_data="support", style="primary"),
         ],
     ],
 )
@@ -168,6 +206,33 @@ _AVITO_URL_IN_TEXT_RE = re.compile(
 def _extract_avito_url_text(text: str) -> Optional[str]:
     match = _AVITO_URL_IN_TEXT_RE.search(text or "")
     return match.group(0) if match else None
+
+
+def _alert_reply_markup(caption: str) -> Optional[Dict[str, Any]]:
+    url = _extract_avito_url_text(html.unescape(caption or ""))
+    if not url:
+        return None
+    url = url.rstrip(".,;:!?)]}'\"")
+    rows = [
+        [
+            _inline_button(
+                text="Открыть на Avito",
+                url=url,
+                style="primary",
+            )
+        ]
+    ]
+    if len(url) <= 256:
+        rows.append(
+            [
+                _inline_button(
+                    text="Скопировать ссылку",
+                    copy_text=types.CopyTextButton(text=url),
+                    style="success",
+                )
+            ]
+        )
+    return types.InlineKeyboardMarkup(inline_keyboard=rows).model_dump(exclude_none=True)
 
 
 async def _prompt_search_name(
@@ -266,7 +331,10 @@ async def _continue_after_filter_review(message: types.Message, state: FSMContex
         await message.answer(
             "<b>Минимальная цена</b>\nВведите число или «-», если ограничения нет.",
             reply_markup=types.ReplyKeyboardMarkup(
-                keyboard=[[types.KeyboardButton(text="-")], [types.KeyboardButton(text="Отмена")]],
+                keyboard=[
+                    [_keyboard_button(text="-", style="primary")],
+                    [_keyboard_button(text="Отмена", style="danger")],
+                ],
                 resize_keyboard=True,
             ),
         )
@@ -347,12 +415,32 @@ async def wizard_got_url(message: types.Message, state: FSMContext):
         _filter_preview(parsed),
         reply_markup=types.InlineKeyboardMarkup(
             inline_keyboard=[
-                [types.InlineKeyboardButton(text="Подтвердить", callback_data="wizard_filters_confirm")],
                 [
-                    types.InlineKeyboardButton(text="Изменить цены", callback_data="wizard_filters_prices"),
-                    types.InlineKeyboardButton(text="Изменить слова", callback_data="wizard_filters_words"),
+                    _inline_button(
+                        text="Подтвердить",
+                        callback_data="wizard_filters_confirm",
+                        style="success",
+                    )
                 ],
-                [types.InlineKeyboardButton(text="Отмена", callback_data="wizard_filters_cancel")],
+                [
+                    _inline_button(
+                        text="Изменить цены",
+                        callback_data="wizard_filters_prices",
+                        style="primary",
+                    ),
+                    _inline_button(
+                        text="Изменить слова",
+                        callback_data="wizard_filters_words",
+                        style="primary",
+                    ),
+                ],
+                [
+                    _inline_button(
+                        text="Отмена",
+                        callback_data="wizard_filters_cancel",
+                        style="danger",
+                    )
+                ],
             ],
         ),
         disable_web_page_preview=True,
@@ -496,9 +584,9 @@ async def wizard_got_min(message: types.Message, state: FSMContext):
         "<b>Максимальная цена</b>\nВведите число или «-», если ограничения нет.",
         reply_markup=types.ReplyKeyboardMarkup(
             keyboard=[
-                [types.KeyboardButton(text="100000000")],
-                [types.KeyboardButton(text="-")],
-                [types.KeyboardButton(text="Отмена")],
+                [_keyboard_button(text="100000000", style="primary")],
+                [_keyboard_button(text="-", style="primary")],
+                [_keyboard_button(text="Отмена", style="danger")],
             ],
             resize_keyboard=True,
         ),
@@ -591,9 +679,9 @@ async def support_info(message: types.Message, state: FSMContext):
     await state.clear()
     kb = types.InlineKeyboardMarkup(
         inline_keyboard=[
-            [types.InlineKeyboardButton(text="Написать в поддержку", url=SUPPORT_LINK)],
+            [_inline_button(text="Написать в поддержку", url=SUPPORT_LINK)],
             [
-                types.InlineKeyboardButton(
+                _inline_button(
                     text="Назад в меню", callback_data="main_menu"
                 )
             ],
@@ -612,12 +700,12 @@ async def support_callback(cq: types.CallbackQuery):
         kb = types.InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    types.InlineKeyboardButton(
+                    _inline_button(
                         text="Написать в поддержку", url=SUPPORT_LINK
                     )
                 ],
                 [
-                    types.InlineKeyboardButton(
+                    _inline_button(
                         text="Назад в меню", callback_data="main_menu"
                     )
                 ],
@@ -658,7 +746,7 @@ def build_searches_kb(
         status = get_watcher_status(s.search_key, watchers or {})
         rows.append(
             [
-                types.InlineKeyboardButton(
+                _inline_button(
                     text=f"{status}  {label}",
                     callback_data=f"open_sub:{s.id}",
                 )
@@ -667,21 +755,21 @@ def build_searches_kb(
     if lic.is_active(user_id):
         rows.append(
             [
-                types.InlineKeyboardButton(
-                    text="＋ Создать поиск", callback_data="slot_new"
+                _inline_button(
+                    text="＋ Создать поиск", callback_data="slot_new", style="success"
                 )
             ]
         )
     else:
         rows.append(
             [
-                types.InlineKeyboardButton(
-                    text="🔑 Получить доступ", callback_data="get_slot"
+                _inline_button(
+                    text="🔑 Получить доступ", callback_data="get_slot", style="success"
                 )
             ]
         )
     rows.append(
-        [types.InlineKeyboardButton(text="Назад в меню", callback_data="main_menu")]
+        [_inline_button(text="Назад в меню", callback_data="main_menu")]
     )
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -762,33 +850,34 @@ def build_sub_inline_kb(sub: Subscription) -> types.InlineKeyboardMarkup:
     rid = sub.id
     rows = [
         [
-            types.InlineKeyboardButton(text="Цена от", callback_data=f"sub:{rid}:min"),
-            types.InlineKeyboardButton(text="Цена до", callback_data=f"sub:{rid}:max"),
+            _inline_button(text="Цена от", callback_data=f"sub:{rid}:min"),
+            _inline_button(text="Цена до", callback_data=f"sub:{rid}:max"),
         ],
         [
-            types.InlineKeyboardButton(
+            _inline_button(
                 text="Все слова", callback_data=f"sub:{rid}:pos"
             ),
-            types.InlineKeyboardButton(text="Любое слово", callback_data=f"sub:{rid}:any"),
+            _inline_button(text="Любое слово", callback_data=f"sub:{rid}:any"),
         ],
         [
-            types.InlineKeyboardButton(
+            _inline_button(
                 text="Стоп-слова", callback_data=f"sub:{rid}:stop"
             ),
-            types.InlineKeyboardButton(
+            _inline_button(
                 text=f"Только новые: {'вкл' if sub.only_new else 'выкл'}",
                 callback_data=f"sub:{rid}:toggle_new",
+                style="success" if sub.only_new else "danger",
             ),
         ],
         [
-            types.InlineKeyboardButton(
+            _inline_button(
                 text="Обновить сейчас", callback_data=f"force_update:{sub.id}"
             )
         ],
         [
-            types.InlineKeyboardButton(text="Назад", callback_data="back_to_list"),
-            types.InlineKeyboardButton(
-                text="Удалить", callback_data=f"sub:{rid}:delete"
+            _inline_button(text="Назад", callback_data="back_to_list"),
+            _inline_button(
+                text="Удалить", callback_data=f"sub:{rid}:delete", style="danger"
             ),
         ],
     ]
@@ -883,12 +972,12 @@ async def cb_get_slot(cq: types.CallbackQuery):
         kb = types.InlineKeyboardMarkup(
             inline_keyboard=[
                 [
-                    types.InlineKeyboardButton(
+                    _inline_button(
                         text="Написать в поддержку", url=SUPPORT_LINK
                     )
                 ],
                 [
-                    types.InlineKeyboardButton(
+                    _inline_button(
                         text="Назад к поискам", callback_data="back_to_list"
                     )
                 ],
@@ -1033,13 +1122,14 @@ async def cb_sub_actions(cq: types.CallbackQuery, state: FSMContext):
             kb = types.InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
-                        types.InlineKeyboardButton(
+                        _inline_button(
                             text="Удалить поиск",
                             callback_data=f"sub:{sub.id}:delete_confirm",
+                            style="danger",
                         )
                     ],
                     [
-                        types.InlineKeyboardButton(
+                        _inline_button(
                             text="Отмена", callback_data=f"sub:{sub.id}:delete_cancel"
                         )
                     ],
@@ -1213,9 +1303,15 @@ async def _accept_key_impl(m: types.Message, state: FSMContext):
     deeplink = app.alert_deeplink(m.chat.id)
     kb = types.InlineKeyboardMarkup(
         inline_keyboard=[
-            [types.InlineKeyboardButton(text="1. Подключить оповещения", url=deeplink)],
             [
-                types.InlineKeyboardButton(
+                _inline_button(
+                    text="1. Подключить оповещения",
+                    url=deeplink,
+                    style="success",
+                )
+            ],
+            [
+                _inline_button(
                     text="2. Создать поиск", callback_data="slot_new"
                 )
             ],
@@ -1281,13 +1377,15 @@ def build_account_kb() -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                types.InlineKeyboardButton(
+                _inline_button(
                     text="История ключей", callback_data="account:expired"
                 ),
-                types.InlineKeyboardButton(text="Продлить доступ", url=SUPPORT_LINK),
+                _inline_button(
+                    text="Продлить доступ", url=SUPPORT_LINK, style="success"
+                ),
             ],
             [
-                types.InlineKeyboardButton(
+                _inline_button(
                     text="Назад в меню", callback_data="main_menu"
                 )
             ],
@@ -1364,6 +1462,7 @@ class App:
         # alert
         self.alert_token: Optional[str] = ALERT_BOT_TOKEN
         self.alert_username: str = ALERT_BOT_USERNAME
+        self.alert_message_effect_id: Optional[str] = ALERT_MESSAGE_EFFECT_ID
         self.bindings_file: str = BINDINGS_FILE
         self.alert_links_file: str = ALERT_LINKS_FILE
         self._alert_warned: Set[int] = set()
@@ -1424,42 +1523,67 @@ class App:
             return False
         api = f"https://api.telegram.org/bot{self.alert_token}"
         safe_caption = _br(caption)
+        reply_markup = _alert_reply_markup(safe_caption)
         if self._alert_session is None or self._alert_session.closed:
             self._alert_session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=10)
             )
         session = self._alert_session
         try:
-            if image_url:
-                form = aiohttp.FormData()
-                form.add_field("chat_id", str(alert_chat_id))
-                form.add_field("caption", safe_caption)
-                form.add_field("parse_mode", "HTML")
-                form.add_field("photo", image_url)
-                request = session.post(f"{api}/sendPhoto", data=form)
-            else:
-                payload = {
-                    "chat_id": alert_chat_id,
-                    "text": safe_caption,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                }
-                request = session.post(f"{api}/sendMessage", json=payload)
+            effect_attempts = (
+                (self.alert_message_effect_id, None)
+                if self.alert_message_effect_id
+                else (None,)
+            )
+            for effect_id in effect_attempts:
+                if image_url:
+                    form = aiohttp.FormData()
+                    form.add_field("chat_id", str(alert_chat_id))
+                    form.add_field("caption", safe_caption)
+                    form.add_field("parse_mode", "HTML")
+                    form.add_field("photo", image_url)
+                    if reply_markup:
+                        form.add_field(
+                            "reply_markup",
+                            json.dumps(reply_markup, ensure_ascii=False),
+                        )
+                    if effect_id:
+                        form.add_field("message_effect_id", effect_id)
+                    request = session.post(f"{api}/sendPhoto", data=form)
+                else:
+                    payload = {
+                        "chat_id": alert_chat_id,
+                        "text": safe_caption,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    }
+                    if reply_markup:
+                        payload["reply_markup"] = reply_markup
+                    if effect_id:
+                        payload["message_effect_id"] = effect_id
+                    request = session.post(f"{api}/sendMessage", json=payload)
 
-            async with request as response:
-                body = await response.json(content_type=None)
-                ok = (
-                    response.status == 200
-                    and isinstance(body, dict)
-                    and body.get("ok") is True
-                )
-                if not ok:
+                async with request as response:
+                    body = await response.json(content_type=None)
+                    if (
+                        response.status == 200
+                        and isinstance(body, dict)
+                        and body.get("ok") is True
+                    ):
+                        return True
+                    if effect_id:
+                        logger.warning(
+                            "Alert message effect was rejected; retrying without it: %s",
+                            body,
+                        )
+                        continue
                     logger.error(
                         "Alert Bot API rejected notification: status=%s response=%s",
                         response.status,
                         body,
                     )
-                return ok
+                    return False
+            return False
         except (aiohttp.ClientError, asyncio.TimeoutError, TypeError, ValueError) as exc:
             logger.exception("Alert notification failed: %s", exc)
             return False

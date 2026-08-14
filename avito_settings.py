@@ -39,6 +39,12 @@ ADMIN_CHAT_ID: Optional[int] = (
 
 ALERT_BOT_TOKEN = os.getenv("ALERT_BOT_TOKEN")
 ALERT_BOT_USERNAME = os.getenv("ALERT_BOT_USERNAME", "")
+# Optional Telegram message effect ID. Effects are supported in private chats;
+# an alert is retried without the effect if Telegram rejects the configured ID.
+ALERT_MESSAGE_EFFECT_ID = os.getenv("ALERT_MESSAGE_EFFECT_ID") or None
+TELEGRAM_PRIMARY_BUTTON_ICON_ID = os.getenv("TELEGRAM_PRIMARY_BUTTON_ICON_ID") or None
+TELEGRAM_SUCCESS_BUTTON_ICON_ID = os.getenv("TELEGRAM_SUCCESS_BUTTON_ICON_ID") or None
+TELEGRAM_DANGER_BUTTON_ICON_ID = os.getenv("TELEGRAM_DANGER_BUTTON_ICON_ID") or None
 BINDINGS_FILE = os.getenv("BINDINGS_FILE", "user_bindings.json")
 ALERT_LINKS_FILE = os.getenv("ALERT_LINKS_FILE", "alert_links.json")
 
