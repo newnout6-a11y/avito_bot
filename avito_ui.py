@@ -300,7 +300,7 @@ def _filter_preview(spec: SearchSpec) -> str:
     if spec.color:
         extra_info.append(f"Цвет: <b>{html.escape(spec.color)}</b>")
     if spec.delivery:
-        extra_info.append("Доставка: <b>включена (cd=1)</b>")
+        extra_info.append("Доставка: <b>включена</b>")
     if spec.sort_title:
         extra_info.append(f"Сортировка: <b>{html.escape(spec.sort_title)}</b>")
 
