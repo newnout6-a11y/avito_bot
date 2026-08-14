@@ -25,7 +25,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -639,6 +639,45 @@ def parse_api_items(payload: Dict[str, Any], limit: int = 20) -> List[Dict[str, 
     return parse_api_feed(payload, limit).items
 
 
+def parse_relative_date(text: str, now: Optional[float] = None) -> Optional[float]:
+    """
+    Парсинг относительной/человекочитаемой даты Авито в unix timestamp (сек).
+    'только что' -> now
+    '15 минут назад' -> now - 15*60
+    '2 часа назад' -> now - 2*3600
+    'сегодня в 14:30' / 'вчера в 12:48' -> timestamp
+    """
+    if not text:
+        return None
+    if now is None:
+        now = time.time()
+    s = text.lower().strip()
+    if any(k in s for k in ("только что", "секунд назад", "прямо сейчас")):
+        return now
+    m_min = re.search(r"(\d+)\s+мин", s)
+    if m_min:
+        return now - int(m_min.group(1)) * 60
+    if "минуту назад" in s or "минуты назад" in s:
+        return now - 60
+    m_hr = re.search(r"(\d+)\s+час", s)
+    if m_hr:
+        return now - int(m_hr.group(1)) * 3600
+    if "час назад" in s or "часа назад" in s:
+        return now - 3600
+    m_day = re.search(r"(\d+)\s+дн", s)
+    if m_day:
+        return now - int(m_day.group(1)) * 86400
+    m_time = re.search(r"(сегодня|вчера)\s+в\s+(\d{1,2}):(\d{2})", s)
+    if m_time:
+        day_word, hh, mm = m_time.groups()
+        dt = datetime.now()
+        if day_word == "вчера":
+            dt -= timedelta(days=1)
+        dt = dt.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+        return dt.timestamp()
+    return None
+
+
 def parse_html_feed(html_text: str, limit: int = 50) -> List[Dict[str, Any]]:
     """
     Парсинг карточек объявлений напрямую из HTML страницы поисковой выдачи Avito.
@@ -650,6 +689,7 @@ def parse_html_feed(html_text: str, limit: int = 50) -> List[Dict[str, Any]]:
     if not items_elements:
         items_elements = soup.select('div[itemprop="itemListElement"]')
     ads: List[Dict[str, Any]] = []
+    now = time.time()
     for item in items_elements[:limit]:
         item_id = item.get("data-item-id") or item.get("id")
         title_el = item.select_one('[itemprop="name"], [data-marker="item-title"]')
@@ -677,6 +717,7 @@ def parse_html_feed(html_text: str, limit: int = 50) -> List[Dict[str, Any]]:
         description = desc_el.get_text(strip=True) if desc_el else ""
         date_el = item.select_one('[data-marker="item-date"]')
         date_str = date_el.get_text(strip=True) if date_el else ""
+        published_ts = parse_relative_date(date_str, now)
         loc_el = item.select_one('[class*="geo"], [data-marker="item-address"]')
         location = loc_el.get_text(strip=True) if loc_el else ""
         ads.append({
@@ -686,7 +727,7 @@ def parse_html_feed(html_text: str, limit: int = 50) -> List[Dict[str, Any]]:
             "price": price,
             "location": location,
             "date_str": date_str,
-            "published_ts": None,
+            "published_ts": published_ts,
             "description": description,
             "image_url": image_url,
             "seller_id": None,

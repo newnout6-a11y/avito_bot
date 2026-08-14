@@ -25,7 +25,7 @@ AVITO_ENRICH = os.getenv("AVITO_ENRICH", "0") == "1"
 API_URLS_FILE = os.getenv("API_URLS_FILE", "api_urls.json")
 SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/Multiscan_service1")
 PRIME_ON_START = os.getenv("PRIME_ON_START", "1") == "1"
-START_STRICT = os.getenv("START_STRICT", "0") == "1"
+START_STRICT = os.getenv("START_STRICT", "1") == "1"
 START_GRACE_SEC = int(os.getenv("START_GRACE_SEC", "10"))
 DISPLAY_TZ_NAME = os.getenv("DISPLAY_TZ", "Europe/Moscow")
 DISPLAY_TZ_OFFSET_MIN = int(os.getenv("DISPLAY_TZ_OFFSET_MIN", "180"))

@@ -436,6 +436,14 @@ class Watcher:
                             and ad.published_ts is not None
                             and ad.published_ts + START_GRACE_SEC < sub.started_ts
                         ):
+                            logger.info(
+                                "Пропуск %s (%s) для sub=%s: старое объявление (дата: %s, поиск запущен: %s)",
+                                ad.ad_id,
+                                ad.title,
+                                sub.id,
+                                ad.date_str or _fmt_dt(ad.published_ts),
+                                _fmt_dt(sub.started_ts),
+                            )
                             continue
                         if not self._ad_passes_filters(ad, sub):
                             logger.info(
