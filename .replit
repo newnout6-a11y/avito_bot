@@ -1,4 +1,4 @@
-entrypoint = "main.py"
+entrypoint = "avito_monitor_bot.py"
 modules = ["python-3.11"]
 
 [nix]
@@ -9,7 +9,7 @@ packages = ["mailutils"]
 language = "python3"
 
 [gitHubImport]
-requiredFiles = [".replit", "replit.nix"]
+requiredFiles = [".replit", "avito_monitor_bot.py"]
 
 [deployment]
 run = "python avito_monitor_bot.py"

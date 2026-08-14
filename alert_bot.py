@@ -7,13 +7,14 @@ Alert (notifier) bot for Avito Monitor
 """
 
 import os
-import json
 import asyncio
 import logging
+import time
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
+from storage import load_json, save_json, update_json
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -26,9 +27,23 @@ except Exception:
         return None
 
 BINDINGS_FILE = os.getenv("BINDINGS_FILE", "user_bindings.json")
+ALERT_LINKS_FILE = os.getenv("ALERT_LINKS_FILE", "alert_links.json")
 SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/Multiscan_service1")
 
 router = Router(name="alert")
+
+SUPPORT_KB = types.InlineKeyboardMarkup(inline_keyboard=[
+    [types.InlineKeyboardButton(text="Поддержка", url=SUPPORT_LINK)],
+])
+
+
+def _consume_link_token(token: str):
+    def consume(links):
+        record = links.pop(token, None)
+        if record and float(record.get("expires", 0)) >= time.time():
+            return int(record["user_id"])
+        return None
+    return update_json(ALERT_LINKS_FILE, {}, consume)
 
 def _load_bindings():
     """Безопасная загрузка привязок"""
@@ -39,28 +54,21 @@ def _load_bindings():
             _save_bindings({})
             return {}
         
-        with open(BINDINGS_FILE, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            if not content:
-                logger.info("Файл привязок пустой")
-                return {}
-            
-            raw_data = json.loads(content)
-            if not raw_data:
-                logger.info("Данные привязок пустые")
-                return {}
-                
-            # Конвертируем в правильный формат
-            data = {}
-            for k, v in raw_data.items():
-                try:
-                    data[str(k)] = int(v)
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"Пропускаем некорректную запись {k}: {v}, ошибка: {e}")
-                    continue
-            
-            logger.info(f"Загружены привязки: {data}")
-            return data
+        raw_data = load_json(BINDINGS_FILE, {})
+        if not raw_data:
+            logger.info("Данные привязок пустые")
+            return {}
+
+        data = {}
+        for k, v in raw_data.items():
+            try:
+                data[str(k)] = int(v)
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Пропускаем некорректную запись {k}: {v}, ошибка: {e}")
+                continue
+
+        logger.info("Загружено привязок: %s", len(data))
+        return data
             
     except Exception as e:
         logger.error(f"Критическая ошибка загрузки привязок: {e}")
@@ -84,32 +92,12 @@ def _save_bindings(data):
                 continue
         
         # Сохраняем с блокировкой
-        temp_file = BINDINGS_FILE + ".tmp"
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(save_data, f, ensure_ascii=False, indent=2)
+        save_json(BINDINGS_FILE, save_data)
         
-        # Атомарно перемещаем временный файл
-        os.replace(temp_file, BINDINGS_FILE)
+        logger.info("Сохранено привязок: %s", len(save_data))
         
-        logger.info(f"Привязки успешно сохранены: {save_data}")
-        
-        # Проверяем, что файл действительно сохранился
-        if os.path.exists(BINDINGS_FILE):
-            with open(BINDINGS_FILE, "r", encoding="utf-8") as f:
-                verify_data = json.load(f)
-                logger.info(f"Проверка сохранения: {verify_data}")
-        else:
-            logger.error("Файл не был создан!")
-            
     except Exception as e:
         logger.error(f"Критическая ошибка сохранения привязок: {e}")
-        # Удаляем временный файл если он остался
-        temp_file = BINDINGS_FILE + ".tmp"
-        if os.path.exists(temp_file):
-            try:
-                os.remove(temp_file)
-            except:
-                pass
 
 @router.message(Command("start"))
 async def start_cmd(m: types.Message):
@@ -121,42 +109,39 @@ async def start_cmd(m: types.Message):
         # Проверяем аргументы команды
         if len(args) >= 2:
             arg = args[1].strip()
-            # Убираем возможные префиксы и проверяем, что это число
-            if arg.lstrip("-").isdigit():
-                main_user_id = int(arg)
-            else:
-                logger.warning(f"Некорректный аргумент start: {arg}")
+            try:
+                main_user_id = _consume_link_token(arg)
+            except Exception as exc:
+                logger.error("Ошибка проверки токена привязки: %s", exc)
         
         if main_user_id is None:
             await m.answer(
-                "Это бот-оповещатель для Avito Monitor.\n\n"
-                "Для привязки используйте кнопку из основного бота после активации ключа.\n\n"
-                f"Поддержка: {SUPPORT_LINK}",
-                disable_web_page_preview=True
+                "<b>Оповещения Avito</b>\n\n"
+                "Откройте основной бот и нажмите кнопку подключения оповещений.",
+                reply_markup=SUPPORT_KB,
+                disable_web_page_preview=True,
             )
             return
         
-        # Сохраняем привязку
-        data = _load_bindings()
-        data[str(main_user_id)] = int(m.chat.id)
-        _save_bindings(data)
+        # Одноразовый токен подтверждает, что ссылку создал основной бот.
+        def bind(data):
+            data[str(main_user_id)] = int(m.chat.id)
+            return dict(data)
+        data = update_json(BINDINGS_FILE, {}, bind)
         
         logger.info(f"Создана привязка: main_user_id={main_user_id} -> alert_chat_id={m.chat.id}")
-        logger.info(f"Все привязки после сохранения: {data}")
         
         await m.answer(
-            "✅ Привязка выполнена успешно!\n\n"
-            f"Ваш chat_id: <code>{m.chat.id}</code>\n"
-            f"Основной пользователь: <code>{main_user_id}</code>\n\n"
-            "Теперь вернитесь в основной бот и создайте поиск."
+            "✅ <b>Оповещения подключены</b>\n\n"
+            "Новые объявления будут приходить сюда. Теперь можно вернуться в основной бот."
         )
         
     except Exception as e:
         logger.error(f"Ошибка в start_cmd: {e}")
         await m.answer(
-            "Произошла ошибка при обработке команды. Попробуйте еще раз или обратитесь в поддержку.\n\n"
-            f"Поддержка: {SUPPORT_LINK}",
-            disable_web_page_preview=True
+            "Не удалось подключить оповещения. Создайте новую ссылку в основном боте.",
+            reply_markup=SUPPORT_KB,
+            disable_web_page_preview=True,
         )
 
 @router.message(Command("id"))
@@ -173,21 +158,17 @@ async def status_cmd(m: types.Message):
     """Проверить статус привязок"""
     try:
         # Детальная диагностика
-        logger.info(f"=== ДИАГНОСТИКА STATUS ===")
+        logger.info("=== ДИАГНОСТИКА STATUS ===")
         logger.info(f"Файл привязок: {BINDINGS_FILE}")
         logger.info(f"Файл существует: {os.path.exists(BINDINGS_FILE)}")
         
         if os.path.exists(BINDINGS_FILE):
             try:
-                with open(BINDINGS_FILE, "r", encoding="utf-8") as f:
-                    raw_content = f.read()
-                logger.info(f"Содержимое файла: '{raw_content}'")
-                logger.info(f"Размер файла: {len(raw_content)} символов")
+                logger.info("Файл привязок доступен")
             except Exception as read_e:
                 logger.error(f"Ошибка чтения файла: {read_e}")
         
         data = _load_bindings()
-        logger.info(f"Загружены привязки: {data} (тип: {type(data)})")
         logger.info(f"Текущий chat_id: {m.chat.id} (тип: {type(m.chat.id)})")
         
         # Ищем привязку для текущего chat_id
@@ -204,26 +185,13 @@ async def status_cmd(m: types.Message):
         logger.info(f"Найденные привязки: {found_bindings}")
         
         if found_bindings:
-            bindings_text = "\n".join([f"• Main user ID: <code>{uid}</code>" for uid in found_bindings])
-            await m.answer(f"✅ Активные привязки:\n{bindings_text}")
+            await m.answer("✅ <b>Оповещения подключены</b>\nБот готов принимать новые объявления.")
         else:
-            # Показываем детальную диагностику
-            status_lines = [
-                f"❌ Привязки для chat_id {m.chat.id} не найдены",
-                f"",
-                f"📋 Диагностика:",
-                f"• Файл существует: {os.path.exists(BINDINGS_FILE)}",
-                f"• Всего привязок: {len(data)}",
-            ]
-            
-            if data:
-                status_lines.append(f"• Все привязки:")
-                for mid, aid in data.items():
-                    status_lines.append(f"  {mid} → {aid}")
-            else:
-                status_lines.append(f"• Файл пустой или данные не загружены")
-            
-            await m.answer("\n".join(status_lines))
+            await m.answer(
+                "⚪ <b>Оповещения не подключены</b>\n"
+                "Используйте кнопку подключения в основном боте.",
+                reply_markup=SUPPORT_KB,
+            )
             
     except Exception as e:
         logger.error(f"Критическая ошибка в status_cmd: {e}")
@@ -231,15 +199,12 @@ async def status_cmd(m: types.Message):
 
 @router.message(F.text)
 async def echo(m: types.Message):
-    """Эхо-обработчик для проверки работы бота"""
+    """Показывает назначение бота вместо эхо-ответа."""
     try:
         await m.answer(
-            f"🤖 Бот-оповещатель активен\n"
-            f"Ваш chat_id: <code>{m.chat.id}</code>\n\n"
-            f"Команды:\n"
-            f"• /start <main_user_id> — привязка\n"
-            f"• /id — показать ваш chat_id\n"
-            f"• /status — проверить привязки"
+            "<b>Оповещения Avito</b>\n"
+            "Этот чат предназначен для новых объявлений.\n\n"
+            "Проверить подключение: /status"
         )
     except Exception as e:
         logger.error(f"Ошибка в echo: {e}")
@@ -264,9 +229,8 @@ async def main():
         
         # Устанавливаем команды бота
         await bot.set_my_commands([
-            types.BotCommand(command="start", description="Привязать к основному боту"),
-            types.BotCommand(command="id", description="Показать ваш chat_id"),
-            types.BotCommand(command="status", description="Проверить привязки"),
+            types.BotCommand(command="start", description="Открыть бот"),
+            types.BotCommand(command="status", description="Проверить подключение"),
         ])
         
         logger.info("Alert-бот запущен успешно")

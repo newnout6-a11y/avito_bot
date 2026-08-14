@@ -121,6 +121,15 @@ celerybeat.pid
 
 # Environments
 .env
+accounts.json
+issued_keys.json
+keys.sqlite3*
+sent_ads.json
+subscriptions.json
+user_bindings.json
+alert_links.json
+*.lock
+*.tmp
 .venv
 env/
 venv/

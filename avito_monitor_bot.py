@@ -1,12 +1,14 @@
-
 # -*- coding: utf-8 -*-
 """
 Avito Monitor Bot (aiogram 3.x)
-— v4.3 (fixed) - ИСПРАВЛЕННАЯ ВЕРСИЯ
-   • Исправлены критические ошибки парсинга
-   • Обновлены селекторы под текущую версию Авито
-   • Исправлена обработка URL и изображений
-   • Улучшена обработка цен и дат
+— v5.0 (API-first) — ИСПРАВЛЕННАЯ ВЕРСИЯ
+    • Переход на JSON API Авито (web/1/js/items) вместо мёртвого HTML-парсера
+    • Классификация блокировок Qrator (403 rate_limit, 429 ip_block, 439 challenge)
+    • Прогрев сессии + браузерные заголовки
+    • Умный бэкофф с Retry-After + экспонентой
+    • Удобное управление (инлайн-меню + статусы)
+    • Легко добавлять прокси со сменой IP
+    • Rerun `python test_regressions.py` — все тесты должны пройти
 """
 
 import os
@@ -17,6 +19,15 @@ import html
 import base64
 import json
 import aiohttp
+import random
+from avito_api import (
+    AvitoBlock,
+    AvitoHttpClient,
+    AvitoHttpError,
+    convert_url_to_api,
+    invalidate_cached_api_url,
+    parse_api_items,
+)
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Deque, Callable, cast, Any, Set
 from collections import deque
@@ -24,6 +35,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, urlunparse, parse_qs, parse_qsl, urlencode, unquote
 import uuid
 import logging
+import secrets
 
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.enums import ParseMode
@@ -33,7 +45,8 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from bs4 import BeautifulSoup  # type: ignore[reportMissingImports]
-from bs4.element import Tag, NavigableString, PageElement
+from bs4.element import Tag
+from storage import load_json, save_json, update_json
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +61,8 @@ except Exception:
     def load_dotenv(*args, **kwargs):  # type: ignore
         return None
 
+load_dotenv()
+
 # keep-alive (Replit/Render). Если модуля нет — no-op.
 try:
     from background import keep_alive  # type: ignore
@@ -58,12 +73,17 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 # ===== ENV =====
-FRESH_WINDOW_SEC = int(os.getenv("FRESH_WINDOW_SEC", "300"))  # Увеличено до 5 минут
-POLL_PERIOD_SEC = int(os.getenv("POLL_PERIOD_SEC", "45"))     # Уменьшено для более частых проверок
+POLL_PERIOD_SEC = int(os.getenv("POLL_PERIOD_SEC", "180"))    # минимальный период опроса (сек)
+POLL_PERIOD_MAX_SEC = int(os.getenv("POLL_PERIOD_MAX_SEC", "300"))
+AVITO_REQUEST_GAP_SEC = float(os.getenv("AVITO_REQUEST_GAP_SEC", "5"))
+AVITO_PROXIES = [value.strip() for value in os.getenv("AVITO_PROXIES", "").split(",") if value.strip()]
+AVITO_PROXY_CHANGE_URLS = [value.strip() for value in os.getenv("AVITO_PROXY_CHANGE_URLS", "").split(",") if value.strip()]
+AVITO_ENRICH = os.getenv("AVITO_ENRICH", "0") == "1"          # догрузка страниц объявлений (доп. запросы = выше риск блока)
+API_URLS_FILE = os.getenv("API_URLS_FILE", "api_urls.json")  # кэш конвертации URL -> API
 SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/Multiscan_service1")
-PRIME_ON_START = os.getenv("PRIME_ON_START", "1") == "1"      # Включено по умолчанию
-START_STRICT = os.getenv("START_STRICT", "1") == "1"
-START_GRACE_SEC = int(os.getenv("START_GRACE_SEC", "10"))     # Увеличена grace period
+PRIME_ON_START = os.getenv("PRIME_ON_START", "1") == "1"
+START_STRICT = os.getenv("START_STRICT", "0") == "1"
+START_GRACE_SEC = int(os.getenv("START_GRACE_SEC", "10"))
 DISPLAY_TZ_NAME = os.getenv("DISPLAY_TZ", "Europe/Moscow")
 DISPLAY_TZ_OFFSET_MIN = int(os.getenv("DISPLAY_TZ_OFFSET_MIN", "180"))
 
@@ -75,6 +95,7 @@ ADMIN_CHAT_ID: Optional[int] = int(_ADMIN_STR) if (_ADMIN_STR and _ADMIN_STR.lst
 ALERT_BOT_TOKEN   = os.getenv("ALERT_BOT_TOKEN")              # токен бота-оповещателя
 ALERT_BOT_USERNAME = os.getenv("ALERT_BOT_USERNAME", "")      # юзернейм бота-оповещателя без @
 BINDINGS_FILE     = os.getenv("BINDINGS_FILE", "user_bindings.json")  # привязки main_user_id -> alert_chat_id
+ALERT_LINKS_FILE  = os.getenv("ALERT_LINKS_FILE", "alert_links.json")
 
 # ===== Файлы хранения =====
 KEYS_FILE = os.getenv("KEYS_FILE", "issued_keys.json")
@@ -82,11 +103,11 @@ SENT_FILE = os.getenv("SENT_FILE", "sent_ads.json")           # { user_id: { ad_
 ACCOUNTS_FILE = os.getenv("ACCOUNTS_FILE", "accounts.json")   # учётка пользователя
 DEDUP_TTL_DAYS = int(os.getenv("DEDUP_TTL_DAYS", "14"))       # сколько хранить следы
 DEDUP_GLOBAL = os.getenv("DEDUP_GLOBAL", "1") == "1"          # глобальный антидубликат
+SUBSCRIPTIONS_FILE = os.getenv("SUBSCRIPTIONS_FILE", "subscriptions.json")
 
 # ===== Регэксп ключа =====
 KEY_RE = re.compile(
-    r'^\s*(?:ключ\s*:\s*)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*$',
-    re.I
+    r'(?i)(?:^|\s)(?:ключ\s*:\s*)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\s|$)'
 )
 
 # ===== helpers =====
@@ -103,6 +124,22 @@ def _fmt_dt(ts: Optional[float]) -> str:
     if not ts:
         return "—"
     return datetime.fromtimestamp(float(ts), _tz()).strftime("%d.%m.%Y %H:%M:%S")
+
+def _parse_price_input(value: str) -> Optional[int]:
+    normalized = (value or "").strip().replace("\u00a0", "").replace(" ", "").replace(".", "")
+    return int(normalized) if normalized.isdigit() else None
+
+def _br(text: str) -> str:
+    """
+    Больше НЕ используем <br>, чтобы не ловить ошибку Telegram:
+    'can't parse entities: Unsupported start tag "br"'.
+    На входе может прийти текст, где уже есть <br> — мы превратим их в \\n.
+    """
+    t = (text or "")
+    # обезвреживаем все варианты <br>
+    t = t.replace("<br/>", "\n").replace("<br />", "\n").replace("<br>", "\n")
+    t = t.replace("\\n", "\n")
+    return t
 
 # ==== LICENSE ====
 class LicenseManager:
@@ -166,79 +203,22 @@ def search_key_from_url(url: str) -> str:
 
 
 def is_valid_avito_url(url: str) -> bool:
-    from urllib.parse import urlparse
     parsed = urlparse(url)
-    return bool(parsed.netloc) and parsed.netloc.endswith('avito.ru')
+    host = (parsed.hostname or "").rstrip(".").lower()
+    return parsed.scheme in {"http", "https"} and (host == "avito.ru" or host.endswith(".avito.ru"))
 
 
 def avito_short_url(full_url: str) -> str:
-    m = re.search(r"/(\d{7,})", full_url)
+    m = re.search(r"(?:/|_)(\d{7,})(?:[/?#]|$)", full_url)
     if m:
         return f"https://www.avito.ru/{m.group(1)}"
     u = urlparse(full_url)
     return urlunparse((u.scheme or "https", u.netloc or "www.avito.ru", u.path, "", "", ""))
 
 
-_MONTHS_RU = {
-    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
-    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
-}
-
-
-def _parse_avito_date(date_str: str):
-    """Исправленная функция парсинга дат Авито"""
-    if not date_str:
-        return None
-    s = date_str.strip().lower()
-    now = datetime.now()
-    
-    # Только что
-    if "только что" in s:
-        return now.timestamp()
-    
-    # X минут назад
-    m = re.search(r"(\d+)\s*минут", s)
-    if m:
-        return (now - timedelta(minutes=int(m.group(1)))).timestamp()
-    
-    # Минуту назад
-    if "минуту назад" in s:
-        return (now - timedelta(minutes=1)).timestamp()
-    
-    # X часов назад
-    m = re.search(r"(\d+)\s*час", s)
-    if m:
-        return (now - timedelta(hours=int(m.group(1)))).timestamp()
-    
-    # Час назад  
-    if "час назад" in s:
-        return (now - timedelta(hours=1)).timestamp()
-    
-    # Сегодня/вчера HH:MM
-    m = re.search(r"(сегодня|вчера)[,\s]+(\d{1,2}:\d{2})", s)
-    if m:
-        day = now.date() if m.group(1) == "сегодня" else (now - timedelta(days=1)).date()
-        hh, mm = map(int, m.group(2).split(":"))
-        return datetime(day.year, day.month, day.day, hh, mm).timestamp()
-    
-    # DD месяц HH:MM
-    m = re.search(r"(\d{1,2})\s+([а-я]+)[,\s]+(\d{1,2}:\d{2})", s)
-    if m:
-        dd = int(m.group(1))
-        mon = _MONTHS_RU.get(m.group(2))
-        hh, mm = map(int, m.group(3).split(":"))
-        if mon:
-            return datetime(datetime.now().year, mon, dd, hh, mm).timestamp()
-    
-    # DD месяц (без времени)
-    m = re.search(r"(\d{1,2})\s+([а-я]+)$", s)
-    if m:
-        dd = int(m.group(1))
-        mon = _MONTHS_RU.get(m.group(2))
-        if mon:
-            return datetime(datetime.now().year, mon, dd, 0, 0).timestamp()
-    
-    return None
+def _extract_ad_id(url: str) -> str:
+    match = re.search(r"(?:/|_)(\d{7,})(?:[/?#]|$)", url)
+    return match.group(1) if match else url
 
 
 @dataclass
@@ -322,6 +302,10 @@ def try_extract_filters_from_url(url: str) -> SubscriberFilter:
 
 
 class Watcher:
+    _request_lock = asyncio.Lock()
+    _last_request_at = 0.0
+    _route_blocked_until: Dict[str, float] = {}
+
     def __init__(
         self,
         search_key: str,
@@ -335,16 +319,24 @@ class Watcher:
         self.subscribers: Dict[int, Subscription] = {}
         self.task: Optional[asyncio.Task] = None
         self.seen: Dict[str, float] = {}
-        self.interval_min = self.interval_max = self._interval = max(1.0, float(POLL_PERIOD_SEC))
-        self._session: Optional["aiohttp.ClientSession"] = None
+        self.interval_min = max(30.0, float(POLL_PERIOD_SEC))
+        self.interval_max = max(self.interval_min, float(POLL_PERIOD_MAX_SEC))
+        self._interval = self.interval_min
+        self._proxy_index = abs(hash(search_key)) % len(AVITO_PROXIES) if AVITO_PROXIES else 0
+        self._client = AvitoHttpClient(proxy=self._proxy(), proxy_change_url=self._proxy_change_url())
         self.on_deliver = on_deliver
         self._enrich_cache: set[str] = set()
+        self._api_url: Optional[str] = None
+        self._blocked_until = 0.0
+        self._consecutive_blocks = 0
+        self.last_http_status: Optional[int] = None
+        self.last_block_kind: Optional[str] = None
 
     async def start(self):
         if self.task and not self.task.done():
             return
         if PRIME_ON_START:
-            await self._prime_seen(30)  # Увеличено количество для priming
+            await self._prime_seen(30)
         self.task = asyncio.create_task(self._run(), name=f"watch:{self.search_key}")
 
     async def stop(self):
@@ -355,25 +347,50 @@ class Watcher:
             except asyncio.CancelledError:
                 pass
             self.task = None
-        if self._session:
-            await self._session.close()
-            self._session = None
+        self._client.close()
 
     def has_subscribers(self):
         return bool(self.subscribers)
 
     def add_sub(self, sub: Subscription):
-        self.subscribers[sub.user_id] = sub
+        self.subscribers[sub.id] = sub
 
-    def remove_sub(self, user_id: int):
-        self.subscribers.pop(user_id, None)
+    def remove_sub(self, sub_id: int):
+        self.subscribers.pop(sub_id, None)
 
-    async def _ensure_session(self):
-        import aiohttp
-        if self._session and not self._session.closed:
-            return self._session
-        self._session = aiohttp.ClientSession()
-        return self._session
+    def _proxy(self) -> Optional[str]:
+        return AVITO_PROXIES[self._proxy_index] if AVITO_PROXIES else None
+
+    def _route_key(self) -> str:
+        return self._proxy() or "direct"
+
+    def _proxy_change_url(self) -> Optional[str]:
+        if AVITO_PROXY_CHANGE_URLS and self._proxy_index < len(AVITO_PROXY_CHANGE_URLS):
+            return AVITO_PROXY_CHANGE_URLS[self._proxy_index] or None
+        return None
+
+    def _rotate_proxy(self) -> bool:
+        changed_ip = self._client.request_new_ip()
+        if len(AVITO_PROXIES) > 1:
+            self._proxy_index = (self._proxy_index + 1) % len(AVITO_PROXIES)
+            self._client.set_proxy(self._proxy(), self._proxy_change_url())
+            return True
+        self._client.reset()
+        return changed_ip
+
+    async def _wait_global_rate_limit(self) -> None:
+        async with Watcher._request_lock:
+            wait = AVITO_REQUEST_GAP_SEC - (time.monotonic() - Watcher._last_request_at)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            Watcher._last_request_at = time.monotonic()
+
+    async def _avito_get(self, url: str):
+        await self._wait_global_rate_limit()
+        if not self._client.warmed_at:
+            await asyncio.to_thread(self._client.warmup)
+        return await asyncio.to_thread(self._client.session.get, url, timeout=30, allow_redirects=False,
+                                       headers={"Accept-Language": "ru,en;q=0.9", "referer": "https://www.avito.ru/"})
 
     def _fmt_price(self, v: Optional[int]) -> str:
         if v is None:
@@ -382,82 +399,54 @@ class Watcher:
 
     async def _enrich_ad_details(self, ad: Ad):
         try:
-            import aiohttp
-            from bs4 import BeautifulSoup
-            session = await self._ensure_session()
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-                "Accept-Language": "ru,en;q=0.9",
-                "Cache-Control": "no-cache",
-            }
-            async with session.get(ad.url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status != 200:
-                    return
-                txt = await r.text()
+            r = await self._avito_get(ad.url)
+            if r.status_code != 200:
+                return
+            txt = r.text
+            if txt:
                 soup = BeautifulSoup(txt, "html.parser")
-                
-                # Ищем имя продавца
-                name_selectors = [
+
+                # Имя продавца
+                for selector in (
                     '[data-marker="seller-info/name"]',
                     '[data-marker="seller-link"]',
                     '.seller-info-name',
-                    '.seller-link'
-                ]
-                
-                for selector in name_selectors:
-                    name_pe = soup.select_one(selector)
-                    if name_pe:
-                        ad.seller_name = _get_text(name_pe)
+                    '.seller-link',
+                ):
+                    pe = soup.select_one(selector)
+                    if pe:
+                        ad.seller_name = _get_text(pe)
                         break
-                
+
                 # ID продавца
                 m = re.search(r'"ownerId"\s*:\s*"?(?P<id>\d+)"?', txt)
                 if m:
                     ad.seller_id = m.group("id")
-                
-                # Ценовой бейдж
+
+                # Бейдж цены
                 for b in ["Ниже рынка", "Хорошая цена", "Рыночная цена", "Выше рынка"]:
                     if b in txt:
                         ad.price_badge = b
                         break
-                
-                # Рассрочка
-                if "рассроч" in txt.lower():
-                    if "Рассрочка" not in ad.features:
-                        ad.features.append("Рассрочка")
-                
+
+                if "рассроч" in txt.lower() and "Рассрочка" not in ad.features:
+                    ad.features.append("Рассрочка")
+
                 # Верификация
-                verified_selectors = [
-                    '[data-marker="verified"]',
-                    '.verified-badge',
-                    '.is-verified'
-                ]
-                
-                for selector in verified_selectors:
-                    verified_tag = soup.select_one(selector)
-                    if verified_tag:
+                for selector in ('[data-marker="verified"]', '.verified-badge', '.is-verified'):
+                    if soup.select_one(selector):
                         ad.is_verified = True
                         break
-                
-                # Количество просмотров
-                views_selectors = [
-                    '[data-marker="total-views"]',
-                    '.item-views',
-                    '.views-count'
-                ]
-                
-                for selector in views_selectors:
-                    views_tag = soup.select_one(selector)
-                    if views_tag:
-                        views_text = _get_text(views_tag)
-                        vm = re.search(r"\d+", views_text)
+
+                # Просмотры
+                for selector in ('[data-marker="total-views"]', '.item-views', '.views-count'):
+                    t = soup.select_one(selector)
+                    if t:
+                        vm = re.search(r"\d+", _get_text(t))
                         if vm:
-                            try:
-                                ad.views = int(vm.group())
-                                break
-                            except Exception:
-                                pass
-                
+                            ad.views = int(vm.group())
+                            break
+
                 self._enrich_cache.add(ad.url)
 
         except Exception as e:
@@ -466,282 +455,122 @@ class Watcher:
     def _build_caption(self, ad: Ad) -> str:
         short = avito_short_url(ad.url)
         lines = [f"<b>{html.escape(ad.title)}</b>", ""]
-        
+
         if ad.price is not None:
             price_line = f"💸 <b>{self._fmt_price(ad.price)}</b>"
             badge_parts: List[str] = []
             if ad.price_badge:
                 badge_parts.append(f"✅ «{html.escape(ad.price_badge)}»")
-            if ad.features:
-                for f in ad.features:
-                    badge_parts.append(f"«{html.escape(f)}»")
+            for ftr in ad.features:
+                badge_parts.append(f"«{html.escape(ftr)}»")
             if badge_parts:
                 price_line += " " + " ".join(badge_parts)
             lines.append(price_line)
-        
+
         if ad.published_ts:
             lines.append("🗓 " + _fmt_dt(ad.published_ts))
         elif ad.date_str:
             lines.append("🗓 " + html.escape(ad.date_str))
-        
+
         if ad.seller_name:
             icon = "🏪" if "магазин" in ad.seller_name.lower() else "👤"
             lines.append(f"{icon} {html.escape(ad.seller_name)}")
-        
+
         if ad.seller_id:
             lines.append(f"🆔 {ad.seller_id}")
-        
+
         if ad.views:
             lines.append(f"👁 {ad.views} просмотров")
-        
+
         if ad.is_verified:
             lines.append("✅ Проверенный")
-        
+
         lines.append("")
         lines.append(short)
+        # Возвращаем с обычными переводами строк
         return "\n".join(lines)
 
-    async def _fetch(self):
-        import aiohttp
-        session = await self._ensure_session()
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-            "Accept-Language": "ru,en;q=0.9",
-            "Cache-Control": "no-cache",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        }
-        try:
-            async with session.get(self.url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status == 200:
-                    return await r.text()
-                else:
-                    logger.warning(f"HTTP {r.status} для {self.url}")
-        except Exception as e:
-            logger.error(f"Ошибка запроса к {self.url}: {e}")
-            try:
-                if ADMIN_CHAT_ID is not None:
-                    await self.bot.send_message(ADMIN_CHAT_ID, f"Ошибка в Watcher: {e}")
-            except Exception:
-                pass
+    async def _fetch_ads(self) -> Optional[List[Ad]]:
+        """Fetch the JSON feed with per-watcher and shared-route cooldowns."""
+        now = time.monotonic()
+        route_key = self._route_key()
+        route_blocked_until = Watcher._route_blocked_until.get(route_key, 0.0)
+        if route_blocked_until and route_blocked_until <= now:
+            Watcher._route_blocked_until.pop(route_key, None)
+            route_blocked_until = 0.0
+        if now < max(self._blocked_until, route_blocked_until):
             return None
+        if not self._api_url:
+            api_url = await asyncio.to_thread(convert_url_to_api, self.url, API_URLS_FILE)
+            if not api_url:
+                logger.warning("Could not convert Avito URL to API URL: %s", self.url)
+                self._blocked_until = time.monotonic() + 60
+                return None
+            self._api_url = api_url
+        max_attempts = max(1, len(AVITO_PROXIES))
+        if self._proxy_change_url():
+            max_attempts = max(max_attempts, 2)
+        for attempt in range(max_attempts):
+            try:
+                await self._wait_global_rate_limit()
+                payload = await asyncio.to_thread(self._client.get_items, self._api_url)
+                self.last_http_status = self._client.last_status
+                self._consecutive_blocks = 0
+                self.last_block_kind = None
+                return [Ad(**item) for item in parse_api_items(payload, limit=20)]
+            except AvitoBlock as block:
+                blocked_route = self._route_key()
+                self.last_http_status = block.status
+                self.last_block_kind = block.kind
+                wait = block.suggested_wait(self._consecutive_blocks)
+                self._consecutive_blocks = min(self._consecutive_blocks + 1, 5)
+                self._blocked_until = time.monotonic() + wait
+                Watcher._route_blocked_until[blocked_route] = self._blocked_until
+                route_changed = self._rotate_proxy()
+                if route_changed and attempt + 1 < max_attempts:
+                    self._blocked_until = 0
+                    continue
+                return None
+            except AvitoHttpError as error:
+                self.last_http_status = error.status
+                if error.status in (400, 404, 410, 422):
+                    try:
+                        await asyncio.to_thread(invalidate_cached_api_url, self.url, API_URLS_FILE)
+                    except Exception as cache_error:
+                        logger.warning("Could not invalidate API URL cache: %s", cache_error)
+                    self._api_url = None
+                logger.error("Avito API error for %s: %s", self.url, error)
+                self._blocked_until = time.monotonic() + min(60.0, self.interval_min)
+                Watcher._route_blocked_until[self._route_key()] = self._blocked_until
+                return None
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                failed_route = self._route_key()
+                logger.error(f"Ошибка запроса к {self.url}: {e}")
+                try:
+                    if ADMIN_CHAT_ID is not None:
+                        await self.bot.send_message(ADMIN_CHAT_ID, _br(f"Ошибка в Watcher: {e}"))
+                except Exception:
+                    pass
+                route_changed = self._rotate_proxy()
+                if route_changed and attempt + 1 < max_attempts:
+                    await asyncio.sleep(2 + random.random() * 2)
+                    continue
+                self._blocked_until = time.monotonic() + min(60.0, self.interval_min)
+                Watcher._route_blocked_until[failed_route] = self._blocked_until
         return None
 
     async def _prime_seen(self, limit=30):
-        html_text = await self._fetch()
-        if not html_text:
+        ads = await self._fetch_ads()
+        if not ads:
             return
-        for ad in self._parse_top(html_text, limit):
-            # помечаем всё, что было ДО старта, как seen
+        for ad in ads[:limit]:
             self.seen[ad.ad_id] = time.time()
-
-    def _parse_top(self, html_text: str, limit=20):
-        """Исправленная функция парсинга списка объявлений"""
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html_text, "html.parser")
-        
-        # Попробуем разные селекторы для поиска контейнера
-        container_selectors = [
-            'div[data-marker="catalog-serp"]',
-            '.catalog-serp',
-            '.items-items',
-            '.snippet-list',
-            '[data-marker="items-list"]'
-        ]
-        
-        root = None
-        for selector in container_selectors:
-            root = soup.select_one(selector)
-            if root:
-                break
-        
-        if not root:
-            logger.warning("Не найден контейнер объявлений")
-            return []
-
-        # Ищем элементы объявлений с обновленными селекторами
-        item_selectors = [
-            'div[data-marker="item"]',
-            '[data-marker="catalog-serp"] > div',
-            '.item',
-            '.snippet-horizontal',
-            '.js-catalog-item-enum'
-        ]
-        
-        items = []
-        for selector in item_selectors:
-            items = root.select(selector)[:limit]
-            if items:
-                logger.info(f"Найдено {len(items)} объявлений с селектором: {selector}")
-                break
-        
-        if not items:
-            logger.warning("Не найдены элементы объявлений")
-            return []
-
-        ads: List[Ad] = []
-        for item in items:
-            try:
-                # Ссылка на объявление - обновленные селекторы
-                link_selectors = [
-                    'a[data-marker="item-title"]',
-                    'h3 a',
-                    '.item-title a',
-                    '.snippet-link',
-                    'a[href*="/items/"]'
-                ]
-                
-                a = None
-                for selector in link_selectors:
-                    a = item.select_one(selector)
-                    if a:
-                        break
-                
-                if not a:
-                    continue
-                    
-                href = a.get("href", "")
-                if isinstance(href, list):
-                    href = href[0] if href else ""
-                    
-                # ИСПРАВЛЕНА ОШИБКА: правильная конкатенация URL
-                url = f"https://www.avito.ru{href}" if href.startswith("/") else href
-                
-                # ID объявления
-                m = re.search(r"/(\d{7,})", href)
-                ad_id = m.group(1) if m else url
-                
-                title = _get_text(a)
-                if not title:
-                    continue
-
-                # Цена - обновленные селекторы и обработка
-                price: Optional[int] = None
-                price_selectors = [
-                    'meta[itemprop="price"]',
-                    '[data-marker="item-price"]',
-                    '.price-text',
-                    '.snippet-price',
-                    '.price'
-                ]
-                
-                for selector in price_selectors:
-                    price_elem = item.select_one(selector)
-                    if price_elem:
-                        if price_elem.name == 'meta':
-                            content = price_elem.get("content", "")
-                            if isinstance(content, list):
-                                content = content[0] if content else ""
-                            if str(content).replace(" ", "").isdigit():
-                                try:
-                                    price = int(str(content).replace(" ", ""))
-                                    break
-                                except Exception:
-                                    pass
-                        else:
-                            price_text = _get_text(price_elem)
-                            # Извлекаем цифры из текста цены
-                            price_match = re.search(r'(\d+(?:\s+\d+)*)', price_text)
-                            if price_match:
-                                try:
-                                    price = int(price_match.group(1).replace(' ', ''))
-                                    break
-                                except Exception:
-                                    pass
-
-                # Дата публикации
-                date_selectors = [
-                    'p[data-marker="item-date"]',
-                    '[data-marker="item-date"]',
-                    '.item-date',
-                    '.snippet-date-info',
-                    '.item-date-text'
-                ]
-                
-                date_str = ""
-                for selector in date_selectors:
-                    date_elem = item.select_one(selector)
-                    if date_elem:
-                        date_str = _get_text(date_elem)
-                        break
-                
-                published_ts = _parse_avito_date(date_str)
-
-                # Локация
-                location_selectors = [
-                    'div[class*="geo-root"]',
-                    '[data-marker="item-address"]',
-                    '.item-address',
-                    '.snippet-location'
-                ]
-                
-                location = ""
-                for selector in location_selectors:
-                    geo_elem = item.select_one(selector)
-                    if geo_elem:
-                        location = _get_text(geo_elem)
-                        break
-
-                # Описание
-                desc_selectors = [
-                    'meta[itemprop="description"]',
-                    '.item-description',
-                    '.snippet-description'
-                ]
-                
-                description = ""
-                for selector in desc_selectors:
-                    desc_elem = item.select_one(selector)
-                    if desc_elem:
-                        if desc_elem.name == 'meta':
-                            description = str(desc_elem.get("content", "")).strip()
-                        else:
-                            description = _get_text(desc_elem)
-                        break
-
-                # Изображение - исправленная обработка
-                image_url = None
-                img_selectors = [
-                    'img[src]',
-                    'img[data-src]',
-                    '.snippet-image img',
-                    '.item-photo img'
-                ]
-                
-                for selector in img_selectors:
-                    img_elem = item.select_one(selector)
-                    if img_elem:
-                        src = img_elem.get("src") or img_elem.get("data-src")
-                        if isinstance(src, list):
-                            src = src[0] if src else ""
-                        if src and str(src) != "":
-                            # Исправляем URL картинки
-                            if str(src).startswith("//"):
-                                image_url = f"https:{src}"
-                            elif str(src).startswith("/"):
-                                image_url = f"https://www.avito.ru{src}"
-                            else:
-                                image_url = str(src)
-                            break
-
-                ads.append(Ad(
-                    ad_id=ad_id, url=url, title=title, price=price,
-                    location=location, date_str=date_str, published_ts=published_ts,
-                    description=description, image_url=image_url
-                ))
-                
-            except Exception as e:
-                logger.warning(f"Ошибка парсинга элемента: {e}")
-                continue
-                
-        logger.info(f"Спарсено {len(ads)} объявлений")
-        return ads
-
-    def _ad_text(self, ad: Ad) -> str:
-        return f"{ad.title}\n{ad.description}".lower()
 
     def _ad_passes_filters(self, ad: Ad, sub: Subscription) -> bool:
         flt = sub.flt
-        t = self._ad_text(ad)
+        t = f"{ad.title}{ad.description}".lower()
         if flt.price_min is not None and (ad.price is None or ad.price < flt.price_min):
             return False
         if flt.price_max is not None and (ad.price is None or ad.price > flt.price_max):
@@ -753,12 +582,10 @@ class Watcher:
         return True
 
     def _bump_interval(self, found_new: bool):
-        # фиксированный период опроса, но слегка адаптивный
         self._interval = max(self.interval_min, self._interval * 0.85) if found_new else min(self.interval_max, self._interval * 1.05)
 
     def _cleanup_seen(self, ttl=7 * 24 * 3600):
         now = time.time()
-        # чистим карту seen и не даём бесконечно расти
         if len(self.seen) > 20000:
             items = sorted(self.seen.items(), key=lambda kv: kv[1])
             for k, _ in items[: len(self.seen) // 2]:
@@ -772,20 +599,9 @@ class Watcher:
         lic: "LicenseManager" = app.license
         while self.has_subscribers():
             found_new = False
-            html_text = await self._fetch()
-            if html_text:
+            ads_list = await self._fetch_ads()
+            if ads_list:
                 now_ts = time.time()
-                ads_list = []
-                try:
-                    ads_list = self._parse_top(html_text, limit=15)  # Увеличено количество
-                except Exception as e:
-                    logger.exception("Ошибка парсинга Avito списка: %s", e)
-                    if ADMIN_CHAT_ID is not None:
-                        try:
-                            await self.bot.send_message(ADMIN_CHAT_ID, f"Ошибка парсинга: {e}")
-                        except Exception:
-                            pass
-                
                 for ad in ads_list:
                     if ad.ad_id in self.seen:
                         continue
@@ -794,26 +610,24 @@ class Watcher:
 
                     for sub in list(self.subscribers.values()):
                         if not lic.is_active(sub.user_id):
+                            logger.info("Пропуск %s для user=%s: лицензия неактивна", ad.ad_id, sub.user_id)
                             continue
 
-                        # «только новые» относительно текущего времени
-                        if sub.only_new and (ad.published_ts is None or (now_ts - ad.published_ts) > FRESH_WINDOW_SEC):
-                            continue
+                        # "Только новые" определяется watcher-ом через первичный
+                        # снимок и seen, а не хрупкой датой Avito (она часто
+                        # округляется до часа/дня).
 
-                        # «после создания слота» (жёсткий отсев старых позиций)
                         if START_STRICT and ad.published_ts is not None and ad.published_ts + START_GRACE_SEC < sub.started_ts:
                             continue
 
                         if not self._ad_passes_filters(ad, sub):
+                            logger.info("Пропуск %s для sub=%s: не прошёл фильтры (price=%s, title=%r)", ad.ad_id, sub.id, ad.price, ad.title)
                             continue
 
-                        # глобальный и персональный антидубликаты
                         if app.sent_was_delivered(sub.user_id, ad.ad_id):
                             continue
-                        if app.dedup_global_enabled() and app.sent_global_was_delivered(ad.ad_id):
-                            continue
-
-                        await self._enrich_ad_details(ad)
+                        if AVITO_ENRICH and ad.url not in self._enrich_cache:
+                            await self._enrich_ad_details(ad)
                         caption = self._build_caption(ad)
 
                         chat_id = app.get_alert_chat_id(sub.user_id)
@@ -821,12 +635,11 @@ class Watcher:
                             if self.on_deliver:
                                 self.on_deliver(sub.user_id, ad)
                             app.sent_mark(sub.user_id, ad.ad_id, now_ts)  # per-user
-                            if app.dedup_global_enabled():
-                                app.sent_global_mark(ad.ad_id, now_ts)     # глобально
                             delivered_any = True
                             found_new = True
+                            logger.info("Отправлено объявление %s пользователю %s в alert_chat=%s", ad.ad_id, sub.user_id, chat_id)
                         else:
-                            # один раз подсказываем про привязку alert-бота
+                            logger.warning("Не удалось отправить объявление %s: alert_chat=%s", ad.ad_id, chat_id)
                             if app.missing_alert_hint_once(sub.user_id):
                                 link = app.alert_deeplink(sub.user_id)
                                 kb = types.InlineKeyboardMarkup(inline_keyboard=[
@@ -834,18 +647,22 @@ class Watcher:
                                 ])
                                 try:
                                     await self.bot.send_message(sub.user_id,
-                                        "Чтобы получать объявления, подключите бота-оповещателя:",
+                                        _br("Чтобы получать объявления, подключите бота-оповещателя:"),
                                         reply_markup=kb, disable_web_page_preview=True)
                                 except Exception:
                                     pass
 
-                    # помечаем объявление увиденным, если его получили хотя бы один подписчик
                     if delivered_any:
+                        self.seen[ad.ad_id] = now_ts
+                    else:
+                        # Не гоняем одну и ту же карточку по кругу, если она
+                        # отфильтрована по возрасту/условиям подписки.
                         self.seen[ad.ad_id] = now_ts
 
             self._cleanup_seen()
             self._bump_interval(found_new)
-            await asyncio.sleep(max(1.0, self._interval))  # Минимум 1 секунда между запросами
+            # Минимальная пауза между заходами
+            await asyncio.sleep(max(1.0, self._interval) * random.uniform(0.9, 1.1))
 
 
 @dataclass
@@ -858,12 +675,13 @@ class FeedItem:
 
 
 class WatcherManager:
-    def __init__(self, bot: Bot):
+    def __init__(self, bot: Bot, subscriptions_file: str = SUBSCRIPTIONS_FILE):
         self.bot = bot
         self.watchers: Dict[str, Watcher] = {}
         self.subs_by_user: Dict[int, List[Subscription]] = {}
         self._sub_id_seq = 1
         self.feed: Dict[int, Deque[FeedItem]] = {}
+        self.subscriptions_file = subscriptions_file
 
     def list_user_subs(self, user_id: int):
         return self.subs_by_user.get(user_id, [])
@@ -889,6 +707,7 @@ class WatcherManager:
             await w.start()
         w.add_sub(sub)
         self.subs_by_user.setdefault(user_id, []).append(sub)
+        self.save()
         return sub
 
     async def remove_subscription(self, user_id: int, sub_id: int) -> bool:
@@ -897,11 +716,12 @@ class WatcherManager:
             if sub.id == sub_id:
                 w = self.watchers.get(sub.search_key)
                 if w:
-                    w.remove_sub(user_id)
+                    w.remove_sub(sub.id)
                     if not w.has_subscribers():
                         await w.stop()
                         self.watchers.pop(sub.search_key, None)
                 subs.pop(i)
+                self.save()
                 return True
         return False
 
@@ -914,17 +734,81 @@ class WatcherManager:
     def recent_feed(self, user_id: int, limit=10) -> List[FeedItem]:
         return list(self.feed.get(user_id, deque()))[:limit]
 
+    def save(self) -> None:
+        rows = []
+        for subs in self.subs_by_user.values():
+            for sub in subs:
+                rows.append({
+                    "id": sub.id, "user_id": sub.user_id, "search_key": sub.search_key,
+                    "url": sub.url, "name": sub.name, "only_new": sub.only_new,
+                    "started_ts": sub.started_ts, "filter": vars(sub.flt),
+                })
+        save_json(self.subscriptions_file, rows)
 
-# === Главное меню — без «Лента», добавлен «⚙️ Аккаунт» ===
-MAIN_KB = types.ReplyKeyboardMarkup(
-    keyboard=[
-        [types.KeyboardButton(text="📘 Инструкция"), types.KeyboardButton(text="🧭 Поиски")],
-        [types.KeyboardButton(text="🛟 Поддержка"), types.KeyboardButton(text="⚙️ Аккаунт")],
+    async def restore(self) -> None:
+        try:
+            rows = load_json(self.subscriptions_file, [])
+        except (OSError, ValueError, TypeError) as exc:
+            logger.error("Не удалось восстановить подписки: %s", exc)
+            return
+        for row in rows:
+            try:
+                flt = SubscriberFilter(**row.get("filter", {}))
+                sub = Subscription(id=int(row["id"]), user_id=int(row["user_id"]),
+                    search_key=str(row["search_key"]), url=str(row["url"]), flt=flt,
+                    name=row.get("name"), only_new=bool(row.get("only_new", True)),
+                    started_ts=float(row.get("started_ts", time.time())))
+                self._sub_id_seq = max(self._sub_id_seq, sub.id + 1)
+                self.subs_by_user.setdefault(sub.user_id, []).append(sub)
+                watcher = self.watchers.get(sub.search_key)
+                if not watcher:
+                    watcher = Watcher(sub.search_key, sub.url, self.bot, self._on_deliver)
+                    self.watchers[sub.search_key] = watcher
+                watcher.add_sub(sub)
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("Пропущена поврежденная подписка: %s", exc)
+        for watcher in self.watchers.values():
+            await watcher.start()
+
+
+# === Главное меню ===
+MAIN_INLINE_KB = types.InlineKeyboardMarkup(
+    inline_keyboard=[
+        [types.InlineKeyboardButton(text="🔎 Мои поиски", callback_data="searches"),
+         types.InlineKeyboardButton(text="👤 Аккаунт", callback_data="account")],
+        [types.InlineKeyboardButton(text="ℹ️ Помощь", callback_data="help"),
+         types.InlineKeyboardButton(text="Поддержка", callback_data="support")],
     ],
-    resize_keyboard=True,
-    is_persistent=True,
-    input_field_placeholder="Выберите пункт меню…",
 )
+
+MAIN_MENU_TEXT = (
+    "<b>Мониторинг Avito</b>\n"
+    "Новые объявления приходят в отдельный бот-оповещатель."
+)
+
+HELP_TEXT = (
+    "<b>Как начать</b>\n\n"
+    "1. Активируйте ключ доступа.\n"
+    "2. Подключите бот-оповещатель.\n"
+    "3. Создайте поиск и укажите фильтры.\n\n"
+    "Управление поисками доступно в разделе «Мои поиски»."
+)
+
+
+async def show_main_menu(
+    message: types.Message,
+    text: str = MAIN_MENU_TEXT,
+    *,
+    clear_reply_keyboard: bool = False,
+) -> None:
+    if clear_reply_keyboard:
+        sent = await message.answer(text, reply_markup=types.ReplyKeyboardRemove())
+        try:
+            await sent.edit_reply_markup(reply_markup=MAIN_INLINE_KB)
+            return
+        except Exception:
+            pass
+    await message.answer(text, reply_markup=MAIN_INLINE_KB)
 
 
 # ===== Мастер добавления поиска =====
@@ -942,18 +826,18 @@ async def wizard_start(message: types.Message, state: FSMContext):
     await state.clear()
     await state.set_state(SearchWizard.url)
     await message.answer(
-        "Шаг 1/3.\nПришлите ссылку с авито указав все фильтры на сайте  <a href='https://avito.ru'>Avito.ru</a>.\n\n"
-        "‼️ <b>Обязательно укажите максимальную цену</b> в фильтрах Авито (если неважна — 100000000).",
+        "<b>Новый поиск · 1 из 3</b>\n\n"
+        "Пришлите ссылку на результаты поиска Avito. Все нужные категории и параметры выберите на сайте заранее.",
         reply_markup=types.ReplyKeyboardRemove(),
         disable_web_page_preview=True,
     )
 
 @wizard_router.message(SearchWizard.url, F.text.casefold() == "отмена")
 @wizard_router.message(SearchWizard.url, F.text.casefold() == "назад")
-@wizard_router.message(SearchWizard.url, F.text.in_(["📘 Инструкция", "🛟 Поддержка", "🧭 Поиски", "⚙️ Аккаунт", "Аккаунт"]))
+@wizard_router.message(SearchWizard.url, F.text.in_(["📘 Инструкция", "🛟 Поддержка", "🧭 Поиски", "🔎 Мои поиски", "⚙️ Аккаунт", "👤 Аккаунт", "Аккаунт"]))
 async def wizard_cancel_from_url(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Мастер прерван. Вы в главном меню.", reply_markup=MAIN_KB)
+    await show_main_menu(message, clear_reply_keyboard=True)
 
 @wizard_router.message(SearchWizard.url)
 async def wizard_got_url(message: types.Message, state: FSMContext):
@@ -961,7 +845,7 @@ async def wizard_got_url(message: types.Message, state: FSMContext):
     m = re.search(r"https?://\S+", raw)
     url_in = m.group(0) if m else raw
     if not is_valid_avito_url(url_in):
-        await message.answer("Похоже, это не ссылка Авито. Вставьте корректный URL.")
+        await message.answer(_br("Похоже, это не ссылка Авито. Вставьте корректный URL."))
         return
 
     url = search_key_from_url(url_in)
@@ -969,9 +853,9 @@ async def wizard_got_url(message: types.Message, state: FSMContext):
 
     await state.update_data(url=url, guessed_kw=guessed.keywords_all)
     await state.set_state(SearchWizard.price_min)
-    kw_txt = f"\n\nНайдены ключевые слова: <code>{', '.join(guessed.keywords_all)}</code>" if guessed.keywords_all else ""
+    kw_txt = f"\n\nНайдены слова: <code>{html.escape(', '.join(guessed.keywords_all))}</code>" if guessed.keywords_all else ""
     await message.answer(
-        "Шаг 2/3.\nМинимальная цена (или «-», если без минимума):" + kw_txt,
+        "<b>Новый поиск · 2 из 3</b>\n\nМинимальная цена. Отправьте число или «-», если ограничения нет." + kw_txt,
         reply_markup=types.ReplyKeyboardMarkup(
             keyboard=[[types.KeyboardButton(text="-")], [types.KeyboardButton(text="Отмена")]],
             resize_keyboard=True
@@ -981,21 +865,21 @@ async def wizard_got_url(message: types.Message, state: FSMContext):
 @wizard_router.message(SearchWizard.price_min, F.text.casefold() == "отмена")
 async def wizard_cancel_min(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Мастер отменён.", reply_markup=MAIN_KB)
+    await show_main_menu(message, clear_reply_keyboard=True)
 
 @wizard_router.message(SearchWizard.price_min)
 async def wizard_got_min(message: types.Message, state: FSMContext):
     txt = (message.text or "").strip()
     pmin = None
     if txt != "-":
-        if not txt.isdigit():
-            await message.answer("Введите число или «-».")
+        pmin = _parse_price_input(txt)
+        if pmin is None:
+            await message.answer(_br("Введите число или «-»."))
             return
-        pmin = int(txt)
     await state.update_data(price_min=pmin)
     await state.set_state(SearchWizard.price_max)
     await message.answer(
-        "Теперь <b>максимальная цена</b> (обязательно число):",
+        "<b>Максимальная цена</b>\nВведите число. Если ограничения нет, оставьте 100 000 000.",
         reply_markup=types.ReplyKeyboardMarkup(
             keyboard=[[types.KeyboardButton(text="100000000")], [types.KeyboardButton(text="Отмена")]],
             resize_keyboard=True
@@ -1005,15 +889,15 @@ async def wizard_got_min(message: types.Message, state: FSMContext):
 @wizard_router.message(SearchWizard.price_max, F.text.casefold() == "отмена")
 async def wizard_cancel_max(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Мастер отменён.", reply_markup=MAIN_KB)
+    await show_main_menu(message, clear_reply_keyboard=True)
 
 @wizard_router.message(SearchWizard.price_max)
 async def wizard_got_max(message: types.Message, state: FSMContext):
     txt = (message.text or "").strip()
-    if not txt.isdigit():
-        await message.answer("Максимальная цена обязательна. Введите число, например 100000000.")
+    pmax = _parse_price_input(txt)
+    if pmax is None:
+        await message.answer(_br("Максимальная цена обязательна. Введите число, например 100000000."))
         return
-    pmax = int(txt)
 
     data = await state.get_data()
     url = data.get("url") or ""
@@ -1022,27 +906,32 @@ async def wizard_got_max(message: types.Message, state: FSMContext):
 
     await state.update_data(price_max=pmax)
 
+    short_url = html.escape(avito_short_url(url), quote=True)
+    min_text = f"{pmin:,}".replace(",", " ") + " ₽" if pmin is not None else "без ограничения"
+    max_text = f"{pmax:,}".replace(",", " ") + " ₽"
     summary = [
-        "<b>Проверим настройки:</b>",
-        f"• URL: {url}",
-        f"• Мин. цена: {pmin if pmin is not None else '—'}",
-        f"• Макс. цена: {pmax}",
-        f"• Слова: {', '.join(kw) if kw else '—'}",
-        "\nОтправьте название поиска (например «тест»).",
+        "<b>Новый поиск · 3 из 3</b>",
+        "",
+        f"Цена от: {min_text}",
+        f"Цена до: {max_text}",
+        f"Слова: {html.escape(', '.join(kw)) if kw else 'не заданы'}",
+        f"<a href=\"{short_url}\">Открыть поиск на Avito</a>",
+        "",
+        "Отправьте короткое название, например «Samsung до 70 000».",
     ]
     await state.set_state(SearchWizard.name)
-    await message.answer("\n".join(summary), disable_web_page_preview=True)
+    await message.answer(_br("\\n".join(summary)), disable_web_page_preview=True)
 
 @wizard_router.message(SearchWizard.name, F.text.casefold() == "отмена")
 async def wizard_cancel_name(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Мастер отменён.", reply_markup=MAIN_KB)
+    await show_main_menu(message, clear_reply_keyboard=True)
 
 @wizard_router.message(SearchWizard.name)
 async def wizard_finish_create(message: types.Message, state: FSMContext):
     lic: LicenseManager = cast(Any, message.bot).app.license
     if not lic.is_active(message.chat.id):
-        await message.answer("Слот не активирован. Получите ключ у поддержки и отправьте его боту (формат «Ключ: xxxxx-…»).")
+        await message.answer(_br("Слот не активирован. Получите ключ у поддержки и отправьте его боту (формат «Ключ: xxxxx-…»)."))
         await state.clear()
         return
 
@@ -1056,17 +945,14 @@ async def wizard_finish_create(message: types.Message, state: FSMContext):
     flt = SubscriberFilter(price_min=pmin, price_max=pmax, keywords_all=kw)
     sub = await cast(Any, message.bot).app.manager.add_subscription(message.chat.id, url, flt)
     sub.name = name
+    cast(Any, message.bot).app.manager.save()
 
     await state.clear()
-    await message.answer(
-        "Поиск создан ✅\n"
-        f"Название: <b>{html.escape(name or f'Поиск №{sub.id}')}</b>\n"
-        f"URL: {url}\n"
-        + (f"min={pmin} " if pmin is not None else "")
-        + (f"max={pmax} " if pmax is not None else "") + "\n\n"
-        "Как только появятся новые объявления — пришлю в бот-оповещателя.",
-        reply_markup=MAIN_KB,
-        disable_web_page_preview=True,
+    title = html.escape(name or f"Поиск №{sub.id}")
+    await show_main_menu(
+        message,
+        f"✅ <b>{title}</b> создан\nНовые объявления будут приходить в бот-оповещатель.",
+        clear_reply_keyboard=True,
     )
 
 
@@ -1076,11 +962,44 @@ support_router = Router(name="support")
 @support_router.message(F.text.in_(["🛟 Поддержка", "Поддержка"]))
 async def support_info(message: types.Message, state: FSMContext):
     await state.clear()
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="Написать в поддержку", url=SUPPORT_LINK)],
+        [types.InlineKeyboardButton(text="Назад в меню", callback_data="main_menu")],
+    ])
     await message.answer(
-        "По любым вопросам — техподдержка:\n👉 <a href='{}'>@Vladlmerr</a>".format(SUPPORT_LINK),
-        reply_markup=MAIN_KB,
-        disable_web_page_preview=True
+        "<b>Поддержка</b>\n\nНапишите нам, если нужна помощь с доступом или настройкой поиска.",
+        reply_markup=kb,
+        disable_web_page_preview=True,
     )
+
+
+@support_router.callback_query(F.data == "support")
+async def support_callback(cq: types.CallbackQuery):
+    if isinstance(cq.message, types.Message):
+        kb = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="Написать в поддержку", url=SUPPORT_LINK)],
+            [types.InlineKeyboardButton(text="Назад в меню", callback_data="main_menu")],
+        ])
+        await cq.message.edit_text(
+            "<b>Поддержка</b>\n\nПоможем с доступом, привязкой оповещений и настройкой поиска.",
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+    await cq.answer()
+
+
+@support_router.callback_query(F.data == "help")
+async def help_callback(cq: types.CallbackQuery):
+    if isinstance(cq.message, types.Message):
+        await cq.message.edit_text(HELP_TEXT, reply_markup=MAIN_INLINE_KB)
+    await cq.answer()
+
+
+@support_router.callback_query(F.data == "main_menu")
+async def main_menu_callback(cq: types.CallbackQuery):
+    if isinstance(cq.message, types.Message):
+        await cq.message.edit_text(MAIN_MENU_TEXT, reply_markup=MAIN_INLINE_KB)
+    await cq.answer()
 
 
 # ===== Экран «Поиски» =====
@@ -1088,50 +1007,80 @@ def build_searches_kb(
     subs: List[Subscription],
     lic: LicenseManager,
     user_id: int,
+    watchers: Optional[Dict[str, "Watcher"]] = None,
 ) -> types.InlineKeyboardMarkup:
     rows: List[List[types.InlineKeyboardButton]] = []
-    if lic.is_active(user_id) and not subs:
-        rows.append([types.InlineKeyboardButton(text="Свободный слот", callback_data="slot_new")])
     for s in subs:
         label = s.name or f"Поиск №{s.id}"
-        rows.append([types.InlineKeyboardButton(text=label, callback_data=f"open_sub:{s.id}")])
-    rows.append([types.InlineKeyboardButton(text="➕ Получить слот", callback_data="get_slot")])
-    rows.append([types.InlineKeyboardButton(text="❌ Закрыть", callback_data="close_menu")])
+        status = get_watcher_status(s.search_key, watchers or {})
+        rows.append([types.InlineKeyboardButton(
+            text=f"{status}  {label}",
+            callback_data=f"open_sub:{s.id}",
+        )])
+    if lic.is_active(user_id):
+        rows.append([types.InlineKeyboardButton(text="＋ Создать поиск", callback_data="slot_new")])
+    else:
+        rows.append([types.InlineKeyboardButton(text="🔑 Получить доступ", callback_data="get_slot")])
+    rows.append([types.InlineKeyboardButton(text="Назад в меню", callback_data="main_menu")])
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
+
+def _short_wait(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds} сек"
+    minutes = max(1, (seconds + 59) // 60)
+    if minutes < 60:
+        return f"{minutes} мин"
+    return f"{max(1, (minutes + 59) // 60)} ч"
+
+
+def get_watcher_status(search_key: str, watchers: Optional[Dict[str, "Watcher"]]) -> str:
+    w = (watchers or {}).get(search_key)
+    if w is None:
+        return "⚪"
+    if w.task is None or w.task.done():
+        return "⚪"
+
+    now = time.monotonic()
+    route_until = Watcher._route_blocked_until.get(w._route_key(), 0.0)
+    wait = int(max(w._blocked_until, route_until) - now)
+    if wait > 0:
+        return f"🟡 {_short_wait(wait)}"
+    if w.last_http_status and w.last_http_status != 200:
+        return "🟡"
+    return "🟢"
+
 def format_sub_panel(sub: Subscription, lic: LicenseManager) -> str:
-    parts = [f"<b>{html.escape(sub.name or f'Подписка №{sub.id}')}</b>"]
+    title = html.escape(sub.name or f"Поиск №{sub.id}")
     exp = lic.expiry_dt(sub.user_id)
-    parts.append(f"\nКлюч: <code>{'активен' if lic.is_active(sub.user_id) else '—'}</code>")
-    if exp:
-        parts.append(f"Активен до: <b>{exp.strftime('%d.%m.%Y %H:%M:%S')}</b>")
-    if sub.flt.price_max is not None:
-        parts.append(f"\n💰 <b>Максимальная цена:</b> {sub.flt.price_max} ₽")
-    else:
-        parts.append("\n💰 <b>Максимальная цена:</b> не задана")
-    if sub.flt.keywords_stop:
-        parts.append(f"❌ <b>СТОП слова:</b> {', '.join(sub.flt.keywords_stop)}")
-    else:
-        parts.append("❌ <b>СТОП слова:</b> ")
-    if sub.flt.keywords_all:
-        parts.append(f"✅ <b>ЦЕЛЕВЫЕ слова:</b> {', '.join(sub.flt.keywords_all)}")
-    else:
-        parts.append("✅ <b>ЦЕЛЕВЫЕ слова:</b> ")
-    parts.append(f"\n🌐 <b>URL:</b> {sub.url}")
-    parts.append("\n<b>Продвинутые фильтры</b>")
-    parts.append(f"📦 Только новые: {'✅' if sub.only_new else '❌'}")
-    return "\n".join(parts)
+    price_min = f"{sub.flt.price_min:,}".replace(",", " ") + " ₽" if sub.flt.price_min is not None else "без минимума"
+    price_max = f"{sub.flt.price_max:,}".replace(",", " ") + " ₽" if sub.flt.price_max is not None else "не задана"
+    target = ", ".join(html.escape(word) for word in sub.flt.keywords_all) or "не заданы"
+    stop = ", ".join(html.escape(word) for word in sub.flt.keywords_stop) or "не заданы"
+    url = html.escape(avito_short_url(sub.url), quote=True)
+    access = exp.strftime("%d.%m.%Y %H:%M") if exp else "не активен"
+    return (
+        f"🔎 <b>{title}</b>\n"
+        f"Доступ до: <b>{access}</b>\n\n"
+        f"<b>Фильтры</b>\n"
+        f"Цена: <b>{price_min} — {price_max}</b>\n"
+        f"Целевые слова: {target}\n"
+        f"Стоп-слова: {stop}\n"
+        f"Только новые: <b>{'включено' if sub.only_new else 'выключено'}</b>\n\n"
+        f"<a href=\"{url}\">Открыть поиск на Avito</a>"
+    )
 
 def build_sub_inline_kb(sub: Subscription) -> types.InlineKeyboardMarkup:
     rid = sub.id
     rows = [
-        [types.InlineKeyboardButton(text="💰 Максимальная цена", callback_data=f"sub:{rid}:max")],
-        [types.InlineKeyboardButton(text="❌ СТОП слова", callback_data=f"sub:{rid}:stop"),
-         types.InlineKeyboardButton(text="✅ ЦЕЛЕВЫЕ слова", callback_data=f"sub:{rid}:pos")],
-        [types.InlineKeyboardButton(text=f"📦 Только новые: {'✅' if sub.only_new else '❌'}",
+        [types.InlineKeyboardButton(text="Цена", callback_data=f"sub:{rid}:max"),
+         types.InlineKeyboardButton(text="Целевые слова", callback_data=f"sub:{rid}:pos")],
+        [types.InlineKeyboardButton(text="Стоп-слова", callback_data=f"sub:{rid}:stop"),
+         types.InlineKeyboardButton(text=f"Только новые: {'вкл' if sub.only_new else 'выкл'}",
                                     callback_data=f"sub:{rid}:toggle_new")],
-        [types.InlineKeyboardButton(text="🗑 Удалить", callback_data=f"sub:{rid}:delete"),
-         types.InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_list")],
+        [types.InlineKeyboardButton(text="Обновить сейчас", callback_data=f"force_update:{sub.id}")],
+        [types.InlineKeyboardButton(text="Назад", callback_data="back_to_list"),
+         types.InlineKeyboardButton(text="Удалить", callback_data=f"sub:{rid}:delete")],
     ]
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1147,21 +1096,79 @@ class EditWords(StatesGroup):
 
 searches_router = Router(name="searches")
 
-@searches_router.message(F.text.in_(["🧭 Поиски", "Поиски"]))
+
+def _searches_view(app: Any, user_id: int) -> tuple[str, types.InlineKeyboardMarkup]:
+    subs = app.manager.list_user_subs(user_id)
+    kb = build_searches_kb(subs, app.license, user_id, watchers=app.manager.watchers)
+    if subs:
+        text = "<b>Мои поиски</b>\nВыберите поиск для настройки."
+    elif app.license.is_active(user_id):
+        text = "<b>Мои поиски</b>\nУ вас пока нет настроенных поисков."
+    else:
+        text = "<b>Мои поиски</b>\nДля создания поиска нужен активный доступ."
+    return text, kb
+
+
+async def _send_searches_screen(message: types.Message, user_id: int) -> None:
+    app = cast(Any, message.bot).app
+    text, kb = _searches_view(app, user_id)
+    await message.answer(text, reply_markup=kb)
+
+
+async def _edit_searches_screen(message: types.Message, user_id: int) -> None:
+    app = cast(Any, message.bot).app
+    text, kb = _searches_view(app, user_id)
+    await message.edit_text(text, reply_markup=kb)
+
+@searches_router.message(F.text.in_(["🧭 Поиски", "🔎 Мои поиски", "Поиски"]))
 async def searches_screen(message: types.Message, state: FSMContext):
     await state.clear()
-    app = cast(Any, message.bot).app
-    subs = app.manager.list_user_subs(message.chat.id)
-    kb = build_searches_kb(subs, app.license, message.chat.id)
-    await message.answer("Выберите поиск или получите новый слот:", reply_markup=kb)
+    await _send_searches_screen(message, message.chat.id)
+
+@searches_router.callback_query(F.data == "searches")
+async def cb_menu_searches(cq: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    if isinstance(cq.message, types.Message):
+        await _edit_searches_screen(cq.message, cq.from_user.id)
+    await cq.answer()
+
+@searches_router.callback_query(F.data.startswith("force_update:"))
+async def cb_force_update(cq: types.CallbackQuery):
+    data_str: str = cq.data or ""
+    try:
+        sub_id = int(data_str.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await cq.answer(); return
+
+    app = cast(Any, cq.bot).app
+    sub = app.manager.get_sub_by_id(cq.from_user.id, sub_id)
+    if not sub:
+        await cq.answer("Поиск не найден", show_alert=True); return
+
+    watcher = app.manager.watchers.get(sub.search_key)
+    if not watcher:
+        await cq.answer("Вотчер не запущен", show_alert=True); return
+
+    try:
+        await watcher.stop()
+        await watcher.start()
+    except Exception as exc:
+        logger.warning("force_update failed for %s: %s", sub.search_key, exc)
+        await cq.answer("Не удалось перезапустить", show_alert=True); return
+
+    await cq.answer("Проверка запущена")
 
 @searches_router.callback_query(F.data == "get_slot")
 async def cb_get_slot(cq: types.CallbackQuery):
     if isinstance(cq.message, types.Message):
-        await cq.message.answer(
-            "Для покупки ключа или получения тестового доступа свяжитесь с\n"
-            f"👉 <a href='{SUPPORT_LINK}'>@Vladlmerr</a>\n\n"
-            "Когда получите ключ, отправьте его сюда (формат: <b>Ключ: xxxxx-…</b>).",
+        kb = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="Написать в поддержку", url=SUPPORT_LINK)],
+            [types.InlineKeyboardButton(text="Назад к поискам", callback_data="back_to_list")],
+        ])
+        await cq.message.edit_text(
+            "<b>Доступ к мониторингу</b>\n\n"
+            "Получите ключ у поддержки, затем отправьте его в этот чат.",
+            reply_markup=kb,
             disable_web_page_preview=True
         )
     await cq.answer()
@@ -1173,8 +1180,8 @@ async def cb_slot_new(cq: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await state.set_state(SearchWizard.url)
     await cq.message.answer(
-        "Шаг 1/3. Пришлите ссылку категории с <a href='https://avito.ru'>Avito.ru</a>.\n\n"
-        "‼️ <b>Обязательно укажите максимальную цену</b> в фильтрах Авито (если неважна — 100000000).",
+        "<b>Новый поиск · 1 из 3</b>\n\n"
+        "Пришлите ссылку на результаты поиска Avito. Все нужные категории и параметры выберите на сайте заранее.",
         reply_markup=types.ReplyKeyboardRemove(),
         disable_web_page_preview=True,
     )
@@ -1182,7 +1189,6 @@ async def cb_slot_new(cq: types.CallbackQuery, state: FSMContext):
 
 @searches_router.callback_query(F.data == "close_menu")
 async def cb_close_menu(cq: types.CallbackQuery, state: FSMContext):
-    # закрываем меню и чистим состояние
     await state.clear()
     if isinstance(cq.message, types.Message):
         try:
@@ -1197,10 +1203,7 @@ async def cb_close_menu(cq: types.CallbackQuery, state: FSMContext):
 @searches_router.callback_query(F.data == "back_to_list")
 async def cb_back_to_list(cq: types.CallbackQuery):
     if isinstance(cq.message, types.Message):
-        app = cast(Any, cq.bot).app
-        subs = app.manager.list_user_subs(cq.from_user.id)
-        kb = build_searches_kb(subs, app.license, cq.from_user.id)
-        await cq.message.answer("Выберите поиск или получите новый слот:", reply_markup=kb)
+        await _edit_searches_screen(cq.message, cq.from_user.id)
     await cq.answer()
 
 @searches_router.callback_query(F.data.startswith("open_sub:"))
@@ -1216,7 +1219,11 @@ async def cb_open_sub(cq: types.CallbackQuery, state: FSMContext):
         await cq.answer("Подписка не найдена", show_alert=True); return
     if isinstance(cq.message, types.Message):
         lic: LicenseManager = cast(Any, cq.bot).app.license
-        await cq.message.answer(format_sub_panel(sub, lic), reply_markup=build_sub_inline_kb(sub), disable_web_page_preview=True)
+        await cq.message.edit_text(
+            format_sub_panel(sub, lic),
+            reply_markup=build_sub_inline_kb(sub),
+            disable_web_page_preview=True,
+        )
     await cq.answer()
 
 @searches_router.callback_query(F.data.startswith("sub:"))
@@ -1236,29 +1243,62 @@ async def cb_sub_actions(cq: types.CallbackQuery, state: FSMContext):
         await state.set_state(EditPrice.value)
         await state.update_data(field="max", sub_id=sub.id)
         if isinstance(cq.message, types.Message):
-            await cq.message.answer("Введите новую <b>максимальную</b> цену (число). Если не важна — укажите 100000000:")
+            await cq.message.answer("Введите новую максимальную цену числом.")
         await cq.answer(); return
 
     if action in ("pos", "stop"):
         await state.set_state(EditWords.text)
         await state.update_data(mode=action, sub_id=sub.id)
         if isinstance(cq.message, types.Message):
-            hint = "целевые" if action == "pos" else "СТОП"
+            hint = "целевые слова" if action == "pos" else "стоп-слова"
             curr = ", ".join(sub.flt.keywords_all if action == "pos" else sub.flt.keywords_stop) or "—"
-            await cq.message.answer(f"Отправьте {hint} слова через запятую.\nТекущие: <code>{curr}</code>")
+            await cq.message.answer(
+                f"Введите {hint} через запятую. Чтобы очистить список, отправьте «-».\n"
+                f"Сейчас: <code>{html.escape(curr)}</code>"
+            )
         await cq.answer(); return
 
     if action == "toggle_new":
         sub.only_new = not sub.only_new
+        mng.save()
         if isinstance(cq.message, types.Message):
             lic: LicenseManager = cast(Any, cq.bot).app.license
-            await cq.message.answer(format_sub_panel(sub, lic), reply_markup=build_sub_inline_kb(sub), disable_web_page_preview=True)
+            await cq.message.edit_text(
+                format_sub_panel(sub, lic),
+                reply_markup=build_sub_inline_kb(sub),
+                disable_web_page_preview=True,
+            )
         await cq.answer("Обновлено"); return
 
     if action == "delete":
+        if isinstance(cq.message, types.Message):
+            title = html.escape(sub.name or f"Поиск №{sub.id}")
+            kb = types.InlineKeyboardMarkup(inline_keyboard=[
+                [types.InlineKeyboardButton(text="Удалить поиск", callback_data=f"sub:{sub.id}:delete_confirm")],
+                [types.InlineKeyboardButton(text="Отмена", callback_data=f"sub:{sub.id}:delete_cancel")],
+            ])
+            await cq.message.edit_text(
+                f"<b>Удалить «{title}»?</b>\nЭто действие нельзя отменить.",
+                reply_markup=kb,
+            )
+        await cq.answer(); return
+
+    if action == "delete_cancel":
+        if isinstance(cq.message, types.Message):
+            lic: LicenseManager = cast(Any, cq.bot).app.license
+            await cq.message.edit_text(
+                format_sub_panel(sub, lic),
+                reply_markup=build_sub_inline_kb(sub),
+                disable_web_page_preview=True,
+            )
+        await cq.answer(); return
+
+    if action == "delete_confirm":
         ok = await mng.remove_subscription(cq.from_user.id, sub.id)
         if isinstance(cq.message, types.Message):
-            await cq.message.answer("Подписка удалена." if ok else "Не удалось удалить.")
+            text, kb = _searches_view(cast(Any, cq.bot).app, cq.from_user.id)
+            notice = "Поиск удалён.\n\n" if ok else "Не удалось удалить поиск.\n\n"
+            await cq.message.edit_text(notice + text, reply_markup=kb)
         await cq.answer(); return
 
     await cq.answer()
@@ -1271,7 +1311,7 @@ async def ui_edit_apply_max(m: types.Message, state: FSMContext):
     raw = data.get("sub_id")
     if raw is None:
         await state.clear()
-        await m.reply("Ошибка: нет идентификатора поиска.", reply_markup=MAIN_KB)
+        await m.reply(_br("Ошибка: нет идентификатора поиска."), reply_markup=MAIN_INLINE_KB)
         return
     sub_id = int(raw)
 
@@ -1280,16 +1320,22 @@ async def ui_edit_apply_max(m: types.Message, state: FSMContext):
     sub = mng.get_sub_by_id(m.chat.id, sub_id)
     if not sub:
         await state.clear()
-        await m.reply("Подписка не найдена.", reply_markup=MAIN_KB)
+        await m.reply(_br("Подписка не найдена."), reply_markup=MAIN_INLINE_KB)
         return
     if field == "max":
-        if not txt.isdigit():
-            await m.reply("Максимальная цена должна быть числом, например 100000000.")
+        parsed = _parse_price_input(txt)
+        if parsed is None:
+            await m.reply(_br("Максимальная цена должна быть числом, например 100000000."))
             return
-        sub.flt.price_max = int(txt)
+        sub.flt.price_max = parsed
+        mng.save()
     await state.clear()
     lic: LicenseManager = cast(Any, m.bot).app.license
-    await m.reply("Готово.\n" + format_sub_panel(sub, lic), reply_markup=MAIN_KB, disable_web_page_preview=True)
+    await m.reply(
+        format_sub_panel(sub, lic),
+        reply_markup=build_sub_inline_kb(sub),
+        disable_web_page_preview=True,
+    )
 
 @searches_router.message(EditWords.text)
 async def ui_edit_words_apply(m: types.Message, state: FSMContext):
@@ -1298,7 +1344,7 @@ async def ui_edit_words_apply(m: types.Message, state: FSMContext):
     raw = data.get("sub_id")
     if raw is None:
         await state.clear()
-        await m.reply("Ошибка: нет идентификатора поиска.", reply_markup=MAIN_KB)
+        await m.reply(_br("Ошибка: нет идентификатора поиска."), reply_markup=MAIN_INLINE_KB)
         return
     sub_id = int(raw)
 
@@ -1306,16 +1352,22 @@ async def ui_edit_words_apply(m: types.Message, state: FSMContext):
     sub = mng.get_sub_by_id(m.chat.id, sub_id)
     if not sub:
         await state.clear()
-        await m.reply("Подписка не найдена.", reply_markup=MAIN_KB)
+        await m.reply(_br("Подписка не найдена."), reply_markup=MAIN_INLINE_KB)
         return
-    words = [w.strip() for w in (m.text or "").replace(";", ",").split(",") if w.strip()]
+    raw_words = (m.text or "").strip()
+    words = [] if raw_words == "-" else [w.strip() for w in raw_words.replace(";", ",").split(",") if w.strip()]
     if mode == "pos":
         sub.flt.keywords_all = words
     else:
         sub.flt.keywords_stop = words
+    mng.save()
     await state.clear()
     lic: LicenseManager = cast(Any, m.bot).app.license
-    await m.reply("Обновлено.\n" + format_sub_panel(sub, lic), reply_markup=MAIN_KB, disable_web_page_preview=True)
+    await m.reply(
+        format_sub_panel(sub, lic),
+        reply_markup=build_sub_inline_kb(sub),
+        disable_web_page_preview=True,
+    )
 
 
 # ===== Приём ключа (устойчивый) =====
@@ -1326,21 +1378,21 @@ async def _accept_key_impl(m: types.Message, state: FSMContext):
     lic: LicenseManager = app.license
 
     txt = (m.text or "").strip()
-    m_uuid = KEY_RE.match(txt)
+    m_uuid = KEY_RE.search(txt)  # <-- ИЩЕМ ВЕЗДЕ, не только в начале
     if not m_uuid:
-        return  # не ключ — передадим дальше другим хендлерам
+        return
 
     key_value = m_uuid.group(1)
     try:
         uuid.UUID(key_value)
     except Exception:
-        await m.reply("Ключ недействителен.")
+        await m.reply(_br("Ключ недействителен."))
         return
 
     res = app.redeem_key(key_value)
     if not res:
         await state.clear()
-        await m.reply("Ключ недействителен или уже использован.")
+        await m.reply(_br("Ключ недействителен или уже использован."))
         return
 
     hours, expires_ts = res  # expires_ts формируется в момент активации!
@@ -1357,39 +1409,22 @@ async def _accept_key_impl(m: types.Message, state: FSMContext):
     deeplink = app.alert_deeplink(m.chat.id)
     kb = types.InlineKeyboardMarkup(
         inline_keyboard=[
-            [types.InlineKeyboardButton(text="Подключить оповещения (alert-бот)", url=deeplink)],
-            [types.InlineKeyboardButton(text="Создать поиск (Свободный слот)", callback_data="slot_new")],
+            [types.InlineKeyboardButton(text="1. Подключить оповещения", url=deeplink)],
+            [types.InlineKeyboardButton(text="2. Создать поиск", callback_data="slot_new")],
         ]
     )
 
     await m.reply(
-        f"Ключ принят ✅\nСлот активен до: <b>{exp_str}</b>\n\n"
-        "1) Нажмите кнопку ниже и запустите бота-оповещателя (для привязки).\n"
-        "2) Затем вернитесь и создайте поиск.",
+        f"✅ <b>Доступ активирован</b>\nДействует до: <b>{exp_str}</b>\n\n"
+        "Сначала подключите оповещения, затем создайте поиск.",
         disable_web_page_preview=True,
         reply_markup=kb,
     )
 
-@key_router.message(F.text.regexp(KEY_RE))
+# Матчим как «Ключ: …», так и просто UUID
+@key_router.message(F.text.regexp(r"(?i)(?:^|\s)(?:ключ\s*:\s*)?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\s|$)"))
 async def accept_key_regexp(m: types.Message, state: FSMContext):
     await _accept_key_impl(m, state)
-
-# Catch any text message and try to treat it as a key.
-from aiogram.dispatcher.event.bases import SkipHandler  # type: ignore
-
-@key_router.message(F.text)
-async def accept_key_fallback(m: types.Message, state: FSMContext):
-    """
-    Fallback handler for text messages in the key router.
-    """
-    # Normalize text
-    text = (m.text or "").strip()
-    # Process valid keys
-    if KEY_RE.match(text):
-        await _accept_key_impl(m, state)
-        return
-    # Skip all other messages so they fall through to subsequent handlers
-    raise SkipHandler()
 
 
 # ===== Аккаунт =====
@@ -1403,44 +1438,54 @@ def account_panel_text(app: Any, user_id: int) -> str:
 
     key_txt = "—"
     if acc and acc.get("keys"):
-        # ищем актуальный ключ (с экспирацией в будущем)
         now = time.time()
         current = None
         for k in sorted(acc["keys"], key=lambda x: x.get("activated", 0), reverse=True):
             if float(k.get("expires", 0) or 0) > now:
                 current = k; break
         if not current:
-            # нет активного — возьмём последний выданный
             current = sorted(acc["keys"], key=lambda x: x.get("activated", 0), reverse=True)[0]
-        key_txt = current.get("key", "—")[:36]
+        key_value = str(current.get("key", ""))
+        key_txt = f"•••• {key_value[-4:]}" if key_value else "—"
 
     lines = [
-        "<b>Аккаунт</b>",
-        f"👤 <b>ID:</b> <code>{user_id}</code>",
-        f"📅 <b>Дата регистрации:</b> {_fmt_dt((acc or {}).get('registered')) if acc else '—'}",
+        "👤 <b>Аккаунт</b>",
+        f"ID: <code>{user_id}</code>",
+        f"Регистрация: {_fmt_dt((acc or {}).get('registered')) if acc else '—'}",
         "",
-        f"🔑 <b>Ключ:</b> <code>{key_txt}</code>",
-        f"⏳ <b>Действителен до:</b> {exp_dt.strftime('%d.%m.%Y %H:%M:%S') if exp_dt else '—'}",
-        f"🧭 <b>Поисков:</b> {len(subs) if subs else 0}" + ("" if subs else " (не создан)"),
+        f"Ключ: <code>{key_txt}</code>",
+        f"Доступ до: <b>{exp_dt.strftime('%d.%m.%Y %H:%M') if exp_dt else 'не активен'}</b>",
+        f"Поисков: <b>{len(subs)}</b>",
     ]
     return "\n".join(lines)
 
 def build_account_kb() -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(
         inline_keyboard=[
-            [types.InlineKeyboardButton(text="Показать истекшие ключи", callback_data="account:expired")],
-            [types.InlineKeyboardButton(text="Продлить", url=SUPPORT_LINK)],
-            [types.InlineKeyboardButton(text="❌ Закрыть", callback_data="account:close")],
+            [types.InlineKeyboardButton(text="История ключей", callback_data="account:expired"),
+             types.InlineKeyboardButton(text="Продлить доступ", url=SUPPORT_LINK)],
+            [types.InlineKeyboardButton(text="Назад в меню", callback_data="main_menu")],
         ]
     )
 
-@account_router.message(F.text.in_(["⚙️ Аккаунт", "Аккаунт", "/account"]))
+@account_router.message(F.text.in_(["⚙️ Аккаунт", "👤 Аккаунт", "Аккаунт", "/account"]))
 async def account_show(m: types.Message, state: FSMContext):
     app = cast(Any, m.bot).app
     app.account_register_if_needed(m.chat.id)
     txt = account_panel_text(app, m.chat.id)
-    await m.answer(txt, reply_markup=MAIN_KB)
-    await m.answer(" ", reply_markup=build_account_kb())
+    await m.answer(txt, reply_markup=build_account_kb())
+
+
+@account_router.callback_query(F.data == "account")
+async def account_callback(cq: types.CallbackQuery):
+    app = cast(Any, cq.bot).app
+    app.account_register_if_needed(cq.from_user.id)
+    if isinstance(cq.message, types.Message):
+        await cq.message.edit_text(
+            account_panel_text(app, cq.from_user.id),
+            reply_markup=build_account_kb(),
+        )
+    await cq.answer()
 
 @account_router.callback_query(F.data == "account:close")
 async def account_close(cq: types.CallbackQuery):
@@ -1461,9 +1506,9 @@ async def account_expired(cq: types.CallbackQuery):
         exp_ts = float(k.get("expires") or 0)
         if exp_ts and exp_ts < now:
             items.append(f"• <code>{k.get('key','')}</code> — истёк {_fmt_dt(exp_ts)}")
-    text = "Истёкших ключей не найдено." if not items else "<b>Истёкшие ключи:</b>\n" + "\n".join(items)
+    text = "Истёкших ключей не найдено." if not items else "<b>Истёкшие ключи:</b>\\n" + "\\n".join(items)
     if isinstance(cq.message, types.Message):
-        await cq.message.answer(text)
+        await cq.message.answer(_br(text))
     await cq.answer()
 
 
@@ -1480,13 +1525,15 @@ class App:
         self.alert_token: Optional[str] = ALERT_BOT_TOKEN
         self.alert_username: str = ALERT_BOT_USERNAME
         self.bindings_file: str = BINDINGS_FILE
-        self._alert_warned: Set[int] = set()  # чтобы не спамить подсказкой
+        self.alert_links_file: str = ALERT_LINKS_FILE
+        self._alert_warned: Set[int] = set()
 
         # storage
         self.keys_file: str = KEYS_FILE
         self.sent_file: str = SENT_FILE
         self.accounts_file: str = ACCOUNTS_FILE
 
+        self._restore_licenses()
         self._register()
 
     # ===== работа с привязками main_user_id -> alert_chat_id
@@ -1494,16 +1541,14 @@ class App:
         if not os.path.exists(self.bindings_file):
             return {}
         try:
-            with open(self.bindings_file, "r", encoding="utf-8") as f:
-                data = json.load(f) or {}
-                return {str(k): int(v) for k, v in data.items()}
-        except Exception:
+            data = load_json(self.bindings_file, {}) or {}
+            return {str(k): int(v) for k, v in data.items()}
+        except (OSError, ValueError, TypeError) as exc:
+            logger.error("Не удалось прочитать привязки: %s", exc)
             return {}
 
     def _save_bindings(self, data: Dict[str, int]) -> None:
-        os.makedirs(os.path.dirname(self.bindings_file) or ".", exist_ok=True)
-        with open(self.bindings_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        save_json(self.bindings_file, data)
 
     def get_alert_chat_id(self, main_user_id: int) -> Optional[int]:
         b = self._load_bindings()
@@ -1512,7 +1557,15 @@ class App:
 
     def alert_deeplink(self, main_user_id: int) -> str:
         uname = self.alert_username or "<УКАЖИТЕ_ALERT_BOT_USERNAME>"
-        return f"https://t.me/{uname}?start={main_user_id}"
+        token = secrets.token_urlsafe(24)
+        now = time.time()
+        def add_link(links):
+            expired = [k for k, v in links.items() if float(v.get("expires", 0)) < now]
+            for key in expired:
+                del links[key]
+            links[token] = {"user_id": main_user_id, "expires": now + 600}
+        update_json(self.alert_links_file, {}, add_link)
+        return f"https://t.me/{uname}?start={token}"
 
     def missing_alert_hint_once(self, user_id: int) -> bool:
         if user_id in self._alert_warned:
@@ -1521,23 +1574,23 @@ class App:
         return True
 
     async def send_to_alert(self, alert_chat_id: int, caption: str, image_url: Optional[str]) -> bool:
-        """Отправка в alert-бота через его Bot API."""
+        """Отправка в alert-бота через его Bot API. Заменяем любые <br> на \\n для безопасности."""
         if not self.alert_token:
             return False
-        import aiohttp
         api = f"https://api.telegram.org/bot{self.alert_token}"
+        safe_caption = _br(caption)
         try:
             async with aiohttp.ClientSession() as s:
                 if image_url:
                     form = aiohttp.FormData()
                     form.add_field("chat_id", str(alert_chat_id))
-                    form.add_field("caption", caption)
+                    form.add_field("caption", safe_caption)
                     form.add_field("parse_mode", "HTML")
                     form.add_field("photo", image_url)
                     async with s.post(f"{api}/sendPhoto", data=form, timeout=10) as r:
                         return (r.status == 200)
                 else:
-                    payload = {"chat_id": alert_chat_id, "text": caption, "parse_mode": "HTML", "disable_web_page_preview": True}
+                    payload = {"chat_id": alert_chat_id, "text": safe_caption, "parse_mode": "HTML", "disable_web_page_preview": True}
                     async with s.post(f"{api}/sendMessage", json=payload, timeout=10) as r:
                         return (r.status == 200)
         except Exception:
@@ -1548,22 +1601,19 @@ class App:
         if not os.path.exists(self.keys_file):
             return {}
         try:
-            with open(self.keys_file, "r", encoding="utf-8") as f:
-                data = json.load(f) or {}
-                return {str(k): dict(v) for k, v in data.items()}
-        except Exception:
+            data = load_json(self.keys_file, {}) or {}
+            return {str(k): dict(v) for k, v in data.items()}
+        except (OSError, ValueError, TypeError) as exc:
+            logger.error("Не удалось прочитать ключи: %s", exc)
             return {}
 
     def _save_keys(self, data: Dict[str, Dict[str, Any]]) -> None:
-        os.makedirs(os.path.dirname(self.keys_file) or ".", exist_ok=True)
-        with open(self.keys_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        save_json(self.keys_file, data)
 
     def issue_key(self, hours: int = 24, uses: int = 1) -> str:
-        data = self._load_keys()
         k = str(uuid.uuid4())
-        data[k] = {"hours": int(hours), "uses_left": int(uses), "created": time.time()}
-        self._save_keys(data)
+        update_json(self.keys_file, {}, lambda data: data.__setitem__(
+            k, {"hours": int(hours), "uses_left": int(uses), "created": time.time()}))
         return k
 
     def redeem_key(self, key: str) -> Optional[tuple[int, float]]:
@@ -1571,39 +1621,33 @@ class App:
         Возвращает (hours, expires_ts). ВАЖНО: expires_ts формируется в МОМЕНТ АКТИВАЦИИ,
         то есть ровно «сейчас + hours*3600», независимо от времени выдачи ключа.
         """
-        data = self._load_keys()
-        rec = data.get(key)
-        if not rec:
-            return None
-        left = int(rec.get("uses_left", 0))
-        if left <= 0:
-            return None
-        hours = int(rec.get("hours", 24))
-        expires_ts = time.time() + hours * 3600  # ← ключ действует 24ч С МОМЕНТА АКТИВАЦИИ
-        rec["uses_left"] = left - 1
-        data[key] = rec
-        self._save_keys(data)
-        return hours, float(expires_ts)
+        def redeem(data):
+            rec = data.get(key)
+            if not rec or int(rec.get("uses_left", 0)) <= 0:
+                return None
+            hours = int(rec.get("hours", 24))
+            expires_ts = time.time() + hours * 3600
+            rec["uses_left"] = int(rec["uses_left"]) - 1
+            return hours, float(expires_ts)
+        return update_json(self.keys_file, {}, redeem)
 
     # ===== антидубликаты per-user + global =====
     def _load_sent(self) -> Dict[str, Dict[str, float]]:
         if not os.path.exists(self.sent_file):
             return {}
         try:
-            with open(self.sent_file, "r", encoding="utf-8") as f:
-                data = json.load(f) or {}
-                out: Dict[str, Dict[str, float]] = {}
-                for uk, mp in data.items():
-                    if isinstance(mp, dict):
-                        out[str(uk)] = {str(aid): float(ts) for aid, ts in mp.items()}
-                return out
-        except Exception:
+            data = load_json(self.sent_file, {}) or {}
+            out: Dict[str, Dict[str, float]] = {}
+            for uk, mp in data.items():
+                if isinstance(mp, dict):
+                    out[str(uk)] = {str(aid): float(ts) for aid, ts in mp.items()}
+            return out
+        except (OSError, ValueError, TypeError) as exc:
+            logger.error("Не удалось прочитать dedup: %s", exc)
             return {}
 
     def _save_sent(self, data: Dict[str, Dict[str, float]]) -> None:
-        os.makedirs(os.path.dirname(self.sent_file) or ".", exist_ok=True)
-        with open(self.sent_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        save_json(self.sent_file, data)
 
     def _cleanup_sent_locked(self, data: Dict[str, Dict[str, float]]) -> None:
         cutoff = time.time() - DEDUP_TTL_DAYS * 86400
@@ -1621,11 +1665,10 @@ class App:
         return ad_id in inner
 
     def sent_mark(self, user_id: int, ad_id: str, ts: Optional[float] = None) -> None:
-        data = self._load_sent()
-        inner = data.setdefault(str(user_id), {})
-        inner[ad_id] = float(ts or time.time())
-        self._cleanup_sent_locked(data)
-        self._save_sent(data)
+        def mark(data):
+            data.setdefault(str(user_id), {})[ad_id] = float(ts or time.time())
+            self._cleanup_sent_locked(data)
+        update_json(self.sent_file, {}, mark)
 
     def dedup_global_enabled(self) -> bool:
         return DEDUP_GLOBAL
@@ -1636,110 +1679,99 @@ class App:
         return ad_id in inner
 
     def sent_global_mark(self, ad_id: str, ts: Optional[float] = None) -> None:
-        data = self._load_sent()
-        inner = data.setdefault("_global", {})
-        inner[ad_id] = float(ts or time.time())
-        self._cleanup_sent_locked(data)
-        self._save_sent(data)
+        def mark(data):
+            data.setdefault("_global", {})[ad_id] = float(ts or time.time())
+            self._cleanup_sent_locked(data)
+        update_json(self.sent_file, {}, mark)
 
     # ===== аккаунты =====
     def _load_accounts(self) -> Dict[str, Dict[str, Any]]:
         if not os.path.exists(self.accounts_file):
             return {}
         try:
-            with open(self.accounts_file, "r", encoding="utf-8") as f:
-                return json.load(f) or {}
-        except Exception:
+            return load_json(self.accounts_file, {}) or {}
+        except (OSError, ValueError, TypeError) as exc:
+            logger.error("Не удалось прочитать аккаунты: %s", exc)
             return {}
 
     def _save_accounts(self, data: Dict[str, Dict[str, Any]]) -> None:
-        os.makedirs(os.path.dirname(self.accounts_file) or ".", exist_ok=True)
-        with open(self.accounts_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        save_json(self.accounts_file, data)
+
+    def _restore_licenses(self) -> None:
+        now = time.time()
+        for user_id, account in self._load_accounts().items():
+            expires = max((float(k.get("expires", 0)) for k in account.get("keys", [])), default=0)
+            if expires > now:
+                self.license.activate_until(int(user_id), expires)
 
     def account_register_if_needed(self, user_id: int) -> None:
-        data = self._load_accounts()
-        u = data.get(str(user_id))
-        if not u:
-            data[str(user_id)] = {"registered": time.time(), "keys": []}
-            self._save_accounts(data)
+        def register(data):
+            data.setdefault(str(user_id), {"registered": time.time(), "keys": []})
+        update_json(self.accounts_file, {}, register)
 
     def account_add_key(self, user_id: int, key_value: str, hours: int, exp_ts: Optional[float]):
-        data = self._load_accounts()
-        u = data.setdefault(str(user_id), {"registered": time.time(), "keys": []})
-        u.setdefault("keys", []).append({
-            "key": key_value,
-            "activated": time.time(),
-            "hours": int(hours),
-            "expires": float(exp_ts or 0.0),
-        })
-        self._save_accounts(data)
+        def add_key(data):
+            u = data.setdefault(str(user_id), {"registered": time.time(), "keys": []})
+            u.setdefault("keys", []).append({"key": key_value, "activated": time.time(),
+                "hours": int(hours), "expires": float(exp_ts or 0.0)})
+        update_json(self.accounts_file, {}, add_key)
 
     def account_get(self, user_id: int) -> Optional[Dict[str, Any]]:
         return self._load_accounts().get(str(user_id))
 
     def _register(self):
+        # Регистрируем key_router ПЕРВЫМ — чтобы сообщения с ключами обрабатывались гарантированно
+        self.dp.include_router(key_router)
         self.dp.include_router(wizard_router)
         self.dp.include_router(support_router)
         self.dp.include_router(searches_router)
-        self.dp.include_router(key_router)
         self.dp.include_router(account_router)
 
         @self.dp.message(Command("test_alert"))
         async def test_alert(m: types.Message):
             if ADMIN_CHAT_ID is None or m.chat.id != ADMIN_CHAT_ID:
-                await m.reply("Команда доступна только админу."); return
+                await m.reply(_br("Команда доступна только админу.")); return
             chat_id = self.get_alert_chat_id(m.chat.id)
             if not chat_id:
-                await m.reply("Alert binding не найден. Нажмите кнопку привязки после активации ключа."); return
-            ok = await self.send_to_alert(chat_id, "Тестовое сообщение из основного бота ✅", None)
-            await m.reply("Отправлено." if ok else "Не удалось отправить (проверь токен ALERT_BOT_TOKEN и привязку).")
+                await m.reply(_br("Alert binding не найден. Нажмите кнопку привязки после активации ключа.")); return
+            ok = await self.send_to_alert(chat_id, _br("Тестовое сообщение из основного бота ✅"), None)
+            await m.reply(_br("Отправлено." if ok else "Не удалось отправить (проверь токен ALERT_BOT_TOKEN и привязку)."))
 
         @self.dp.message(F.text == "Назад")
         async def back_btn(m: types.Message, state: FSMContext):
             await state.clear()
-            await m.answer("Главное меню.", reply_markup=MAIN_KB)
+            await show_main_menu(m, clear_reply_keyboard=True)
 
         @self.dp.message(F.text.in_(["📘 Инструкция", "Инструкция", "/help"]))
         async def help_cmd(m: types.Message):
             self.account_register_if_needed(m.chat.id)
             await m.answer(
-                "📘 <b>Инструкция</b>\n"
-                "1) Получите ключ у поддержки.\n"
-                "2) Отправьте: <code>Ключ: xxxxx-…</code> — активируется слот.\n"
-                "3) Подключите alert-бота по кнопке в ответе на ключ.\n"
-                "4) Создайте поиск (Свободный слот) — объявления придут в alert-бот.",
-                reply_markup=MAIN_KB,
+                HELP_TEXT,
+                reply_markup=MAIN_INLINE_KB,
                 disable_web_page_preview=True
             )
 
         @self.dp.message(Command("start"))
         async def start_cmd(m: types.Message):
             self.account_register_if_needed(m.chat.id)
-            await m.answer(
-                "Я пришлю вам <b>только что опубликованные</b> объявления по вашим фильтрам.\n\n"
-                "• Активируйте доступ: отправьте ключ (формат «Ключ: …»)\n"
-                "• Подключите бота-оповещателя по кнопке в ответе на ключ\n"
-                "• Мастер: <code>/newsearch</code>\n"
-                "• Экран слотов: «🧭 Поиски»\n"
-                "• Аккаунт: «⚙️ Аккаунт»",
-                reply_markup=MAIN_KB,
-                disable_web_page_preview=True,
-            )
+            await show_main_menu(m, clear_reply_keyboard=True)
 
         @self.dp.message(Command("add"))
         async def add_cmd(m: types.Message):
             self.account_register_if_needed(m.chat.id)
             lic: LicenseManager = self.license
             if not lic.is_active(m.chat.id):
-                await m.reply("Слот не активирован. Получите ключ у поддержки и отправьте его боту (формат «Ключ: …»).")
+                await m.reply(_br("Слот не активирован. Получите ключ у поддержки и отправьте его боту (формат «Ключ: …»)."))
                 return
             txt = (m.text or "")
             parts = txt.split(maxsplit=2)
             if len(parts) < 2:
-                await m.reply("Укажите ссылку после /add. Пример:\n/add https://www.avito.ru/... max=100000000,min=10000")
+                await m.reply(_br("Укажите ссылку после /add. Пример:\\n/add https://www.avito.ru/... max=100000000,min=10000"))
                 return
             url = parts[1].strip()
+            if not is_valid_avito_url(url):
+                await m.reply(_br("Разрешены только ссылки https://avito.ru и его поддоменов."))
+                return
             params = parts[2].strip() if len(parts) >= 3 else ""
             flt = try_extract_filters_from_url(url)
             if params:
@@ -1761,12 +1793,12 @@ class App:
                         except Exception:
                             pass
             if flt.price_max is None:
-                await m.reply("⚠️ Укажите максимальную цену (параметр <code>max=</code>) или воспользуйтесь мастером «/newsearch».")
+                await m.reply(_br("⚠️ Укажите максимальную цену (параметр <code>max=</code>) или воспользуйтесь мастером «/newsearch»."))
                 return
             sub = await self.manager.add_subscription(m.chat.id, url, flt)
             await m.reply(
-                f"Подписка добавлена: <b>{sub.id}</b>\nСсылка: {url}\n"
-                "Карточки будут приходить в бот-оповещатель."
+                _br(f"Подписка добавлена: <b>{sub.id}</b>\\nСсылка: {url}\\n"
+                    "Карточки будут приходить в бот-оповещатель.")
             )
 
         @self.dp.message(Command("list"))
@@ -1774,7 +1806,7 @@ class App:
             self.account_register_if_needed(m.chat.id)
             subs = self.manager.list_user_subs(m.chat.id)
             if not subs:
-                await m.reply("У вас нет активных подписок."); return
+                await m.reply(_br("У вас нет активных подписок.")); return
             lines = ["Ваши подписки:"]
             for s in subs:
                 desc = []
@@ -1784,42 +1816,44 @@ class App:
                 if s.flt.price_min is not None: desc.append(f"min={s.flt.price_min}")
                 if s.flt.price_max is not None: desc.append(f"max={s.flt.price_max}")
                 lines.append(f"{s.id}: {s.url} " + (f"({' ; '.join(desc)})" if desc else ""))
-            lines.append("\nПодсказка: карточки приходят в бот-оповещатель после привязки.")
-            await m.reply("\n".join(lines), disable_web_page_preview=True)
+            lines.append("\\nПодсказка: карточки приходят в бот-оповещатель после привязки.")
+            await m.reply(_br("\\n".join(lines)), disable_web_page_preview=True)
 
         @self.dp.message(Command("remove"))
         async def remove_cmd(m: types.Message):
             self.account_register_if_needed(m.chat.id)
             parts = (m.text or "").split(maxsplit=1)
             if len(parts) < 2 or not parts[1].strip().isdigit():
-                await m.reply("Укажите ID: /remove 3"); return
+                await m.reply(_br("Укажите ID: /remove 3")); return
             ok = await self.manager.remove_subscription(m.chat.id, int(parts[1].strip()))
-            await m.reply("Удалено." if ok else "Подписка не найдена.")
+            await m.reply(_br("Удалено." if ok else "Подписка не найдена."))
 
         @self.dp.message(Command("genkey"))
         async def genkey_cmd(m: types.Message):
             if ADMIN_CHAT_ID is None or m.chat.id != ADMIN_CHAT_ID:
-                await m.reply("Команда доступна только админу."); return
+                await m.reply(_br("Команда доступна только админу.")); return
             parts = (m.text or "").split()
             hours = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 24
             uses = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else 1
             key = self.issue_key(hours=hours, uses=uses)
             await m.reply(
-                "Сгенерирован ключ ✅\n"
-                f"Ключ: <code>{key}</code>\n"
-                f"Срок: {hours} ч\n"
-                f"Использований: {uses}\n\n"
-                "Отправьте пользователю в виде: <b>Ключ: </b><code>значение</code>"
+                _br(
+                    "Сгенерирован ключ ✅\\n"
+                    f"Ключ: <code>{key}</code>\\n"
+                    f"Срок: {hours} ч\\n"
+                    f"Использований: {uses}\\n\\n"
+                    "Отправьте пользователю в виде: <b>Ключ: </b><code>значение</code>"
+                )
             )
 
         @self.dp.message(Command("diag"))
         async def diag_cmd(m: types.Message):
             if ADMIN_CHAT_ID is None or m.chat.id != ADMIN_CHAT_ID:
-                await m.reply("Команда доступна только админу."); return
+                await m.reply(_br("Команда доступна только админу.")); return
             lic = "✅" if self.license.is_active(m.chat.id) else "❌"
             bind = self.get_alert_chat_id(m.chat.id)
             subs = self.manager.list_user_subs(m.chat.id)
-            watchers = list(self.manager.watchers.keys())
+            watchers = list(self.manager.watchers.items())
             lines = [
                 "<b>Диагностика</b>",
                 f"Лицензия: {lic}",
@@ -1829,46 +1863,62 @@ class App:
             ]
             if watchers:
                 lines.append("Ключи вотчеров:")
-                for k in watchers:
-                    lines.append("• " + html.escape(k)[:80])
-            await m.reply("\n".join(lines), disable_web_page_preview=True)
+                now_mono = time.monotonic()
+                for key, watcher in watchers:
+                    route_until = Watcher._route_blocked_until.get(watcher._route_key(), 0.0)
+                    cooldown = max(0, int(max(watcher._blocked_until, route_until) - now_mono))
+                    status = str(watcher.last_http_status or "-")
+                    block = watcher.last_block_kind or "ok"
+                    consec = watcher._consecutive_blocks
+                    lines.append(
+                        f"• {html.escape(key)[:55]} | http={status} | {html.escape(block)} | wait={cooldown}s | consec={consec}"
+                    )
+
+            await m.reply(_br("\\n".join(lines)), disable_web_page_preview=True)
 
         @self.dp.message(Command("dedup_clear"))
         async def dedup_clear_cmd(m: types.Message):
             if ADMIN_CHAT_ID is None or m.chat.id != ADMIN_CHAT_ID:
-                await m.reply("Команда доступна только админу."); return
+                await m.reply(_br("Команда доступна только админу.")); return
             parts = (m.text or "").split(maxsplit=1)
             target = parts[1].strip().lower() if len(parts) > 1 else ""
             data = self._load_sent()
             if not target or target == "all":
                 data = {}; self._save_sent(data)
-                await m.reply("Антидубликат очищен полностью (per-user и global)."); return
+                await m.reply(_br("Антидубликат очищен полностью (per-user и global).")); return
             if target == "global":
                 if "_global" in data: del data["_global"]
-                self._save_sent(data); await m.reply("Глобальный антидубликат очищен."); return
+                self._save_sent(data); await m.reply(_br("Глобальный антидубликат очищен.")); return
             if target.isdigit():
                 if target in data:
                     del data[target]; self._save_sent(data)
-                    await m.reply(f"Антидубликат очищен для user_id={target}.")
+                    await m.reply(_br(f"Антидубликат очищен для user_id={target}."))
                 else:
-                    await m.reply(f"Для user_id={target} записей не было.")
+                    await m.reply(_br(f"Для user_id={target} записей не было."))
                 return
-            await m.reply("Формат: /dedup_clear [all|global|<user_id>]")
+            await m.reply(_br("Формат: /dedup_clear [all|global|<user_id>]"))
 
     async def setup_menu(self):
         await self.bot.set_my_commands(
             [
-                types.BotCommand(command="start", description="Начать работу"),
-                types.BotCommand(command="add", description="Добавить ссылку для мониторинга"),
-                types.BotCommand(command="list", description="Список ваших подписок"),
-                types.BotCommand(command="remove", description="Удалить подписку по ID"),
-                types.BotCommand(command="newsearch", description="Мастер подбора фильтров"),
-                types.BotCommand(command="account", description="⚙️ Аккаунт"),
-                types.BotCommand(command="genkey", description="(админ) Выдать ключ"),
-                types.BotCommand(command="diag", description="(админ) Диагностика"),
-                types.BotCommand(command="dedup_clear", description="(админ) Очистка антидубликата"),
+                types.BotCommand(command="start", description="Главное меню"),
+                types.BotCommand(command="newsearch", description="Создать поиск"),
+                types.BotCommand(command="account", description="Аккаунт"),
+                types.BotCommand(command="help", description="Помощь"),
             ]
         )
+        if ADMIN_CHAT_ID is not None:
+            await self.bot.set_my_commands(
+                [
+                    types.BotCommand(command="start", description="Главное меню"),
+                    types.BotCommand(command="newsearch", description="Создать поиск"),
+                    types.BotCommand(command="account", description="Аккаунт"),
+                    types.BotCommand(command="genkey", description="Выдать ключ"),
+                    types.BotCommand(command="diag", description="Диагностика"),
+                    types.BotCommand(command="dedup_clear", description="Очистить антидубликат"),
+                ],
+                scope=types.BotCommandScopeChat(chat_id=ADMIN_CHAT_ID),
+            )
 
 
 # ===== main =====
@@ -1879,6 +1929,7 @@ async def main():
     if not token:
         raise RuntimeError("BOT_TOKEN отсутствует в .env/Secrets")
     app = App(token)
+    await app.manager.restore()
     await app.setup_menu()
     await app.dp.start_polling(app.bot)
 
