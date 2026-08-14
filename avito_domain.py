@@ -1,13 +1,14 @@
 """Domain models and pure helpers for Avito searches and notifications."""
 
 import base64
+import binascii
 import json
 import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Literal
-from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse, urlunparse
+from typing import List, Literal, Optional
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 from bs4.element import Tag
 
@@ -61,13 +62,17 @@ class SubscriberFilter:
 
 
 @dataclass(frozen=True)
-class ParsedAvitoUrl:
+class SearchSpec:
     canonical_url: str
     display_url: str
     search_key: str
     kind: Literal["search", "item"]
     filters: SubscriberFilter
     warnings: tuple[str, ...] = ()
+
+
+# Backwards-compatible public name used by existing integrations.
+ParsedAvitoUrl = SearchSpec
 
 
 @dataclass
@@ -77,6 +82,7 @@ class Subscription:
     search_key: str
     url: str
     flt: SubscriberFilter = field(default_factory=SubscriberFilter)
+    original_url: Optional[str] = None
     name: Optional[str] = None
     only_new: bool = True
     forward_chat_id: Optional[int] = None
@@ -121,11 +127,13 @@ def _clean_url_text(url: str) -> str:
     return value
 
 
-def parse_avito_url(url: str) -> ParsedAvitoUrl:
+def parse_avito_url(url: str) -> SearchSpec:
     """Validate and canonically normalize a public Avito URL."""
     original = (url or "").strip()
     cleaned = _clean_url_text(original)
     parsed = urlparse(cleaned)
+    if parsed.scheme.casefold() not in {"http", "https"}:
+        raise ValueError("Поддерживаются только HTTP и HTTPS ссылки")
     host = (parsed.hostname or "").rstrip(".").casefold()
     if not host or not (host == "avito.ru" or host.endswith(".avito.ru")):
         raise ValueError("Разрешены только avito.ru и его поддомены")
@@ -143,7 +151,12 @@ def parse_avito_url(url: str) -> ParsedAvitoUrl:
         if key.casefold().startswith("utm_"):
             continue
         pairs.append((key, value))
-        if key.casefold() not in {"q", "f", "pmin", "pmax", "pricemin", "pricemax", "price_min", "price_max", "context"} and not key.casefold().startswith("params["):
+        if key.casefold() not in {
+            "q", "f", "pmin", "pmax", "pricemin", "pricemax",
+            "price_min", "price_max", "pricefrom", "priceto",
+            "minprice", "maxprice", "context", "s", "sort", "categoryid",
+            "locationid", "radius", "searchradius", "geocoords",
+        } and not key.casefold().startswith("params["):
             warnings.append(f"Неподдерживаемый параметр: {key}")
     pairs.sort(key=lambda item: (item[0], item[1]))
     netloc = host
@@ -152,7 +165,14 @@ def parse_avito_url(url: str) -> ParsedAvitoUrl:
     kind: Literal["search", "item"] = "item" if re.search(r"(?:^|[_/-])\d{7,}(?:$|[/?_-])", parsed.path) else "search"
     filters, filter_warnings = parse_filters(canonical)
     warnings.extend(filter_warnings)
-    return ParsedAvitoUrl(canonical, cleaned, canonical, kind, filters, tuple(dict.fromkeys(warnings)))
+    return SearchSpec(
+        canonical,
+        original or canonical,
+        canonical,
+        kind,
+        filters,
+        tuple(dict.fromkeys(warnings)),
+    )
 
 
 def _normalize_url(url: str) -> str:
@@ -213,85 +233,140 @@ def _get_text(tag: Optional[Tag]) -> str:
         return str(tag) if tag else ""
 
 
-def parse_filters(url: str) -> tuple[SubscriberFilter, list[str]]:
-    result = SubscriberFilter()
-    warnings: list[str] = []
-    try:
-        query = parse_qs(urlparse(url).query)
-        query_lower = {key.lower(): values for key, values in query.items()}
+_PRICE_MIN_KEYS = ("pmin", "pricemin", "price_min", "pricefrom", "minprice")
+_PRICE_MAX_KEYS = ("pmax", "pricemax", "price_max", "priceto", "maxprice")
+_FILTER_TEXT_KEYS = ("brand", "model", "storage", "keyword", "q")
+_PARAM_TEXT_KEYS = ("brand", "model", "storage", "value", "name")
 
-        def query_price(keys: tuple[str, ...]) -> Optional[int]:
-            for key in keys:
-                values = query_lower.get(key.lower())
-                if values:
-                    parsed = _parse_price_input(unquote(values[0]))
-                    if parsed is not None:
-                        return parsed
-            return None
 
-        result.price_min = query_price(("pmin", "priceMin", "price_min", "priceFrom", "minPrice"))
-        result.price_max = query_price(("pmax", "priceMax", "price_max", "priceTo", "maxPrice"))
-        if result.price_min == 0:
-            result.price_min = None
-
-        if query.get("q"):
-            result.keywords_all = [word for word in re.split(r"[,\s]+", unquote(query["q"][0]).strip()) if word]
-
-        encoded_filter = query.get("f", [None])[0]
-        if encoded_filter:
-            padding = "=" * ((4 - len(encoded_filter.strip()) % 4) % 4)
-            token = encoded_filter.strip()
-            if not re.fullmatch(r"[A-Za-z0-9_-]+={0,2}", token):
-                raise ValueError("malformed base64")
-            raw_decoded = base64.urlsafe_b64decode(token + padding)
-            json_start = raw_decoded.find(b"{")
-            if json_start < 0:
-                raise ValueError("JSON object not found")
-            payload = json.loads(raw_decoded[json_start:].decode("utf-8"))
-            if not isinstance(payload, dict):
-                raise ValueError("decoded filter is not an object")
-            text_parts: List[str] = []
-            if isinstance(payload, dict):
-                encoded_min = _parse_price_input(str(payload.get("from", "")))
-                encoded_max = _parse_price_input(str(payload.get("to", "")))
-                if result.price_min is None and encoded_min not in (None, 0):
-                    result.price_min = encoded_min
-                if result.price_max is None and encoded_max is not None:
-                    result.price_max = encoded_max
-
-                def pick(obj, keys):
-                    for key in keys:
-                        value = obj.get(key)
-                        if isinstance(value, str) and value:
-                            text_parts.append(value)
-
-                pick(payload, ["brand", "model", "storage", "keyword", "q"])
-                if isinstance(payload.get("params"), list):
-                    for parameter in payload["params"]:
-                        if isinstance(parameter, dict):
-                            pick(parameter, ["brand", "model", "storage", "value", "name"])
-
-            known_words = {word.lower() for word in result.keywords_all}
-            for text_part in text_parts:
-                for word in re.split(r"[,\s/]+", str(text_part)):
-                    word = word.strip()
-                    if word and word.lower() not in known_words:
-                        result.keywords_all.append(word)
-                        known_words.add(word.lower())
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        warnings.append(f"Не удалось разобрать фильтр f: {exc}")
-    except (TypeError, AttributeError) as exc:
-        warnings.append(f"Некорректные параметры фильтра: {exc}")
-    # Stable, case-insensitive de-duplication.
+def normalize_filter(filters: SubscriberFilter) -> SubscriberFilter:
+    """Return a detached filter with stable case-insensitive word lists."""
+    normalized = SubscriberFilter(price_min=filters.price_min, price_max=filters.price_max)
     for attr in ("keywords_all", "keywords_any", "keywords_stop"):
-        values = getattr(result, attr)
-        seen = set(); normalized = []
-        for value in values:
+        seen: set[str] = set()
+        words: list[str] = []
+        for value in getattr(filters, attr, ()):
             token = str(value).strip()
             folded = token.casefold()
             if token and folded not in seen:
-                seen.add(folded); normalized.append(token)
-        setattr(result, attr, normalized)
+                seen.add(folded)
+                words.append(token)
+        setattr(normalized, attr, words)
+    if normalized.price_min == 0:
+        normalized.price_min = None
+    return normalized
+
+
+def _first_query_price(query: dict[str, list[str]], keys: tuple[str, ...]) -> Optional[int]:
+    for key in keys:
+        values = query.get(key)
+        if values:
+            parsed = _parse_price_input(values[0])
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _parse_query_filters(query: dict[str, list[str]]) -> SubscriberFilter:
+    result = SubscriberFilter(
+        price_min=_first_query_price(query, _PRICE_MIN_KEYS),
+        price_max=_first_query_price(query, _PRICE_MAX_KEYS),
+    )
+    for value in query.get("q", []):
+        result.keywords_all.extend(
+            word for word in re.split(r"[,\s]+", value.strip()) if word
+        )
+    return result
+
+
+def _decode_filter_payload(encoded_filter: str) -> dict[str, object]:
+    token = encoded_filter.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]+={0,2}", token):
+        raise ValueError("malformed base64")
+    token = token.rstrip("=")
+    padding = "=" * ((4 - len(token) % 4) % 4)
+    try:
+        raw_decoded = base64.urlsafe_b64decode(token + padding)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("malformed base64") from exc
+    json_start = raw_decoded.find(b"{")
+    if json_start < 0:
+        raise ValueError("JSON object not found")
+    try:
+        payload = json.loads(raw_decoded[json_start:].decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise ValueError("invalid UTF-8") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError("malformed JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("decoded filter is not an object")
+    return payload
+
+
+def _parse_encoded_filter(encoded_filter: str) -> SubscriberFilter:
+    payload = _decode_filter_payload(encoded_filter)
+    result = SubscriberFilter(
+        price_min=_parse_price_input(str(payload.get("from", ""))),
+        price_max=_parse_price_input(str(payload.get("to", ""))),
+    )
+    text_parts: list[str] = []
+
+    def pick(obj: dict[str, object], keys: tuple[str, ...]) -> None:
+        for key in keys:
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                text_parts.append(value)
+
+    pick(payload, _FILTER_TEXT_KEYS)
+    parameters = payload.get("params")
+    if parameters is not None and not isinstance(parameters, list):
+        raise ValueError("params must be a list")
+    for parameter in parameters or []:
+        if not isinstance(parameter, dict):
+            raise ValueError("params entries must be objects")
+        pick(parameter, _PARAM_TEXT_KEYS)
+    for text_part in text_parts:
+        result.keywords_all.extend(
+            word for word in re.split(r"[,\s/]+", text_part) if word.strip()
+        )
+    return result
+
+
+def _merge_filters(primary: SubscriberFilter, fallback: SubscriberFilter) -> SubscriberFilter:
+    merged = SubscriberFilter(
+        keywords_all=[*primary.keywords_all, *fallback.keywords_all],
+        keywords_any=[*primary.keywords_any, *fallback.keywords_any],
+        keywords_stop=[*primary.keywords_stop, *fallback.keywords_stop],
+        price_min=primary.price_min if primary.price_min is not None else fallback.price_min,
+        price_max=primary.price_max if primary.price_max is not None else fallback.price_max,
+    )
+    return normalize_filter(merged)
+
+
+def parse_filters(url: str) -> tuple[SubscriberFilter, list[str]]:
+    warnings: list[str] = []
+    try:
+        raw_query = parse_qs(urlparse(url).query, keep_blank_values=True)
+        query = {key.casefold(): values for key, values in raw_query.items()}
+    except (TypeError, ValueError, AttributeError) as exc:
+        return SubscriberFilter(), [f"Некорректные параметры фильтра: {exc}"]
+
+    result = _parse_query_filters(query)
+    encoded_values = query.get("f", [])
+    for encoded_filter in encoded_values:
+        if not encoded_filter:
+            continue
+        try:
+            result = _merge_filters(result, _parse_encoded_filter(encoded_filter))
+        except ValueError as exc:
+            warnings.append(f"Не удалось разобрать фильтр f: {exc}")
+    result = normalize_filter(result)
+    if (
+        result.price_min is not None
+        and result.price_max is not None
+        and result.price_min > result.price_max
+    ):
+        warnings.append("Минимальная цена больше максимальной")
     return result, warnings
 
 

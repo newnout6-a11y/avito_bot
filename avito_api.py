@@ -17,16 +17,16 @@
 - parse_api_items — разбор JSON в плоские словари под dataclass Ad бота.
 """
 
+import hashlib
 import json
 import logging
 import random
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Protocol
-from dataclasses import dataclass
-import hashlib
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from curl_cffi import requests as curl_requests
@@ -284,39 +284,125 @@ class ApiRouteResolver(Protocol):
 
 
 class DefaultApiRouteResolver:
-    """Resolve public URLs while retaining route metadata and stale entries."""
+    """Resolve public URLs with TTL metadata and stale-route fallback."""
 
     def __init__(self, cache_file: str, timeout: float = 25.0):
         self.cache_file = cache_file
         self.timeout = timeout
+        self.last_status = "pending"
+        self.last_error: Optional[str] = None
+
+    @staticmethod
+    def _retry_delay(fail_count: int) -> float:
+        return min(3600.0, 60.0 * (2 ** max(0, fail_count - 1)))
+
+    @staticmethod
+    def _as_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+
+    @staticmethod
+    def _as_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
 
     def resolve(self, canonical_url: str) -> Optional[str]:
         from storage import load_state, save_state
+
+        if is_valid_api_url(canonical_url):
+            self.last_status = "ready"
+            self.last_error = None
+            return _ensure_sort_date(canonical_url)
+
         now = time.time()
         try:
             data = load_state(self.cache_file, {}) or {}
-        except Exception:
+        except Exception as exc:
+            data = {}
+            self.last_error = str(exc)
+        if not isinstance(data, dict):
             data = {}
         raw = data.get(canonical_url) if isinstance(data, dict) else None
         if isinstance(raw, str):
             raw = {"api_url": raw, "created_at": now, "last_success_at": now}
-        if isinstance(raw, dict):
-            route = raw.get("api_url")
-            last = float(raw.get("last_success_at") or raw.get("created_at") or 0)
-            if route and is_valid_api_url(str(route)) and now - last < API_ROUTE_TTL_SEC:
-                return _ensure_sort_date(str(route))
-        route = convert_url_to_api(canonical_url, self.cache_file, self.timeout)
-        if route:
-            if not isinstance(data, dict):
-                data = {}
-            data[canonical_url] = {"api_url": route, "created_at": now,
-                                   "last_success_at": now, "last_error": None,
-                                   "fail_count": 0}
+            data[canonical_url] = raw
             try:
                 save_state(self.cache_file, data)
             except Exception:
                 pass
-        return route
+        stale_route: Optional[str] = None
+        if isinstance(raw, dict):
+            route = raw.get("api_url")
+            last = self._as_float(raw.get("last_success_at") or raw.get("created_at"))
+            if route and is_valid_api_url(str(route)):
+                stale_route = _ensure_sort_date(str(route))
+                if now - last < API_ROUTE_TTL_SEC:
+                    self.last_status = "ready"
+                    self.last_error = None
+                    return stale_route
+            retry_after = self._as_float(raw.get("retry_after"))
+            if retry_after > now:
+                self.last_status = "retry"
+                self.last_error = str(raw.get("last_error") or "conversion retry scheduled")
+                return stale_route
+
+        route, error = _request_api_route(canonical_url, self.timeout)
+        if route:
+            data[canonical_url] = {
+                "api_url": route,
+                "created_at": self._as_float(raw.get("created_at"), now) if isinstance(raw, dict) else now,
+                "last_success_at": now,
+                "last_error": None,
+                "fail_count": 0,
+                "retry_after": None,
+            }
+            self.last_status = "ready"
+            self.last_error = None
+        else:
+            fail_count = self._as_int(raw.get("fail_count")) + 1 if isinstance(raw, dict) else 1
+            self.last_status = "retry"
+            self.last_error = error or "SPFA conversion failed"
+            data[canonical_url] = {
+                "api_url": stale_route,
+                "created_at": self._as_float(raw.get("created_at"), now) if isinstance(raw, dict) else now,
+                "last_success_at": self._as_float(raw.get("last_success_at")) if isinstance(raw, dict) else 0,
+                "last_error": self.last_error,
+                "fail_count": fail_count,
+                "retry_after": now + self._retry_delay(fail_count),
+            }
+        try:
+            save_state(self.cache_file, data)
+        except Exception as exc:
+            logger.warning("Не удалось сохранить metadata API route: %s", exc)
+        return route or stale_route
+
+    def invalidate(self, canonical_url: str, reason: str) -> None:
+        from storage import update_state
+
+        now = time.time()
+
+        def mark_invalid(data: Any) -> None:
+            if not isinstance(data, dict):
+                return
+            raw = data.get(canonical_url)
+            created_at = self._as_float(raw.get("created_at"), now) if isinstance(raw, dict) else now
+            fail_count = self._as_int(raw.get("fail_count")) + 1 if isinstance(raw, dict) else 1
+            data[canonical_url] = {
+                "api_url": None,
+                "created_at": created_at,
+                "last_success_at": self._as_float(raw.get("last_success_at")) if isinstance(raw, dict) else 0,
+                "last_error": reason,
+                "fail_count": fail_count,
+                "retry_after": now + self._retry_delay(fail_count),
+            }
+
+        update_state(self.cache_file, {}, mark_invalid)
+        self.last_status = "retry"
+        self.last_error = reason
 
 
 def invalidate_cached_api_url(url: str, cache_file: str) -> None:
@@ -338,35 +424,8 @@ def _ensure_sort_date(api_url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
-def convert_url_to_api(url: str, cache_file: str, timeout: float = 25.0) -> Optional[str]:
-    """
-    Публичная ссылка Авито -> API URL (web/1/js/items).
-    Ходим в бесплатный конвертер SPFA (лимит ~2/мин), результат кэшируем
-    в cache_file навсегда. При неудаче возвращаем None (повторим позже).
-    """
+def _request_api_route(url: str, timeout: float) -> tuple[Optional[str], Optional[str]]:
     global _spfa_last_call
-    if is_valid_api_url(url):
-        return _ensure_sort_date(url)
-
-    from storage import (  # локальный импорт, чтобы не тянуть при тестах парсера
-        load_state,
-        save_state,
-    )
-
-    cache: Dict[str, str] = {}
-    try:
-        raw = load_state(cache_file, {}) or {}
-        if isinstance(raw, dict):
-            cache = {
-                str(k): (str(v.get("api_url")) if isinstance(v, dict) and v.get("api_url") else str(v))
-                for k, v in raw.items()
-            }
-    except Exception as exc:
-        logger.warning("Не удалось прочитать кэш API URL: %s", exc)
-    if url in cache and is_valid_api_url(cache[url]):
-        return _ensure_sort_date(cache[url])
-
-    # Serialize SPFA calls so concurrent watcher startup cannot violate its rate limit.
     with _spfa_lock:
         wait = SPFA_MIN_INTERVAL_SEC - (time.monotonic() - _spfa_last_call)
         if _spfa_last_call and wait > 0:
@@ -378,25 +437,25 @@ def convert_url_to_api(url: str, cache_file: str, timeout: float = 25.0) -> Opti
             _spfa_last_call = time.monotonic()
             if r.status_code != 200:
                 logger.warning("SPFA конвертер: http %s для %s", r.status_code, url)
-                return None
+                return None, f"SPFA HTTP {r.status_code}"
             payload = r.json()
             api_url = payload.get("api_url") if payload.get("success") else None
             if not api_url:
                 logger.warning("SPFA конвертер не вернул api_url для %s", url)
-                return None
+                return None, "SPFA did not return api_url"
             api_url = _ensure_sort_date(str(api_url))
             if not is_valid_api_url(api_url):
                 logger.warning("SPFA returned an invalid API URL for %s", url)
-                return None
-            cache[url] = api_url
-            try:
-                save_state(cache_file, cache)
-            except Exception as exc:
-                logger.warning("Не удалось сохранить кэш API URL: %s", exc)
-            return api_url
+                return None, "SPFA returned invalid api_url"
+            return api_url, None
         except Exception as exc:
             logger.warning("Ошибка конвертации URL %s: %s", url, exc)
-            return None
+            return None, str(exc)
+
+
+def convert_url_to_api(url: str, cache_file: str, timeout: float = 25.0) -> Optional[str]:
+    """Compatibility facade for the metadata-aware route resolver."""
+    return DefaultApiRouteResolver(cache_file, timeout).resolve(url)
 
 
 # ===== разбор JSON API -> плоские словари под Ad =====
@@ -427,12 +486,29 @@ def _item_image(item: Dict[str, Any]) -> str:
     return ""
 
 
+def _item_url(value: Any) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("/"):
+        return f"https://www.avito.ru{raw}"
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if parsed.scheme == "https" and (host == "avito.ru" or host.endswith(".avito.ru")):
+        return raw
+    return None
+
+
 @dataclass
 class FeedParseResult:
     items: List[Dict[str, Any]]
     warnings: List[str]
     skipped_items: int
     schema_fingerprint: str
+    schema_mismatch: bool = False
 
 
 def parse_api_feed(payload: Dict[str, Any], limit: int = 20) -> FeedParseResult:
@@ -440,26 +516,34 @@ def parse_api_feed(payload: Dict[str, Any], limit: int = 20) -> FeedParseResult:
     if limit <= 0:
         return FeedParseResult([], [], 0, "empty-limit")
     if not isinstance(payload, dict):
-        return FeedParseResult([], ["API payload is not an object"], 0, "invalid")
+        return FeedParseResult([], ["API payload is not an object"], 0, "invalid", True)
     catalog = payload.get("catalog")
     if not isinstance(catalog, dict):
         result = payload.get("result")
         catalog = result if isinstance(result, dict) else payload
     raw_items = catalog.get("items") if isinstance(catalog, dict) else None
     if not isinstance(raw_items, list):
-        return FeedParseResult([], ["API schema mismatch: items missing"], 0, hashlib.sha1(repr(sorted(payload.keys())).encode()).hexdigest()[:12])
+        fingerprint = hashlib.sha1(repr(sorted(payload.keys())).encode()).hexdigest()[:12]
+        return FeedParseResult([], ["API schema mismatch: items missing"], 0, fingerprint, True)
     ads: List[Dict[str, Any]] = []
     skipped = 0
     for item in raw_items:
         if not isinstance(item, dict):
-            skipped += 1; continue
+            skipped += 1
+            continue
         if str(item.get("type", "")) in _NON_AD_TYPES:
-            skipped += 1; warnings.append("Skipped service/banner item"); continue
+            skipped += 1
+            if "Skipped service/banner item" not in warnings:
+                warnings.append("Skipped service/banner item")
+            continue
         ad_id = item.get("id")
-        url_path = item.get("urlPath") or item.get("uriPath")
+        url = _item_url(item.get("urlPath") or item.get("uriPath"))
         title = item.get("title")
-        if not ad_id or not url_path or not title:
-            skipped += 1; warnings.append("Skipped malformed item"); continue
+        if not ad_id or not url or not title:
+            skipped += 1
+            if "Skipped malformed item" not in warnings:
+                warnings.append("Skipped malformed item")
+            continue
         price: Optional[int] = None
         pd = item.get("priceDetailed")
         candidates = [pd.get("value")] if isinstance(pd, dict) else []
@@ -469,27 +553,33 @@ def parse_api_feed(payload: Dict[str, Any], limit: int = 20) -> FeedParseResult:
                 if isinstance(value, str):
                     value = value.replace(" ", "").replace("\u00a0", "")
                 if isinstance(value, (int, float, str)) and float(value) > 0:
-                    price = int(float(value)); break
+                    price = int(float(value))
+                    break
             except (TypeError, ValueError):
                 continue
         published_ts: Optional[float] = None
         sts = item.get("sortTimeStamp")
-        if isinstance(sts, (int, float)) and sts > 0:
-            published_ts = float(sts) / 1000.0 if sts > 10_000_000_000 else float(sts)
+        try:
+            numeric_ts = float(sts)
+        except (TypeError, ValueError):
+            numeric_ts = 0.0
+        if numeric_ts > 0:
+            published_ts = numeric_ts / 1000.0 if numeric_ts > 10_000_000_000 else numeric_ts
         location = ""
         for candidate in (item.get("geo"), item.get("addressDetailed"), item.get("location")):
             if isinstance(candidate, str):
                 location = candidate.strip()
             elif isinstance(candidate, dict):
                 location = _first_str(candidate.get("name"), candidate.get("title"), candidate.get("formattedAddress"), candidate.get("locationName"))
-            if location: break
-        url = str(url_path) if str(url_path).startswith("http") else f"https://www.avito.ru{url_path}"
+            if location:
+                break
         ads.append({"ad_id": str(ad_id), "url": url, "title": str(title), "price": price,
                     "location": location, "date_str": "", "published_ts": published_ts,
                     "description": str(item.get("description") or ""), "image_url": _item_image(item),
                     "seller_id": str(item["sellerId"]) if item.get("sellerId") else None,
                     "is_verified": bool(item.get("isVerifiedItem"))})
-        if len(ads) >= max(0, limit): break
+        if len(ads) >= limit:
+            break
     if raw_items and not ads:
         warnings.append("API returned zero valid listings")
     fingerprint = hashlib.sha1(repr(sorted(raw_items[0].keys()) if raw_items and isinstance(raw_items[0], dict) else []).encode()).hexdigest()[:12]

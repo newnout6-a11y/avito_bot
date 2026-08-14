@@ -13,23 +13,26 @@ from aiogram import Bot, types
 from bs4 import BeautifulSoup
 
 from avito_api import (
+    ApiRouteResolver,
     AvitoBlock,
     AvitoHttpClient,
     AvitoHttpError,
-    convert_url_to_api,
+    DefaultApiRouteResolver,
     invalidate_cached_api_url,
-    parse_api_items,
+    parse_api_feed,
 )
 from avito_domain import (
     Ad,
     FeedItem,
+    SearchSpec,
     SubscriberFilter,
     Subscription,
     _br,
     _fmt_dt,
     _get_text,
     avito_short_url,
-    search_key_from_url,
+    normalize_filter,
+    parse_avito_url,
 )
 from avito_settings import (
     ADMIN_CHAT_ID,
@@ -61,6 +64,7 @@ class Watcher:
         url: str,
         bot: Bot,
         on_deliver: Optional[Callable[[int, Ad], None]] = None,
+        route_resolver: Optional[ApiRouteResolver] = None,
     ):
         self.search_key = search_key
         self.url = url
@@ -76,17 +80,29 @@ class Watcher:
             proxy=self._proxy(),
             proxy_change_url=self._proxy_change_url(),
         )
+        self._client_closed = False
         self.on_deliver = on_deliver
+        self.route_resolver = route_resolver or DefaultApiRouteResolver(API_URLS_FILE)
         self._enrich_cache: set[str] = set()
         self._api_url: Optional[str] = None
         self._blocked_until = 0.0
         self._consecutive_blocks = 0
         self.last_http_status: Optional[int] = None
         self.last_block_kind: Optional[str] = None
+        self.conversion_status = "pending"
+        self.conversion_error: Optional[str] = None
+        self.parser_health = "unknown"
+        self.parser_warnings: tuple[str, ...] = ()
 
     async def start(self):
         if self.task and not self.task.done():
             return
+        if self._client_closed:
+            self._client = AvitoHttpClient(
+                proxy=self._proxy(),
+                proxy_change_url=self._proxy_change_url(),
+            )
+            self._client_closed = False
         if PRIME_ON_START:
             await self._prime_seen(30)
         self.task = asyncio.create_task(self._run(), name=f"watch:{self.search_key}")
@@ -100,6 +116,7 @@ class Watcher:
                 pass
             self.task = None
         self._client.close()
+        self._client_closed = True
 
     def has_subscribers(self):
         return bool(self.subscribers)
@@ -229,6 +246,13 @@ class Watcher:
         lines.extend(("", avito_short_url(ad.url)))
         return "\n".join(lines)
 
+    async def _invalidate_api_route(self, reason: str) -> None:
+        invalidate = getattr(self.route_resolver, "invalidate", None)
+        if callable(invalidate):
+            await asyncio.to_thread(invalidate, self.url, reason)
+            return
+        await asyncio.to_thread(invalidate_cached_api_url, self.url, API_URLS_FILE)
+
     async def _fetch_ads(self) -> Optional[List[Ad]]:
         """Fetch the JSON feed with per-watcher and shared-route cooldowns."""
         now = time.monotonic()
@@ -240,12 +264,16 @@ class Watcher:
         if now < max(self._blocked_until, route_blocked_until):
             return None
         if not self._api_url:
-            api_url = await asyncio.to_thread(convert_url_to_api, self.url, API_URLS_FILE)
+            api_url = await asyncio.to_thread(self.route_resolver.resolve, self.url)
+            self.conversion_status = getattr(self.route_resolver, "last_status", "ready" if api_url else "retry")
+            self.conversion_error = getattr(self.route_resolver, "last_error", None)
             if not api_url:
                 logger.warning("Could not convert Avito URL to API URL: %s", self.url)
                 self._blocked_until = time.monotonic() + 60
                 return None
             self._api_url = api_url
+            if self.conversion_status != "retry":
+                self.conversion_status = "ready"
 
         max_attempts = max(1, len(AVITO_PROXIES))
         if self._proxy_change_url():
@@ -257,7 +285,35 @@ class Watcher:
                 self.last_http_status = self._client.last_status
                 self._consecutive_blocks = 0
                 self.last_block_kind = None
-                return [Ad(**item) for item in parse_api_items(payload, limit=20)]
+                parsed = parse_api_feed(payload, limit=20)
+                self.parser_warnings = tuple(parsed.warnings)
+                if parsed.schema_mismatch:
+                    self.parser_health = "schema_mismatch"
+                    self.conversion_status = "retry"
+                    self.conversion_error = "; ".join(parsed.warnings)
+                    try:
+                        await self._invalidate_api_route(self.conversion_error)
+                    except Exception as cache_error:
+                        logger.warning("Could not invalidate schema-mismatched route: %s", cache_error)
+                    self._api_url = None
+                    logger.error(
+                        "Avito API schema mismatch for %s (%s): %s",
+                        self.url,
+                        parsed.schema_fingerprint,
+                        self.conversion_error,
+                    )
+                    return None
+                self.parser_health = "warning" if parsed.warnings else "ok"
+                if parsed.warnings:
+                    logger.warning(
+                        "Avito feed warnings for %s (%s): %s",
+                        self.url,
+                        parsed.schema_fingerprint,
+                        "; ".join(parsed.warnings),
+                    )
+                self.conversion_status = "ready"
+                self.conversion_error = None
+                return [Ad(**item) for item in parsed.items]
             except AvitoBlock as block:
                 blocked_route = self._route_key()
                 self.last_http_status = block.status
@@ -275,10 +331,12 @@ class Watcher:
                 self.last_http_status = error.status
                 if error.status in (400, 404, 410, 422):
                     try:
-                        await asyncio.to_thread(invalidate_cached_api_url, self.url, API_URLS_FILE)
+                        await self._invalidate_api_route(str(error))
                     except Exception as cache_error:
                         logger.warning("Could not invalidate API URL cache: %s", cache_error)
                     self._api_url = None
+                    self.conversion_status = "retry"
+                    self.conversion_error = str(error)
                 logger.error("Avito API error for %s: %s", self.url, error)
                 self._blocked_until = time.monotonic() + min(60.0, self.interval_min)
                 Watcher._route_blocked_until[self._route_key()] = self._blocked_until
@@ -311,16 +369,16 @@ class Watcher:
     @staticmethod
     def _ad_passes_filters(ad: Ad, sub: Subscription) -> bool:
         filters = sub.flt
-        text = f"{ad.title}{ad.description}".lower()
+        text = f"{ad.title} {ad.description}".casefold()
         if filters.price_min is not None and (ad.price is None or ad.price < filters.price_min):
             return False
         if filters.price_max is not None and (ad.price is None or ad.price > filters.price_max):
             return False
-        if filters.keywords_all and not all(word.lower() in text for word in filters.keywords_all):
+        if filters.keywords_all and not all(word.casefold() in text for word in filters.keywords_all):
             return False
-        if filters.keywords_any and not any(word.casefold() in text.casefold() for word in filters.keywords_any):
+        if filters.keywords_any and not any(word.casefold() in text for word in filters.keywords_any):
             return False
-        if filters.keywords_stop and any(word.lower() in text for word in filters.keywords_stop):
+        if filters.keywords_stop and any(word.casefold() in text for word in filters.keywords_stop):
             return False
         return True
 
@@ -453,21 +511,32 @@ class WatcherManager:
         url: str,
         flt: Optional[SubscriberFilter] = None,
     ) -> Subscription:
-        filters = flt or SubscriberFilter()
-        key = search_key_from_url(url)
+        return await self.add_search_spec(user_id, parse_avito_url(url), flt)
+
+    async def add_search_spec(
+        self,
+        user_id: int,
+        spec: SearchSpec,
+        flt: Optional[SubscriberFilter] = None,
+    ) -> Subscription:
+        if spec.kind != "search":
+            raise ValueError("Для подписки нужна ссылка на результаты поиска")
+        filters = normalize_filter(flt or spec.filters)
+        key = spec.search_key
         sub = Subscription(
             id=self._next_sub_id(),
             user_id=user_id,
             search_key=key,
             url=key,
             flt=filters,
+            original_url=spec.display_url,
         )
         watcher = self.watchers.get(key)
         if not watcher:
-            watcher = Watcher(key, url, self.bot, self._on_deliver)
+            watcher = Watcher(key, spec.canonical_url, self.bot, self._on_deliver)
             self.watchers[key] = watcher
-            await watcher.start()
         watcher.add_sub(sub)
+        await watcher.start()
         self.subs_by_user.setdefault(user_id, []).append(sub)
         self.save()
         return sub
@@ -501,6 +570,7 @@ class WatcherManager:
                 "user_id": sub.user_id,
                 "search_key": sub.search_key,
                 "url": sub.url,
+                "original_url": sub.original_url,
                 "name": sub.name,
                 "only_new": sub.only_new,
                 "started_ts": sub.started_ts,
@@ -519,12 +589,29 @@ class WatcherManager:
             return
         for row in rows:
             try:
+                candidates = (
+                    row.get("url"),
+                    row.get("search_key"),
+                    row.get("original_url"),
+                )
+                spec = None
+                for candidate in candidates:
+                    if not candidate:
+                        continue
+                    try:
+                        spec = parse_avito_url(str(candidate))
+                        break
+                    except (TypeError, ValueError):
+                        continue
+                if spec is None or spec.kind != "search":
+                    raise ValueError("нет восстанавливаемой поисковой ссылки")
                 sub = Subscription(
                     id=int(row["id"]),
                     user_id=int(row["user_id"]),
-                    search_key=search_key_from_url(str(row.get("search_key") or row.get("url") or "")),
-                    url=search_key_from_url(str(row.get("url") or row.get("search_key") or "")),
-                    flt=SubscriberFilter(**row.get("filter", {})),
+                    search_key=spec.search_key,
+                    url=spec.canonical_url,
+                    flt=normalize_filter(SubscriberFilter(**row.get("filter", {}))),
+                    original_url=row.get("original_url") or spec.display_url,
                     name=row.get("name"),
                     only_new=bool(row.get("only_new", True)),
                     started_ts=float(row.get("started_ts", time.time())),

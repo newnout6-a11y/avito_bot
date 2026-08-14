@@ -35,16 +35,15 @@ from avito_api import parse_api_items as parse_api_items
 from avito_domain import (
     KEY_RE,
     LicenseManager,
+    SearchSpec,
     SubscriberFilter,
     Subscription,
     _br,
     _fmt_dt,
     _parse_price_input,
     avito_short_url,
-    is_valid_avito_url,
+    normalize_filter,
     parse_avito_url,
-    search_key_from_url,
-    try_extract_filters_from_url,
 )
 from avito_domain import (
     Ad as Ad,
@@ -60,6 +59,15 @@ from avito_domain import (
 )
 from avito_domain import (
     _get_text as _get_text,
+)
+from avito_domain import (
+    is_valid_avito_url as is_valid_avito_url,
+)
+from avito_domain import (
+    search_key_from_url as search_key_from_url,
+)
+from avito_domain import (
+    try_extract_filters_from_url as try_extract_filters_from_url,
 )
 from avito_monitoring import Watcher, WatcherManager
 from avito_settings import (
@@ -142,12 +150,24 @@ async def show_main_menu(
 # ===== Мастер добавления поиска =====
 class SearchWizard(StatesGroup):
     url = State()
+    confirm = State()
     price_min = State()
     price_max = State()
+    words = State()
     name = State()
 
 
 wizard_router = Router(name="wizard")
+
+_AVITO_URL_IN_TEXT_RE = re.compile(
+    r"(?:(?:https?://(?:[a-z0-9-]+\.)*avito\.ru)|(?<!://)(?:[a-z0-9-]+\.)*avito\.ru)\S*",
+    re.I,
+)
+
+
+def _extract_avito_url_text(text: str) -> Optional[str]:
+    match = _AVITO_URL_IN_TEXT_RE.search(text or "")
+    return match.group(0) if match else None
 
 
 async def _prompt_search_name(
@@ -155,7 +175,7 @@ async def _prompt_search_name(
     state: FSMContext,
     url: str,
     pmin: Optional[int],
-    pmax: int,
+    pmax: Optional[int],
     keywords: List[str],
 ) -> None:
     await state.update_data(price_min=pmin, price_max=pmax)
@@ -163,19 +183,102 @@ async def _prompt_search_name(
     min_text = (
         f"{pmin:,}".replace(",", " ") + " ₽" if pmin is not None else "без ограничения"
     )
-    max_text = f"{pmax:,}".replace(",", " ") + " ₽"
+    max_text = (
+        f"{pmax:,}".replace(",", " ") + " ₽" if pmax is not None else "без ограничения"
+    )
+    data = await state.get_data()
+    keywords_any = data.get("keywords_any") or []
+    keywords_stop = data.get("keywords_stop") or []
     summary = [
         "<b>Новый поиск · 3 из 3</b>",
         "",
         f"Цена от: {min_text}",
         f"Цена до: {max_text}",
         f"Слова: {html.escape(', '.join(keywords)) if keywords else 'не заданы'}",
+        f"Любое из слов: {html.escape(', '.join(keywords_any)) if keywords_any else 'не заданы'}",
+        f"Стоп-слова: {html.escape(', '.join(keywords_stop)) if keywords_stop else 'не заданы'}",
         f'<a href="{short_url}">Открыть поиск на Avito</a>',
         "",
         "Отправьте короткое название, например «Samsung до 70 000».",
     ]
     await state.set_state(SearchWizard.name)
     await message.answer(_br("\\n".join(summary)), disable_web_page_preview=True)
+
+
+def _filter_from_data(data: Dict[str, Any]) -> SubscriberFilter:
+    return normalize_filter(
+        SubscriberFilter(
+            keywords_all=list(data.get("keywords_all") or data.get("guessed_kw") or []),
+            keywords_any=list(data.get("keywords_any") or []),
+            keywords_stop=list(data.get("keywords_stop") or []),
+            price_min=data.get("price_min"),
+            price_max=data.get("price_max"),
+        )
+    )
+
+
+def _filter_preview(spec: SearchSpec) -> str:
+    filters = spec.filters
+
+    def price(value: Optional[int]) -> str:
+        return f"{value:,}".replace(",", " ") + " ₽" if value is not None else "не задана"
+
+    warnings = "\n".join(
+        f"• {html.escape(warning)}" for warning in spec.warnings
+    ) or "нет"
+    return (
+        "<b>Проверка ссылки</b>\n\n"
+        f"Тип: <b>{'поиск' if spec.kind == 'search' else 'объявление'}</b>\n"
+        f'<a href="{html.escape(spec.canonical_url, quote=True)}">Нормализованная ссылка</a>\n\n'
+        "<b>Найденные фильтры</b>\n"
+        f"Цена: {price(filters.price_min)} — {price(filters.price_max)}\n"
+        f"Все слова: {html.escape(', '.join(filters.keywords_all)) or 'не заданы'}\n"
+        f"Любое из слов: {html.escape(', '.join(filters.keywords_any)) or 'не заданы'}\n"
+        f"Стоп-слова: {html.escape(', '.join(filters.keywords_stop)) or 'не заданы'}\n\n"
+        f"<b>Предупреждения</b>\n{warnings}"
+    )
+
+
+def _conversion_text(watcher: Optional[Watcher]) -> str:
+    status = getattr(watcher, "conversion_status", "pending") if watcher else "pending"
+    if status == "ready":
+        return "готово"
+    if status == "retry":
+        return "ошибка, повтор запланирован"
+    return "ожидает"
+
+
+async def _continue_after_filter_review(message: types.Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    filters = _filter_from_data(data)
+    if (
+        filters.price_min is not None
+        and filters.price_max is not None
+        and filters.price_min > filters.price_max
+    ):
+        await state.set_state(SearchWizard.price_min)
+        await message.answer(
+            "Минимальная цена больше максимальной. Введите корректную минимальную цену или «-»."
+        )
+        return
+    if filters.price_max is None:
+        await state.set_state(SearchWizard.price_min)
+        await message.answer(
+            "<b>Минимальная цена</b>\nВведите число или «-», если ограничения нет.",
+            reply_markup=types.ReplyKeyboardMarkup(
+                keyboard=[[types.KeyboardButton(text="-")], [types.KeyboardButton(text="Отмена")]],
+                resize_keyboard=True,
+            ),
+        )
+        return
+    await _prompt_search_name(
+        message,
+        state,
+        str(data.get("url") or ""),
+        filters.price_min,
+        filters.price_max,
+        filters.keywords_all,
+    )
 
 
 @wizard_router.message(F.text.in_(["/newsearch"]))
@@ -214,8 +317,7 @@ async def wizard_cancel_from_url(message: types.Message, state: FSMContext):
 @wizard_router.message(SearchWizard.url)
 async def wizard_got_url(message: types.Message, state: FSMContext):
     raw = (message.text or "").strip()
-    m = re.search(r"(?:(?:https?://)?(?:www\.)?avito\.ru)\S*", raw, re.I)
-    url_in = m.group(0) if m else raw
+    url_in = _extract_avito_url_text(raw) or raw
     try:
         parsed = parse_avito_url(url_in)
     except ValueError:
@@ -231,38 +333,146 @@ async def wizard_got_url(message: types.Message, state: FSMContext):
 
     await state.update_data(
         url=url,
+        display_url=parsed.display_url,
+        warnings=list(parsed.warnings),
         guessed_kw=guessed.keywords_all,
+        keywords_all=guessed.keywords_all,
+        keywords_any=guessed.keywords_any,
+        keywords_stop=guessed.keywords_stop,
         price_min=guessed.price_min,
         price_max=guessed.price_max,
     )
-    if guessed.price_max is not None:
-        await _prompt_search_name(
-            message,
-            state,
-            url,
-            guessed.price_min,
-            guessed.price_max,
-            guessed.keywords_all,
-        )
-        return
-
-    await state.set_state(SearchWizard.price_min)
-    kw_txt = (
-        f"\n\nНайдены слова: <code>{html.escape(', '.join(guessed.keywords_all))}</code>"
-        if guessed.keywords_all
-        else ""
-    )
+    await state.set_state(SearchWizard.confirm)
     await message.answer(
-        "<b>Новый поиск · 2 из 3</b>\n\nМинимальная цена. Отправьте число или «-», если ограничения нет."
-        + kw_txt,
-        reply_markup=types.ReplyKeyboardMarkup(
-            keyboard=[
-                [types.KeyboardButton(text="-")],
-                [types.KeyboardButton(text="Отмена")],
+        _filter_preview(parsed),
+        reply_markup=types.InlineKeyboardMarkup(
+            inline_keyboard=[
+                [types.InlineKeyboardButton(text="Подтвердить", callback_data="wizard_filters_confirm")],
+                [
+                    types.InlineKeyboardButton(text="Изменить цены", callback_data="wizard_filters_prices"),
+                    types.InlineKeyboardButton(text="Изменить слова", callback_data="wizard_filters_words"),
+                ],
+                [types.InlineKeyboardButton(text="Отмена", callback_data="wizard_filters_cancel")],
             ],
-            resize_keyboard=True,
         ),
+        disable_web_page_preview=True,
     )
+
+
+@wizard_router.callback_query(SearchWizard.confirm, F.data == "wizard_filters_confirm")
+async def wizard_confirm_filters(cq: types.CallbackQuery, state: FSMContext):
+    if isinstance(cq.message, types.Message):
+        await _continue_after_filter_review(cq.message, state)
+    await cq.answer()
+
+
+@wizard_router.callback_query(SearchWizard.confirm, F.data == "wizard_filters_prices")
+async def wizard_edit_prices(cq: types.CallbackQuery, state: FSMContext):
+    await state.set_state(SearchWizard.price_min)
+    if isinstance(cq.message, types.Message):
+        await cq.message.answer("Введите минимальную цену или «-».")
+    await cq.answer()
+
+
+@wizard_router.callback_query(SearchWizard.confirm, F.data == "wizard_filters_words")
+async def wizard_edit_words(cq: types.CallbackQuery, state: FSMContext):
+    await state.set_state(SearchWizard.words)
+    if isinstance(cq.message, types.Message):
+        await cq.message.answer(
+            "Введите списки в формате:\n"
+            "<code>all=Samsung,Galaxy; any=256GB,512GB; stop=копия,ремонт</code>\n"
+            "Для очистки всех слов отправьте «-»."
+        )
+    await cq.answer()
+
+
+@wizard_router.callback_query(SearchWizard.confirm, F.data == "wizard_filters_cancel")
+async def wizard_cancel_preview(cq: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    if isinstance(cq.message, types.Message):
+        await show_main_menu(cq.message, clear_reply_keyboard=True)
+    await cq.answer()
+
+
+def _parse_word_groups(text: str) -> dict[str, list[str]]:
+    if text.strip() == "-":
+        return {"all": [], "any": [], "stop": []}
+    result: dict[str, list[str]] = {}
+    for group in text.split(";"):
+        if "=" not in group:
+            continue
+        key, raw_values = group.split("=", 1)
+        key = key.strip().casefold()
+        if key not in {"all", "any", "stop"}:
+            continue
+        result[key] = [value.strip() for value in raw_values.split(",") if value.strip()]
+    return result
+
+
+def _parse_add_options(
+    text: str, base: SubscriberFilter
+) -> tuple[SubscriberFilter, list[str]]:
+    filters = normalize_filter(base)
+    warnings: list[str] = []
+    if not text.strip():
+        return filters, warnings
+    tokens = re.split(
+        r"\s*,\s*(?=(?:kw|all|any|stop|min|max)\s*=)",
+        text.strip(),
+        flags=re.I,
+    )
+    for token in tokens:
+        if "=" not in token:
+            warnings.append(f"Неизвестная опция: {token.strip()}")
+            continue
+        key, value = token.split("=", 1)
+        key = key.strip().casefold()
+        value = value.strip()
+        if key in {"kw", "all", "any", "stop"}:
+            words = [word.strip() for word in re.split(r"[|;]", value) if word.strip()]
+            attr = {
+                "kw": "keywords_all",
+                "all": "keywords_all",
+                "any": "keywords_any",
+                "stop": "keywords_stop",
+            }[key]
+            setattr(filters, attr, words)
+        elif key in {"min", "max"}:
+            parsed = None if value == "-" else _parse_price_input(value)
+            if parsed is None and value != "-":
+                warnings.append(f"Некорректное значение {key}: {value}")
+                continue
+            setattr(filters, "price_min" if key == "min" else "price_max", parsed)
+        else:
+            warnings.append(f"Неизвестная опция: {key}")
+    if (
+        filters.price_min is not None
+        and filters.price_max is not None
+        and filters.price_min > filters.price_max
+    ):
+        warnings.append("Минимальная цена не может быть больше максимальной")
+    return normalize_filter(filters), warnings
+
+
+@wizard_router.message(SearchWizard.words, F.text.casefold() == "отмена")
+async def wizard_cancel_words(message: types.Message, state: FSMContext):
+    await state.clear()
+    await show_main_menu(message, clear_reply_keyboard=True)
+
+
+@wizard_router.message(SearchWizard.words)
+async def wizard_got_words(message: types.Message, state: FSMContext):
+    groups = _parse_word_groups(message.text or "")
+    if not groups:
+        await message.answer("Не удалось разобрать списки. Используйте all=, any= и stop=.")
+        return
+    data = await state.get_data()
+    await state.update_data(
+        keywords_all=groups.get("all", data.get("keywords_all") or []),
+        keywords_any=groups.get("any", data.get("keywords_any") or []),
+        keywords_stop=groups.get("stop", data.get("keywords_stop") or []),
+    )
+    await _continue_after_filter_review(message, state)
 
 
 @wizard_router.message(SearchWizard.price_min, F.text.casefold() == "отмена")
@@ -283,10 +493,11 @@ async def wizard_got_min(message: types.Message, state: FSMContext):
     await state.update_data(price_min=pmin)
     await state.set_state(SearchWizard.price_max)
     await message.answer(
-        "<b>Максимальная цена</b>\nВведите число. Если ограничения нет, оставьте 100 000 000.",
+        "<b>Максимальная цена</b>\nВведите число или «-», если ограничения нет.",
         reply_markup=types.ReplyKeyboardMarkup(
             keyboard=[
                 [types.KeyboardButton(text="100000000")],
+                [types.KeyboardButton(text="-")],
                 [types.KeyboardButton(text="Отмена")],
             ],
             resize_keyboard=True,
@@ -303,19 +514,22 @@ async def wizard_cancel_max(message: types.Message, state: FSMContext):
 @wizard_router.message(SearchWizard.price_max)
 async def wizard_got_max(message: types.Message, state: FSMContext):
     txt = (message.text or "").strip()
-    pmax = _parse_price_input(txt)
-    if pmax is None:
+    pmax = None if txt == "-" else _parse_price_input(txt)
+    if pmax is None and txt != "-":
         await message.answer(
-            _br("Максимальная цена обязательна. Введите число, например 100000000.")
+            _br("Введите число или «-», если ограничения нет.")
         )
         return
 
     data = await state.get_data()
     url = data.get("url") or ""
     pmin = data.get("price_min")
-    kw = data.get("guessed_kw") or []
+    filters = _filter_from_data(data)
+    if pmin is not None and pmax is not None and pmin > pmax:
+        await message.answer("Минимальная цена не может быть больше максимальной.")
+        return
 
-    await _prompt_search_name(message, state, url, pmin, pmax, kw)
+    await _prompt_search_name(message, state, url, pmin, pmax, filters.keywords_all)
 
 
 @wizard_router.message(SearchWizard.name, F.text.casefold() == "отмена")
@@ -338,23 +552,32 @@ async def wizard_finish_create(message: types.Message, state: FSMContext):
 
     data = await state.get_data()
     url = data.get("url") or ""
-    pmin = data.get("price_min")
-    pmax = data.get("price_max")
-    kw = data.get("guessed_kw") or []
+    filters = _filter_from_data(data)
     name = (message.text or "").strip() or None
 
-    flt = SubscriberFilter(price_min=pmin, price_max=pmax, keywords_all=kw)
-    sub = await cast(Any, message.bot).app.manager.add_subscription(
-        message.chat.id, url, flt
+    parsed_spec = parse_avito_url(url)
+    spec = SearchSpec(
+        canonical_url=parsed_spec.canonical_url,
+        display_url=str(data.get("display_url") or parsed_spec.display_url),
+        search_key=parsed_spec.search_key,
+        kind=parsed_spec.kind,
+        filters=parsed_spec.filters,
+        warnings=tuple(data.get("warnings") or parsed_spec.warnings),
+    )
+    sub = await cast(Any, message.bot).app.manager.add_search_spec(
+        message.chat.id, spec, filters
     )
     sub.name = name
     cast(Any, message.bot).app.manager.save()
 
     await state.clear()
     title = html.escape(name or f"Поиск №{sub.id}")
+    watcher = cast(Any, message.bot).app.manager.watchers.get(sub.search_key)
     await show_main_menu(
         message,
-        f"✅ <b>{title}</b> создан\nНовые объявления будут приходить в бот-оповещатель.",
+        f"✅ <b>{title}</b> создан\n"
+        f"Конвертация API: <b>{_conversion_text(watcher)}</b>\n"
+        "Новые объявления будут приходить в бот-оповещатель.",
         clear_reply_keyboard=True,
     )
 
@@ -480,6 +703,10 @@ def get_watcher_status(
         return "⚪"
     if w.task is None or w.task.done():
         return "⚪"
+    if w.conversion_status == "pending":
+        return "🟡 ожидает"
+    if w.conversion_status == "retry":
+        return "🟡 повтор"
 
     now = time.monotonic()
     route_until = Watcher._route_blocked_until.get(w._route_key(), 0.0)
@@ -491,7 +718,11 @@ def get_watcher_status(
     return "🟢"
 
 
-def format_sub_panel(sub: Subscription, lic: LicenseManager) -> str:
+def format_sub_panel(
+    sub: Subscription,
+    lic: LicenseManager,
+    watcher: Optional[Watcher] = None,
+) -> str:
     title = html.escape(sub.name or f"Поиск №{sub.id}")
     exp = lic.expiry_dt(sub.user_id)
     price_min = (
@@ -507,6 +738,9 @@ def format_sub_panel(sub: Subscription, lic: LicenseManager) -> str:
     target = (
         ", ".join(html.escape(word) for word in sub.flt.keywords_all) or "не заданы"
     )
+    any_words = (
+        ", ".join(html.escape(word) for word in sub.flt.keywords_any) or "не заданы"
+    )
     stop = ", ".join(html.escape(word) for word in sub.flt.keywords_stop) or "не заданы"
     url = html.escape(avito_short_url(sub.url), quote=True)
     access = exp.strftime("%d.%m.%Y %H:%M") if exp else "не активен"
@@ -515,9 +749,11 @@ def format_sub_panel(sub: Subscription, lic: LicenseManager) -> str:
         f"Доступ до: <b>{access}</b>\n\n"
         f"<b>Фильтры</b>\n"
         f"Цена: <b>{price_min} — {price_max}</b>\n"
-        f"Целевые слова: {target}\n"
+        f"Все слова: {target}\n"
+        f"Любое из слов: {any_words}\n"
         f"Стоп-слова: {stop}\n"
         f"Только новые: <b>{'включено' if sub.only_new else 'выключено'}</b>\n\n"
+        f"API: <b>{_conversion_text(watcher)}</b>\n\n"
         f'<a href="{url}">Открыть поиск на Avito</a>'
     )
 
@@ -526,10 +762,14 @@ def build_sub_inline_kb(sub: Subscription) -> types.InlineKeyboardMarkup:
     rid = sub.id
     rows = [
         [
-            types.InlineKeyboardButton(text="Цена", callback_data=f"sub:{rid}:max"),
+            types.InlineKeyboardButton(text="Цена от", callback_data=f"sub:{rid}:min"),
+            types.InlineKeyboardButton(text="Цена до", callback_data=f"sub:{rid}:max"),
+        ],
+        [
             types.InlineKeyboardButton(
-                text="Целевые слова", callback_data=f"sub:{rid}:pos"
+                text="Все слова", callback_data=f"sub:{rid}:pos"
             ),
+            types.InlineKeyboardButton(text="Любое слово", callback_data=f"sub:{rid}:any"),
         ],
         [
             types.InlineKeyboardButton(
@@ -716,7 +956,7 @@ async def cb_open_sub(cq: types.CallbackQuery, state: FSMContext):
     if isinstance(cq.message, types.Message):
         lic: LicenseManager = cast(Any, cq.bot).app.license
         await cq.message.edit_text(
-            format_sub_panel(sub, lic),
+            format_sub_panel(sub, lic, mng.watchers.get(sub.search_key)),
             reply_markup=build_sub_inline_kb(sub),
             disable_web_page_preview=True,
         )
@@ -738,23 +978,33 @@ async def cb_sub_actions(cq: types.CallbackQuery, state: FSMContext):
         await cq.answer("Подписка не найдена", show_alert=True)
         return
 
-    if action == "max":
+    if action in ("min", "max"):
         await state.set_state(EditPrice.value)
-        await state.update_data(field="max", sub_id=sub.id)
+        await state.update_data(field=action, sub_id=sub.id)
         if isinstance(cq.message, types.Message):
-            await cq.message.answer("Введите новую максимальную цену числом.")
+            label = "минимальную" if action == "min" else "максимальную"
+            await cq.message.answer(
+                f"Введите новую {label} цену числом или «-», чтобы убрать ограничение."
+            )
         await cq.answer()
         return
 
-    if action in ("pos", "stop"):
+    if action in ("pos", "any", "stop"):
         await state.set_state(EditWords.text)
         await state.update_data(mode=action, sub_id=sub.id)
         if isinstance(cq.message, types.Message):
-            hint = "целевые слова" if action == "pos" else "стоп-слова"
+            hint = {
+                "pos": "слова, которые должны встретиться все",
+                "any": "слова, из которых достаточно одного",
+                "stop": "стоп-слова",
+            }[action]
+            current_words = {
+                "pos": sub.flt.keywords_all,
+                "any": sub.flt.keywords_any,
+                "stop": sub.flt.keywords_stop,
+            }[action]
             curr = (
-                ", ".join(
-                    sub.flt.keywords_all if action == "pos" else sub.flt.keywords_stop
-                )
+                ", ".join(current_words)
                 or "—"
             )
             await cq.message.answer(
@@ -770,7 +1020,7 @@ async def cb_sub_actions(cq: types.CallbackQuery, state: FSMContext):
         if isinstance(cq.message, types.Message):
             lic: LicenseManager = cast(Any, cq.bot).app.license
             await cq.message.edit_text(
-                format_sub_panel(sub, lic),
+                format_sub_panel(sub, lic, mng.watchers.get(sub.search_key)),
                 reply_markup=build_sub_inline_kb(sub),
                 disable_web_page_preview=True,
             )
@@ -806,7 +1056,7 @@ async def cb_sub_actions(cq: types.CallbackQuery, state: FSMContext):
         if isinstance(cq.message, types.Message):
             lic: LicenseManager = cast(Any, cq.bot).app.license
             await cq.message.edit_text(
-                format_sub_panel(sub, lic),
+                format_sub_panel(sub, lic, mng.watchers.get(sub.search_key)),
                 reply_markup=build_sub_inline_kb(sub),
                 disable_web_page_preview=True,
             )
@@ -826,6 +1076,13 @@ async def cb_sub_actions(cq: types.CallbackQuery, state: FSMContext):
 
 
 # ====== Применение изменений из FSM ======
+@searches_router.message(EditPrice.value, F.text.casefold() == "отмена")
+@searches_router.message(EditWords.text, F.text.casefold() == "отмена")
+async def ui_edit_cancel(m: types.Message, state: FSMContext):
+    await state.clear()
+    await _send_searches_screen(m, m.chat.id)
+
+
 @searches_router.message(EditPrice.value)
 async def ui_edit_apply_max(m: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -846,19 +1103,29 @@ async def ui_edit_apply_max(m: types.Message, state: FSMContext):
         await state.clear()
         await m.reply(_br("Подписка не найдена."), reply_markup=MAIN_INLINE_KB)
         return
-    if field == "max":
-        parsed = _parse_price_input(txt)
-        if parsed is None:
+    if field in ("min", "max"):
+        parsed = None if txt == "-" else _parse_price_input(txt)
+        if parsed is None and txt != "-":
+            label = "Минимальная" if field == "min" else "Максимальная"
             await m.reply(
-                _br("Максимальная цена должна быть числом, например 100000000.")
+                _br(f"{label} цена должна быть числом или «-».")
             )
             return
-        sub.flt.price_max = parsed
+        if field == "min":
+            if parsed is not None and sub.flt.price_max is not None and parsed > sub.flt.price_max:
+                await m.reply("Минимальная цена не может быть больше максимальной.")
+                return
+            sub.flt.price_min = parsed
+        else:
+            if parsed is not None and sub.flt.price_min is not None and parsed < sub.flt.price_min:
+                await m.reply("Максимальная цена не может быть меньше минимальной.")
+                return
+            sub.flt.price_max = parsed
         mng.save()
     await state.clear()
     lic: LicenseManager = cast(Any, m.bot).app.license
     await m.reply(
-        format_sub_panel(sub, lic),
+        format_sub_panel(sub, lic, mng.watchers.get(sub.search_key)),
         reply_markup=build_sub_inline_kb(sub),
         disable_web_page_preview=True,
     )
@@ -891,13 +1158,16 @@ async def ui_edit_words_apply(m: types.Message, state: FSMContext):
     )
     if mode == "pos":
         sub.flt.keywords_all = words
+    elif mode == "any":
+        sub.flt.keywords_any = words
     else:
         sub.flt.keywords_stop = words
+    sub.flt = normalize_filter(sub.flt)
     mng.save()
     await state.clear()
     lic: LicenseManager = cast(Any, m.bot).app.license
     await m.reply(
-        format_sub_panel(sub, lic),
+        format_sub_panel(sub, lic, mng.watchers.get(sub.search_key)),
         reply_markup=build_sub_inline_kb(sub),
         disable_web_page_preview=True,
     )
@@ -1355,15 +1625,16 @@ class App:
                 )
                 return
             txt = m.text or ""
-            parts = txt.split(maxsplit=2)
-            if len(parts) < 2:
+            url_in = _extract_avito_url_text(txt)
+            if not url_in:
                 await m.reply(
                     _br(
-                        "Укажите ссылку после /add. Пример:\\n/add https://www.avito.ru/... max=100000000,min=10000"
+                        "Укажите ссылку после /add. Пример:\\n"
+                        "/add https://www.avito.ru/... max=100000000,min=10000,any=256GB|512GB"
                     )
                 )
                 return
-            url = parts[1].strip().strip(".,;:!?)]}>'\"»")
+            url = url_in.strip().strip(".,;:!?)]}>'\"»")
             try:
                 parsed_url = parse_avito_url(url)
             except ValueError:
@@ -1374,40 +1645,33 @@ class App:
             if parsed_url.kind == "item":
                 await m.reply(_br("Это ссылка на карточку объявления. Нужна ссылка на результаты поиска Avito."))
                 return
-            url = parsed_url.canonical_url
-            params = parts[2].strip() if len(parts) >= 3 else ""
-            flt = parsed_url.filters
-            if params:
-                p = params.replace(" ", "")
-                for token in p.split(","):
-                    if not token:
-                        continue
-                    if token.startswith("kw="):
-                        kws = token[3:].replace(";", ",").replace("|", ",")
-                        flt.keywords_all = [w for w in kws.split(",") if w]
-                    elif token.startswith("min="):
-                        try:
-                            flt.price_min = int(token[4:])
-                        except Exception:
-                            pass
-                    elif token.startswith("max="):
-                        try:
-                            flt.price_max = int(token[4:])
-                        except Exception:
-                            pass
-            if flt.price_max is None:
+            url_end = txt.find(url_in) + len(url_in)
+            params = txt[url_end:].strip().lstrip(",")
+            flt, option_warnings = _parse_add_options(params, parsed_url.filters)
+            if option_warnings:
                 await m.reply(
-                    _br(
-                        "⚠️ Укажите максимальную цену (параметр <code>max=</code>) или воспользуйтесь мастером «/newsearch»."
-                    )
+                    "Не удалось применить параметры:\n"
+                    + "\n".join(f"• {html.escape(value)}" for value in option_warnings)
                 )
                 return
-            sub = await self.manager.add_subscription(m.chat.id, url, flt)
+            sub = await self.manager.add_search_spec(m.chat.id, parsed_url, flt)
+            watcher = self.manager.watchers.get(sub.search_key)
+            all_warnings = [*parsed_url.warnings, *option_warnings]
+            warning_text = (
+                "\\nПредупреждения: "
+                + "; ".join(html.escape(value) for value in all_warnings)
+                if all_warnings
+                else ""
+            )
             await m.reply(
                 _br(
-                    f"Подписка добавлена: <b>{sub.id}</b>\\nСсылка: {url}\\n"
+                    f"Подписка добавлена: <b>{sub.id}</b>\\n"
+                    f"Ссылка: {parsed_url.canonical_url}\\n"
+                    f"Конвертация API: <b>{_conversion_text(watcher)}</b>\\n"
                     "Карточки будут приходить в бот-оповещатель."
-                )
+                    + warning_text
+                ),
+                disable_web_page_preview=True,
             )
 
         @self.dp.message(Command("list"))
@@ -1499,7 +1763,9 @@ class App:
                     block = watcher.last_block_kind or "ok"
                     consec = watcher._consecutive_blocks
                     lines.append(
-                        f"• {html.escape(key)[:55]} | http={status} | {html.escape(block)} | wait={cooldown}s | consec={consec}"
+                        f"• {html.escape(key)[:55]} | http={status} | "
+                        f"{html.escape(block)} | wait={cooldown}s | consec={consec} | "
+                        f"conversion={watcher.conversion_status} | parser={watcher.parser_health}"
                     )
 
             await m.reply(_br("\\n".join(lines)), disable_web_page_preview=True)

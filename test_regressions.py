@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import json
 import os
 import tempfile
 import time
@@ -12,6 +14,7 @@ import alert_bot
 import avito_api
 import avito_monitor_bot as appmod
 import avito_monitoring as monitoring
+import avito_ui
 from avito_accounts import AccountService, LicenseManager
 from storage import load_json, load_state, update_json, update_state
 
@@ -128,11 +131,119 @@ class RegressionTests(unittest.TestCase):
 
             self.assertEqual(state.data["price_min"], 10000)
             self.assertEqual(state.data["price_max"], 70000)
-            self.assertEqual(state.state, appmod.SearchWizard.name)
-            self.assertIn("Цена от: 10 000 ₽", message.answers[-1][0])
-            self.assertIn("Цена до: 70 000 ₽", message.answers[-1][0])
+            self.assertEqual(state.state, appmod.SearchWizard.confirm)
+            self.assertIn("Цена: 10 000 ₽ — 70 000 ₽", message.answers[-1][0])
+            self.assertIn("Нормализованная ссылка", message.answers[-1][0])
 
         asyncio.run(scenario())
+
+    def test_url_parser_table(self):
+        cases = [
+            ("avito.ru/moskva?q=x", "https://avito.ru/moskva?q=x"),
+            ("http://www.avito.ru/moskva?q=x", "https://avito.ru/moskva?q=x"),
+            ("https://m.avito.ru/moskva?q=x", "https://m.avito.ru/moskva?q=x"),
+            ("https://avito.ru/moskva?q=x).", "https://avito.ru/moskva?q=x"),
+        ]
+        for source, expected in cases:
+            with self.subTest(source=source):
+                self.assertEqual(appmod.parse_avito_url(source).canonical_url, expected)
+
+        first = appmod.parse_avito_url(
+            "https://avito.ru/moskva?b=2&a=3&a=1&utm_source=test"
+        )
+        second = appmod.parse_avito_url(
+            "https://avito.ru/moskva?a=1&a=3&b=2"
+        )
+        self.assertEqual(first.search_key, second.search_key)
+        self.assertEqual(first.canonical_url.count("a="), 2)
+        self.assertNotIn("utm_source", first.canonical_url)
+        self.assertEqual(
+            avito_ui._extract_avito_url_text(
+                "Вот ссылка https://m.avito.ru/moskva?q=x), проверь"
+            ),
+            "https://m.avito.ru/moskva?q=x),",
+        )
+        self.assertIsNone(
+            avito_ui._extract_avito_url_text("ftp://avito.ru/moskva")
+        )
+
+    def test_url_parser_rejects_unsafe_and_item_urls(self):
+        invalid = [
+            "https://user:pass@avito.ru/moskva",
+            "https://avito.ru:8443/moskva",
+            "https://avito.ru/moskva#fragment",
+            "https://avito.ru.evil.test/moskva",
+            "ftp://avito.ru/moskva",
+        ]
+        for source in invalid:
+            with self.subTest(source=source):
+                with self.assertRaises(ValueError):
+                    appmod.parse_avito_url(source)
+        item = appmod.parse_avito_url(
+            "https://www.avito.ru/moskva/telefony/iphone_123456789"
+        )
+        self.assertEqual(item.kind, "item")
+
+    def test_filter_parser_reports_malformed_f_and_normalizes_words(self):
+        malformed = appmod.parse_avito_url("https://avito.ru/moskva?f=not_base64%25")
+        self.assertTrue(any("filter f" in warning or "фильтр f" in warning for warning in malformed.warnings))
+
+        payload = {"from": 1000, "to": 5000, "brand": "Samsung samsung"}
+        encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+        parsed = appmod.parse_avito_url(
+            f"https://avito.ru/moskva?q=SAMSUNG&f={encoded}"
+        )
+        self.assertEqual(parsed.filters.keywords_all, ["SAMSUNG"])
+        self.assertEqual((parsed.filters.price_min, parsed.filters.price_max), (1000, 5000))
+
+    def test_local_filter_modes(self):
+        ad = appmod.Ad(
+            ad_id="1",
+            url="https://avito.ru/1",
+            title="Samsung Galaxy",
+            description="256GB",
+            price=50000,
+        )
+        passing = appmod.Subscription(
+            1,
+            1,
+            "key",
+            "https://avito.ru/moskva",
+            appmod.SubscriberFilter(
+                keywords_all=["Samsung", "256GB"],
+                keywords_any=["iPhone", "Galaxy"],
+                price_min=40000,
+                price_max=60000,
+            ),
+        )
+        blocked = appmod.Subscription(
+            2,
+            1,
+            "key",
+            "https://avito.ru/moskva",
+            appmod.SubscriberFilter(keywords_stop=["Galaxy"]),
+        )
+        self.assertTrue(appmod.Watcher._ad_passes_filters(ad, passing))
+        self.assertFalse(appmod.Watcher._ad_passes_filters(ad, blocked))
+
+    def test_add_options_preserve_full_filter_contract(self):
+        spec = appmod.parse_avito_url(
+            "https://avito.ru/moskva?q=Samsung&pmin=10000&pmax=70000"
+        )
+        filters, warnings = avito_ui._parse_add_options(
+            "min=20000,max=-,any=256GB|512GB,stop=копия|ремонт",
+            spec.filters,
+        )
+        self.assertEqual(filters.keywords_all, ["Samsung"])
+        self.assertEqual(filters.keywords_any, ["256GB", "512GB"])
+        self.assertEqual(filters.keywords_stop, ["копия", "ремонт"])
+        self.assertEqual(filters.price_min, 20000)
+        self.assertIsNone(filters.price_max)
+        self.assertEqual(warnings, [])
+        _, warnings = avito_ui._parse_add_options(
+            "min=90000,max=10000", spec.filters
+        )
+        self.assertIn("Минимальная цена не может быть больше максимальной", warnings)
 
     def test_subscription_panel_is_compact_and_menu_callbacks_exist(self):
         sub = appmod.Subscription(
@@ -145,12 +256,24 @@ class RegressionTests(unittest.TestCase):
                 price_min=10000,
                 price_max=70000,
                 keywords_all=["samsung"],
+                keywords_any=["256GB"],
             ),
         )
         panel = appmod.format_sub_panel(sub, appmod.LicenseManager())
         self.assertNotIn("\\n", panel)
         self.assertNotIn("context=very-long-value", panel)
         self.assertIn("Открыть поиск на Avito", panel)
+        self.assertIn("Любое из слов: 256GB", panel)
+
+        sub_callbacks = {
+            button.callback_data
+            for row in appmod.build_sub_inline_kb(sub).inline_keyboard
+            for button in row
+        }
+        self.assertTrue(
+            {"sub:1:min", "sub:1:max", "sub:1:pos", "sub:1:any", "sub:1:stop"}
+            <= sub_callbacks
+        )
 
         callbacks = {
             button.callback_data
@@ -175,6 +298,108 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual((ads[0]["ad_id"], ads[0]["price"], ads[0]["location"]),
                          ("123456789", 85000, "\u041c\u043e\u0441\u043a\u0432\u0430"))
         self.assertIsNotNone(ads[0]["published_ts"])
+
+    def test_feed_parser_variants_limit_and_health(self):
+        payload = {
+            "result": {
+                "items": [
+                    {"type": "banner"},
+                    {
+                        "id": 1,
+                        "uriPath": "/moskva/one_1234567",
+                        "title": "One",
+                        "price": "10 000",
+                        "location": {"title": "Москва"},
+                        "sortTimeStamp": "1735000000",
+                    },
+                    {
+                        "id": 2,
+                        "urlPath": "/moskva/two_2345678",
+                        "title": "Two",
+                        "priceValue": 20000,
+                        "location": "Москва",
+                        "sortTimeStamp": 1735000000000,
+                    },
+                ]
+            }
+        }
+        parsed = avito_api.parse_api_feed(payload, limit=1)
+        self.assertEqual(len(parsed.items), 1)
+        self.assertEqual(parsed.items[0]["price"], 10000)
+        self.assertEqual(parsed.items[0]["location"], "Москва")
+        self.assertEqual(parsed.skipped_items, 1)
+        self.assertFalse(parsed.schema_mismatch)
+
+        mismatch = avito_api.parse_api_feed({"unexpected": []})
+        self.assertTrue(mismatch.schema_mismatch)
+        self.assertTrue(mismatch.warnings)
+        external = avito_api.parse_api_feed(
+            {
+                "items": [
+                    {
+                        "id": 3,
+                        "urlPath": "https://evil.test/item_3456789",
+                        "title": "External",
+                    }
+                ]
+            }
+        )
+        self.assertEqual(external.items, [])
+        self.assertEqual(external.skipped_items, 1)
+
+    def test_route_resolver_migrates_legacy_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "api.json")
+            public = "https://avito.ru/moskva?q=x"
+            route = "https://www.avito.ru/web/1/js/items?q=x"
+            update_json(path, {}, lambda data: data.__setitem__(public, route))
+
+            resolver = avito_api.DefaultApiRouteResolver(path)
+            self.assertEqual(resolver.resolve(public), route + "&sort=date")
+            metadata = load_json(path, {})[public]
+            self.assertEqual(metadata["api_url"], route)
+            self.assertEqual(resolver.last_status, "ready")
+            resolver.invalidate(public, "schema mismatch")
+            invalidated = load_json(path, {})[public]
+            self.assertIsNone(invalidated["api_url"])
+            self.assertEqual(invalidated["last_error"], "schema mismatch")
+            self.assertEqual(invalidated["fail_count"], 1)
+
+    def test_route_resolver_uses_direct_api_url_without_spfa(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            resolver = avito_api.DefaultApiRouteResolver(str(Path(tmp) / "api.json"))
+            direct = "https://www.avito.ru/web/1/js/items?q=x"
+            with patch.object(avito_api, "_request_api_route") as request_route:
+                self.assertEqual(resolver.resolve(direct), direct + "&sort=date")
+            request_route.assert_not_called()
+            self.assertEqual(resolver.last_status, "ready")
+
+    def test_route_resolver_keeps_stale_route_on_transient_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "api.json")
+            public = "https://avito.ru/moskva?q=x"
+            route = "https://www.avito.ru/web/1/js/items?q=x"
+            update_json(
+                path,
+                {},
+                lambda data: data.__setitem__(
+                    public,
+                    {
+                        "api_url": route,
+                        "created_at": 1,
+                        "last_success_at": "bad",
+                        "fail_count": "bad",
+                    },
+                ),
+            )
+            resolver = avito_api.DefaultApiRouteResolver(path)
+            with patch.object(avito_api, "_request_api_route", return_value=(None, "offline")):
+                self.assertEqual(resolver.resolve(public), route + "&sort=date")
+            metadata = load_json(path, {})[public]
+            self.assertEqual(metadata["api_url"], route + "&sort=date")
+            self.assertEqual(metadata["last_error"], "offline")
+            self.assertEqual(metadata["fail_count"], 1)
+            self.assertEqual(resolver.last_status, "retry")
 
     def test_avito_transport_has_persistent_cookie_jar(self):
         watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", FakeBot())
@@ -293,6 +518,27 @@ class RegressionTests(unittest.TestCase):
             watcher._client.close()
         asyncio.run(scenario())
 
+    def test_fetch_ads_invalidates_schema_mismatch(self):
+        async def scenario():
+            appmod.Watcher._route_blocked_until.clear()
+            watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", FakeBot())
+            watcher._api_url = "https://www.avito.ru/web/1/js/items?q=test"
+            watcher._client.last_status = 200
+            watcher._client.get_items = MagicMock(return_value={"unexpected": []})
+            with patch.object(watcher, "_wait_global_rate_limit", AsyncMock()), \
+                    patch.object(watcher.route_resolver, "invalidate") as invalidate:
+                self.assertIsNone(await watcher._fetch_ads())
+            self.assertEqual(watcher.parser_health, "schema_mismatch")
+            self.assertEqual(watcher.conversion_status, "retry")
+            self.assertIsNone(watcher._api_url)
+            invalidate.assert_called_once_with(
+                watcher.url, "API schema mismatch: items missing"
+            )
+            watcher._client.close()
+            appmod.Watcher._route_blocked_until.clear()
+
+        asyncio.run(scenario())
+
     def test_fetch_ads_block_applies_cooldown_and_resets_session(self):
         async def scenario():
             appmod.Watcher._route_blocked_until.clear()
@@ -362,10 +608,10 @@ class RegressionTests(unittest.TestCase):
             watcher._api_url = "https://www.avito.ru/web/1/js/items?q=stale"
             watcher._client.get_items = MagicMock(side_effect=avito_api.AvitoHttpError(404, "gone"))
             with patch.object(watcher, "_wait_global_rate_limit", AsyncMock()), \
-                    patch.object(monitoring, "invalidate_cached_api_url") as invalidate:
+                    patch.object(watcher.route_resolver, "invalidate") as invalidate:
                 self.assertIsNone(await watcher._fetch_ads())
             self.assertIsNone(watcher._api_url)
-            invalidate.assert_called_once_with(watcher.url, appmod.API_URLS_FILE)
+            invalidate.assert_called_once_with(watcher.url, "http 404: gone")
             watcher._client.close()
             appmod.Watcher._route_blocked_until.clear()
         asyncio.run(scenario())
@@ -390,6 +636,26 @@ class RegressionTests(unittest.TestCase):
                     self.assertIn(first.search_key, manager.watchers)
         asyncio.run(scenario())
 
+    def test_equivalent_urls_share_watcher_and_search_key(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                manager = appmod.WatcherManager(FakeBot(), str(Path(tmp) / "subs.json"))
+                with patch.object(appmod.Watcher, "start", AsyncMock()):
+                    first = await manager.add_subscription(
+                        7,
+                        "http://www.avito.ru/moskva?b=2&a=1&utm_source=test",
+                    )
+                    second = await manager.add_subscription(
+                        8,
+                        "https://avito.ru/moskva?a=1&b=2",
+                    )
+                self.assertEqual(first.search_key, second.search_key)
+                self.assertTrue(first.original_url.startswith("http://www.avito.ru"))
+                self.assertEqual(len(manager.watchers), 1)
+                self.assertEqual(len(manager.watchers[first.search_key].subscribers), 2)
+
+        asyncio.run(scenario())
+
     def test_restore_subscriptions(self):
         async def scenario():
             with tempfile.TemporaryDirectory() as tmp:
@@ -400,6 +666,34 @@ class RegressionTests(unittest.TestCase):
                     restored = appmod.WatcherManager(FakeBot(), path)
                     await restored.restore()
                     self.assertEqual(restored.list_user_subs(9)[0].id, original.id)
+        asyncio.run(scenario())
+
+    def test_restore_uses_original_url_fallback_and_keeps_filters(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                path = str(Path(tmp) / "subs.json")
+                update_json(
+                    path,
+                    [],
+                    lambda rows: rows.append(
+                        {
+                            "id": 4,
+                            "user_id": 9,
+                            "url": "not-a-url",
+                            "search_key": "also-invalid",
+                            "original_url": "http://www.avito.ru/moskva?q=test",
+                            "filter": {"keywords_any": ["Galaxy"], "price_max": 50000},
+                        }
+                    ),
+                )
+                manager = appmod.WatcherManager(FakeBot(), path)
+                with patch.object(appmod.Watcher, "start", AsyncMock()):
+                    await manager.restore()
+                restored = manager.list_user_subs(9)[0]
+                self.assertEqual(restored.url, "https://avito.ru/moskva?q=test")
+                self.assertEqual(restored.flt.keywords_any, ["Galaxy"])
+                self.assertEqual(restored.flt.price_max, 50000)
+
         asyncio.run(scenario())
 
     def test_json_update_preserves_sequential_changes(self):
@@ -430,6 +724,27 @@ class RegressionTests(unittest.TestCase):
                 update_state("sqlite_test_accounts.json", {}, lambda data: data.__setitem__("second", 2))
                 self.assertEqual(load_state("sqlite_test_accounts.json", {}), {"first": 1, "second": 2})
                 self.assertTrue(Path(db_path).exists())
+
+    def test_legacy_api_cache_imports_to_sqlite_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "state.sqlite3")
+            previous = Path.cwd()
+            os.chdir(tmp)
+            try:
+                Path("api_urls.json").write_text(
+                    json.dumps({"https://avito.ru/moskva": "https://avito.ru/web/1/js/items"}),
+                    encoding="utf-8",
+                )
+                with patch.dict(
+                    os.environ,
+                    {"STORAGE_BACKEND": "sqlite", "DATABASE_FILE": db_path},
+                ):
+                    imported = load_state("api_urls.json", {})
+                    Path("api_urls.json").write_text("{}", encoding="utf-8")
+                    self.assertEqual(load_state("api_urls.json", {}), imported)
+                self.assertTrue(Path("api_urls.json").exists())
+            finally:
+                os.chdir(previous)
 
     def test_account_service_redeems_key_once_and_restores_license(self):
         with tempfile.TemporaryDirectory() as tmp:
