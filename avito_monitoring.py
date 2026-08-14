@@ -335,17 +335,21 @@ class Watcher:
                 raise
             except Exception as exc:
                 failed_route = self._route_key()
+                self._client.reset()
+                err_str = str(exc)
                 logger.error("Ошибка запроса к %s: %s", self.url, exc)
-                try:
-                    if ADMIN_CHAT_ID is not None:
-                        await self.bot.send_message(ADMIN_CHAT_ID, _br(f"Ошибка в Watcher: {exc}"))
-                except Exception:
-                    pass
+                is_transient_net = any(k in err_str for k in ("(56)", "(28)", "(35)", "(7)", "Connection closed", "timed out", "reset by peer"))
+                if not is_transient_net:
+                    try:
+                        if ADMIN_CHAT_ID is not None:
+                            await self.bot.send_message(ADMIN_CHAT_ID, _br(f"Ошибка в Watcher: {exc}"))
+                    except Exception:
+                        pass
                 route_changed = self._rotate_proxy()
                 if route_changed and attempt + 1 < max_attempts:
                     await asyncio.sleep(2 + random.random() * 2)
                     continue
-                self._blocked_until = time.monotonic() + min(60.0, self.interval_min)
+                self._blocked_until = time.monotonic() + min(30.0, self.interval_min)
                 Watcher._route_blocked_until[failed_route] = self._blocked_until
         return None
 

@@ -239,6 +239,7 @@ class AvitoHttpClient:
     def get_search_page_items(self, search_url: str, limit: int = 50) -> List[Dict[str, Any]]:
         """
         Прямое получение объявлений со страницы поисковой выдачи Avito (HTML-рендеринг).
+        Автоматически восстанавливает сокет при сбросе соединения.
         """
         headers = {
             "referer": AVITO_HOME,
@@ -247,17 +248,28 @@ class AvitoHttpClient:
             "sec-fetch-mode": "navigate",
             "sec-fetch-dest": "document",
         }
-        r = self._session.get(search_url, timeout=self.timeout, headers=headers, allow_redirects=True)
-        self.last_status = r.status_code
-        text = r.text or ""
-        block = classify_block(r.status_code, r.headers, text)
-        if block:
-            self.total_blocked += 1
-            raise block
-        if r.status_code != 200:
-            raise AvitoHttpError(r.status_code, text[:200])
-        self.total_ok += 1
-        return parse_html_feed(text, limit=limit)
+        for attempt in range(2):
+            try:
+                r = self._session.get(search_url, timeout=self.timeout, headers=headers, allow_redirects=True)
+                self.last_status = r.status_code
+                text = r.text or ""
+                block = classify_block(r.status_code, r.headers, text)
+                if block:
+                    self.total_blocked += 1
+                    raise block
+                if r.status_code != 200:
+                    raise AvitoHttpError(r.status_code, text[:200])
+                self.total_ok += 1
+                return parse_html_feed(text, limit=limit)
+            except (AvitoBlock, AvitoHttpError):
+                raise
+            except Exception as exc:
+                self.reset()
+                if attempt == 0:
+                    time.sleep(1.0)
+                    continue
+                raise exc
+        return []
 
     def get_items(self, api_url: str) -> Dict[str, Any]:
         """
@@ -275,21 +287,28 @@ class AvitoHttpClient:
         }
         if not is_valid_api_url(api_url):
             raise ValueError(f"invalid Avito API URL: {api_url!r}")
-        r = self._session.get(api_url, timeout=self.timeout, headers=headers, allow_redirects=False)
-        self.last_status = r.status_code
-        text = r.text or ""
-        block = classify_block(r.status_code, r.headers, text)
-        if block:
-            self.total_blocked += 1
-            raise block
-        if r.status_code != 200:
-            raise AvitoHttpError(r.status_code, text[:200])
-        try:
-            payload = json.loads(text)
-        except ValueError as exc:
-            raise RuntimeError(f"не JSON в ответе API: {text[:200]}") from exc
-        self.total_ok += 1
-        return payload
+        for attempt in range(2):
+            try:
+                r = self._session.get(api_url, timeout=self.timeout, headers=headers, allow_redirects=False)
+                self.last_status = r.status_code
+                text = r.text or ""
+                block = classify_block(r.status_code, r.headers, text)
+                if block:
+                    self.total_blocked += 1
+                    raise block
+                if r.status_code != 200:
+                    raise AvitoHttpError(r.status_code, text[:200])
+                self.total_ok += 1
+                return json.loads(text)
+            except (AvitoBlock, AvitoHttpError):
+                raise
+            except Exception as exc:
+                self.reset()
+                if attempt == 0:
+                    time.sleep(1.0)
+                    continue
+                raise exc
+        return {}
 
     def close(self) -> None:
         try:
