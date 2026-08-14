@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "python-template"
 version = "0.1.0"
@@ -14,4 +18,12 @@ dependencies = [
 ]
 
 [tool.setuptools]
-py-modules = ["avito_monitor_bot", "alert_bot", "avito_api", "storage"]
+py-modules = [
+    "avito_monitor_bot",
+    "avito_monitoring",
+    "avito_domain",
+    "avito_settings",
+    "alert_bot",
+    "avito_api",
+    "storage",
+]

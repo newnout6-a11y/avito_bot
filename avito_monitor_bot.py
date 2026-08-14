@@ -16,26 +16,48 @@ import re
 import time
 import asyncio
 import html
-import base64
-import json
 import aiohttp
-import random
-from avito_api import (
-    AvitoBlock,
-    AvitoHttpClient,
-    AvitoHttpError,
-    convert_url_to_api,
-    invalidate_cached_api_url,
-    parse_api_items,
-)
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Deque, Callable, cast, Any, Set
-from collections import deque
-from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse, urlunparse, parse_qs, parse_qsl, urlencode, unquote
+from typing import Dict, List, Optional, cast, Any, Set
 import uuid
 import logging
 import secrets
+
+from avito_api import parse_api_items
+from avito_domain import (
+    Ad,
+    FeedItem,
+    KEY_RE,
+    LicenseManager,
+    SubscriberFilter,
+    Subscription,
+    _attr_to_str,
+    _br,
+    _extract_ad_id,
+    _fmt_dt,
+    _get_text,
+    _parse_price_input,
+    avito_short_url,
+    is_valid_avito_url,
+    search_key_from_url,
+    try_extract_filters_from_url,
+)
+from avito_monitoring import Watcher, WatcherManager
+from avito_settings import (
+    ACCOUNTS_FILE,
+    ALERT_BOT_TOKEN,
+    ALERT_BOT_USERNAME,
+    ALERT_LINKS_FILE,
+    API_URLS_FILE,
+    AVITO_PROXIES,
+    AVITO_PROXY_CHANGE_URLS,
+    BINDINGS_FILE,
+    DEDUP_GLOBAL,
+    DEDUP_TTL_DAYS,
+    KEYS_FILE,
+    SENT_FILE,
+    SUBSCRIPTIONS_FILE,
+    SUPPORT_LINK,
+)
 
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.enums import ParseMode
@@ -44,725 +66,14 @@ from aiogram.filters import Command
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from bs4 import BeautifulSoup  # type: ignore[reportMissingImports]
-from bs4.element import Tag
 from storage import load_json, save_json, update_json
 
 logger = logging.getLogger(__name__)
 
-try:
-    from zoneinfo import ZoneInfo  # py>=3.9
-except Exception:
-    ZoneInfo = None  # type: ignore
-
-try:
-    from dotenv import load_dotenv  # type: ignore
-except Exception:
-    def load_dotenv(*args, **kwargs):  # type: ignore
-        return None
-
-load_dotenv()
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-# ===== ENV =====
-POLL_PERIOD_SEC = int(os.getenv("POLL_PERIOD_SEC", "180"))    # минимальный период опроса (сек)
-POLL_PERIOD_MAX_SEC = int(os.getenv("POLL_PERIOD_MAX_SEC", "300"))
-AVITO_REQUEST_GAP_SEC = float(os.getenv("AVITO_REQUEST_GAP_SEC", "5"))
-AVITO_PROXIES = [value.strip() for value in os.getenv("AVITO_PROXIES", "").split(",") if value.strip()]
-AVITO_PROXY_CHANGE_URLS = [value.strip() for value in os.getenv("AVITO_PROXY_CHANGE_URLS", "").split(",") if value.strip()]
-AVITO_ENRICH = os.getenv("AVITO_ENRICH", "0") == "1"          # догрузка страниц объявлений (доп. запросы = выше риск блока)
-API_URLS_FILE = os.getenv("API_URLS_FILE", "api_urls.json")  # кэш конвертации URL -> API
-SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/Multiscan_service1")
-PRIME_ON_START = os.getenv("PRIME_ON_START", "1") == "1"
-START_STRICT = os.getenv("START_STRICT", "0") == "1"
-START_GRACE_SEC = int(os.getenv("START_GRACE_SEC", "10"))
-DISPLAY_TZ_NAME = os.getenv("DISPLAY_TZ", "Europe/Moscow")
-DISPLAY_TZ_OFFSET_MIN = int(os.getenv("DISPLAY_TZ_OFFSET_MIN", "180"))
-
-# ADMIN_CHAT_ID как int (или None)
-_ADMIN_STR = os.getenv("ADMIN_CHAT_ID")
-ADMIN_CHAT_ID: Optional[int] = int(_ADMIN_STR) if (_ADMIN_STR and _ADMIN_STR.lstrip("-").isdigit()) else None
-
-# ===== Настройки alert-бота =====
-ALERT_BOT_TOKEN   = os.getenv("ALERT_BOT_TOKEN")              # токен бота-оповещателя
-ALERT_BOT_USERNAME = os.getenv("ALERT_BOT_USERNAME", "")      # юзернейм бота-оповещателя без @
-BINDINGS_FILE     = os.getenv("BINDINGS_FILE", "user_bindings.json")  # привязки main_user_id -> alert_chat_id
-ALERT_LINKS_FILE  = os.getenv("ALERT_LINKS_FILE", "alert_links.json")
-
-# ===== Файлы хранения =====
-KEYS_FILE = os.getenv("KEYS_FILE", "issued_keys.json")
-SENT_FILE = os.getenv("SENT_FILE", "sent_ads.json")           # { user_id: { ad_id: ts }, "_global": {...} }
-ACCOUNTS_FILE = os.getenv("ACCOUNTS_FILE", "accounts.json")   # учётка пользователя
-DEDUP_TTL_DAYS = int(os.getenv("DEDUP_TTL_DAYS", "14"))       # сколько хранить следы
-DEDUP_GLOBAL = os.getenv("DEDUP_GLOBAL", "1") == "1"          # глобальный антидубликат
-SUBSCRIPTIONS_FILE = os.getenv("SUBSCRIPTIONS_FILE", "subscriptions.json")
-
-# ===== Регэксп ключа =====
-KEY_RE = re.compile(
-    r'(?i)(?:^|\s)(?:ключ\s*:\s*)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\s|$)'
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-
-# ===== helpers =====
-def _tz():
-    if ZoneInfo:
-        try:
-            return ZoneInfo(DISPLAY_TZ_NAME)
-        except Exception:
-            pass
-    # fallback — фиксированный сдвиг
-    return timezone(timedelta(minutes=DISPLAY_TZ_OFFSET_MIN))
-
-def _fmt_dt(ts: Optional[float]) -> str:
-    if not ts:
-        return "—"
-    return datetime.fromtimestamp(float(ts), _tz()).strftime("%d.%m.%Y %H:%M:%S")
-
-def _parse_price_input(value: str) -> Optional[int]:
-    normalized = (value or "").strip().replace("\u00a0", "").replace(" ", "").replace(".", "")
-    return int(normalized) if normalized.isdigit() else None
-
-def _br(text: str) -> str:
-    """
-    Больше НЕ используем <br>, чтобы не ловить ошибку Telegram:
-    'can't parse entities: Unsupported start tag "br"'.
-    На входе может прийти текст, где уже есть <br> — мы превратим их в \\n.
-    """
-    t = (text or "")
-    # обезвреживаем все варианты <br>
-    t = t.replace("<br/>", "\n").replace("<br />", "\n").replace("<br>", "\n")
-    t = t.replace("\\n", "\n")
-    return t
-
-# ==== LICENSE ====
-class LicenseManager:
-    def __init__(self):
-        self._expires: Dict[int, float] = {}  # user_id -> epoch_seconds (UTC)
-
-    def activate_for(self, user_id: int, hours: int = 24):
-        self._expires[user_id] = (time.time() + hours * 3600)
-
-    def activate_until(self, user_id: int, expires_ts: float):
-        self._expires[user_id] = float(expires_ts)
-
-    def is_active(self, user_id: int) -> bool:
-        ts = self._expires.get(user_id)
-        return (ts is not None) and (ts > time.time())
-
-    def expiry_dt(self, user_id: int) -> Optional[datetime]:
-        ts = self._expires.get(user_id)
-        return datetime.fromtimestamp(ts, _tz()) if ts else None
-
-
-@dataclass
-class SubscriberFilter:
-    keywords_all: List[str] = field(default_factory=list)  # целевые
-    keywords_any: List[str] = field(default_factory=list)
-    keywords_stop: List[str] = field(default_factory=list)  # СТОП-слова
-    price_min: Optional[int] = None
-    price_max: Optional[int] = None
-
-
-@dataclass
-class Subscription:
-    id: int
-    user_id: int
-    search_key: str
-    url: str
-    flt: SubscriberFilter = field(default_factory=SubscriberFilter)
-    name: Optional[str] = None            # название
-    only_new: bool = True                 # «только новые»
-    forward_chat_id: Optional[int] = None # не используется
-    started_ts: float = field(default_factory=lambda: time.time())  # точка отсечения «до создания слота»
-
-
-def _normalize_url(url: str) -> str:
-    u = urlparse(url.strip())
-    if not u.scheme:
-        u = u._replace(scheme="https")
-    netloc = u.netloc or "www.avito.ru"
-    keep: Dict[str, str] = {}
-    for k, v in parse_qsl(u.query, keep_blank_values=True):
-        if k.lower().startswith("utm_"):
-            continue
-        keep[k] = v
-    query = urlencode(sorted(keep.items()))
-    u2 = u._replace(netloc=netloc, query=query)
-    return urlunparse(u2)
-
-
-def search_key_from_url(url: str) -> str:
-    return _normalize_url(url)
-
-
-def is_valid_avito_url(url: str) -> bool:
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").rstrip(".").lower()
-    return parsed.scheme in {"http", "https"} and (host == "avito.ru" or host.endswith(".avito.ru"))
-
-
-def avito_short_url(full_url: str) -> str:
-    m = re.search(r"(?:/|_)(\d{7,})(?:[/?#]|$)", full_url)
-    if m:
-        return f"https://www.avito.ru/{m.group(1)}"
-    u = urlparse(full_url)
-    return urlunparse((u.scheme or "https", u.netloc or "www.avito.ru", u.path, "", "", ""))
-
-
-def _extract_ad_id(url: str) -> str:
-    match = re.search(r"(?:/|_)(\d{7,})(?:[/?#]|$)", url)
-    return match.group(1) if match else url
-
-
-@dataclass
-class Ad:
-    ad_id: str
-    url: str
-    title: str = ""
-    price: Optional[int] = None
-    location: str = ""
-    date_str: str = ""
-    published_ts: Optional[float] = None
-    description: str = ""
-    image_url: Optional[str] = None
-    seller_name: Optional[str] = None
-    seller_id: Optional[str] = None
-    price_badge: Optional[str] = None
-    features: List[str] = field(default_factory=list)  # например: "Рассрочка"
-    views: Optional[int] = None
-    is_verified: bool = False
-
-
-def _attr_to_str(v: object) -> str:
-    if isinstance(v, str):
-        return v
-    if isinstance(v, (list, tuple)) and v and isinstance(v[0], str):
-        return v[0]
-    return ""
-
-
-def _get_text(tag: Optional[Tag]) -> str:
-    """Безопасно извлекает текст из bs4-объекта"""
-    if tag is None:
-        return ""
-    try:
-        return tag.get_text(strip=True)
-    except Exception:
-        return str(tag) if tag else ""
-
-
-def try_extract_filters_from_url(url: str) -> SubscriberFilter:
-    flt = SubscriberFilter()
-    try:
-        u = urlparse(url)
-        qs = parse_qs(u.query)
-        if "q" in qs and qs["q"]:
-            qval = unquote(qs["q"][0]).strip()
-            words = [w for w in re.split(r"[,\s]+", qval) if w]
-            if words:
-                flt.keywords_all = words
-
-        fval = qs.get("f", [None])[0]
-        if fval:
-            s = fval.strip()
-            pad = '=' * ((4 - len(s) % 4) % 4)
-            raw = base64.urlsafe_b64decode(s + pad)
-            try:
-                j = json.loads(raw.decode("utf-8", errors="ignore"))
-                text_parts: List[str] = []
-                if isinstance(j, dict):
-                    def pick(obj, keys):
-                        for k in keys:
-                            v = obj.get(k)
-                            if isinstance(v, str) and v:
-                                text_parts.append(v)
-                    pick(j, ["brand", "model", "storage", "keyword", "q"])
-                    if "params" in j and isinstance(j["params"], list):
-                        for p in j["params"]:
-                            if isinstance(p, dict):
-                                pick(p, ["brand", "model", "storage", "value", "name"])
-                if text_parts:
-                    for token in text_parts:
-                        for w in re.split(r"[,\s/]+", str(token)):
-                            w = w.strip()
-                            if w and w.lower() not in [x.lower() for x in flt.keywords_all]:
-                                flt.keywords_all.append(w)
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return flt
-
-
-class Watcher:
-    _request_lock = asyncio.Lock()
-    _last_request_at = 0.0
-    _route_blocked_until: Dict[str, float] = {}
-
-    def __init__(
-        self,
-        search_key: str,
-        url: str,
-        bot: Bot,
-        on_deliver: Optional[Callable[[int, Ad], None]] = None,
-    ):
-        self.search_key = search_key
-        self.url = url
-        self.bot = bot
-        self.subscribers: Dict[int, Subscription] = {}
-        self.task: Optional[asyncio.Task] = None
-        self.seen: Dict[str, float] = {}
-        self.interval_min = max(30.0, float(POLL_PERIOD_SEC))
-        self.interval_max = max(self.interval_min, float(POLL_PERIOD_MAX_SEC))
-        self._interval = self.interval_min
-        self._proxy_index = abs(hash(search_key)) % len(AVITO_PROXIES) if AVITO_PROXIES else 0
-        self._client = AvitoHttpClient(proxy=self._proxy(), proxy_change_url=self._proxy_change_url())
-        self.on_deliver = on_deliver
-        self._enrich_cache: set[str] = set()
-        self._api_url: Optional[str] = None
-        self._blocked_until = 0.0
-        self._consecutive_blocks = 0
-        self.last_http_status: Optional[int] = None
-        self.last_block_kind: Optional[str] = None
-
-    async def start(self):
-        if self.task and not self.task.done():
-            return
-        if PRIME_ON_START:
-            await self._prime_seen(30)
-        self.task = asyncio.create_task(self._run(), name=f"watch:{self.search_key}")
-
-    async def stop(self):
-        if self.task:
-            self.task.cancel()
-            try:
-                await self.task
-            except asyncio.CancelledError:
-                pass
-            self.task = None
-        self._client.close()
-
-    def has_subscribers(self):
-        return bool(self.subscribers)
-
-    def add_sub(self, sub: Subscription):
-        self.subscribers[sub.id] = sub
-
-    def remove_sub(self, sub_id: int):
-        self.subscribers.pop(sub_id, None)
-
-    def _proxy(self) -> Optional[str]:
-        return AVITO_PROXIES[self._proxy_index] if AVITO_PROXIES else None
-
-    def _route_key(self) -> str:
-        return self._proxy() or "direct"
-
-    def _proxy_change_url(self) -> Optional[str]:
-        if AVITO_PROXY_CHANGE_URLS and self._proxy_index < len(AVITO_PROXY_CHANGE_URLS):
-            return AVITO_PROXY_CHANGE_URLS[self._proxy_index] or None
-        return None
-
-    def _rotate_proxy(self) -> bool:
-        changed_ip = self._client.request_new_ip()
-        if len(AVITO_PROXIES) > 1:
-            self._proxy_index = (self._proxy_index + 1) % len(AVITO_PROXIES)
-            self._client.set_proxy(self._proxy(), self._proxy_change_url())
-            return True
-        self._client.reset()
-        return changed_ip
-
-    async def _wait_global_rate_limit(self) -> None:
-        async with Watcher._request_lock:
-            wait = AVITO_REQUEST_GAP_SEC - (time.monotonic() - Watcher._last_request_at)
-            if wait > 0:
-                await asyncio.sleep(wait)
-            Watcher._last_request_at = time.monotonic()
-
-    async def _avito_get(self, url: str):
-        await self._wait_global_rate_limit()
-        if not self._client.warmed_at:
-            await asyncio.to_thread(self._client.warmup)
-        return await asyncio.to_thread(self._client.session.get, url, timeout=30, allow_redirects=False,
-                                       headers={"Accept-Language": "ru,en;q=0.9", "referer": "https://www.avito.ru/"})
-
-    def _fmt_price(self, v: Optional[int]) -> str:
-        if v is None:
-            return "—"
-        return f"{v:,}".replace(",", " ") + " ₽"
-
-    async def _enrich_ad_details(self, ad: Ad):
-        try:
-            r = await self._avito_get(ad.url)
-            if r.status_code != 200:
-                return
-            txt = r.text
-            if txt:
-                soup = BeautifulSoup(txt, "html.parser")
-
-                # Имя продавца
-                for selector in (
-                    '[data-marker="seller-info/name"]',
-                    '[data-marker="seller-link"]',
-                    '.seller-info-name',
-                    '.seller-link',
-                ):
-                    pe = soup.select_one(selector)
-                    if pe:
-                        ad.seller_name = _get_text(pe)
-                        break
-
-                # ID продавца
-                m = re.search(r'"ownerId"\s*:\s*"?(?P<id>\d+)"?', txt)
-                if m:
-                    ad.seller_id = m.group("id")
-
-                # Бейдж цены
-                for b in ["Ниже рынка", "Хорошая цена", "Рыночная цена", "Выше рынка"]:
-                    if b in txt:
-                        ad.price_badge = b
-                        break
-
-                if "рассроч" in txt.lower() and "Рассрочка" not in ad.features:
-                    ad.features.append("Рассрочка")
-
-                # Верификация
-                for selector in ('[data-marker="verified"]', '.verified-badge', '.is-verified'):
-                    if soup.select_one(selector):
-                        ad.is_verified = True
-                        break
-
-                # Просмотры
-                for selector in ('[data-marker="total-views"]', '.item-views', '.views-count'):
-                    t = soup.select_one(selector)
-                    if t:
-                        vm = re.search(r"\d+", _get_text(t))
-                        if vm:
-                            ad.views = int(vm.group())
-                            break
-
-                self._enrich_cache.add(ad.url)
-
-        except Exception as e:
-            logger.warning(f"Ошибка обогащения объявления {ad.url}: {e}")
-
-    def _build_caption(self, ad: Ad) -> str:
-        short = avito_short_url(ad.url)
-        lines = [f"<b>{html.escape(ad.title)}</b>", ""]
-
-        if ad.price is not None:
-            price_line = f"💸 <b>{self._fmt_price(ad.price)}</b>"
-            badge_parts: List[str] = []
-            if ad.price_badge:
-                badge_parts.append(f"✅ «{html.escape(ad.price_badge)}»")
-            for ftr in ad.features:
-                badge_parts.append(f"«{html.escape(ftr)}»")
-            if badge_parts:
-                price_line += " " + " ".join(badge_parts)
-            lines.append(price_line)
-
-        if ad.published_ts:
-            lines.append("🗓 " + _fmt_dt(ad.published_ts))
-        elif ad.date_str:
-            lines.append("🗓 " + html.escape(ad.date_str))
-
-        if ad.seller_name:
-            icon = "🏪" if "магазин" in ad.seller_name.lower() else "👤"
-            lines.append(f"{icon} {html.escape(ad.seller_name)}")
-
-        if ad.seller_id:
-            lines.append(f"🆔 {ad.seller_id}")
-
-        if ad.views:
-            lines.append(f"👁 {ad.views} просмотров")
-
-        if ad.is_verified:
-            lines.append("✅ Проверенный")
-
-        lines.append("")
-        lines.append(short)
-        # Возвращаем с обычными переводами строк
-        return "\n".join(lines)
-
-    async def _fetch_ads(self) -> Optional[List[Ad]]:
-        """Fetch the JSON feed with per-watcher and shared-route cooldowns."""
-        now = time.monotonic()
-        route_key = self._route_key()
-        route_blocked_until = Watcher._route_blocked_until.get(route_key, 0.0)
-        if route_blocked_until and route_blocked_until <= now:
-            Watcher._route_blocked_until.pop(route_key, None)
-            route_blocked_until = 0.0
-        if now < max(self._blocked_until, route_blocked_until):
-            return None
-        if not self._api_url:
-            api_url = await asyncio.to_thread(convert_url_to_api, self.url, API_URLS_FILE)
-            if not api_url:
-                logger.warning("Could not convert Avito URL to API URL: %s", self.url)
-                self._blocked_until = time.monotonic() + 60
-                return None
-            self._api_url = api_url
-        max_attempts = max(1, len(AVITO_PROXIES))
-        if self._proxy_change_url():
-            max_attempts = max(max_attempts, 2)
-        for attempt in range(max_attempts):
-            try:
-                await self._wait_global_rate_limit()
-                payload = await asyncio.to_thread(self._client.get_items, self._api_url)
-                self.last_http_status = self._client.last_status
-                self._consecutive_blocks = 0
-                self.last_block_kind = None
-                return [Ad(**item) for item in parse_api_items(payload, limit=20)]
-            except AvitoBlock as block:
-                blocked_route = self._route_key()
-                self.last_http_status = block.status
-                self.last_block_kind = block.kind
-                wait = block.suggested_wait(self._consecutive_blocks)
-                self._consecutive_blocks = min(self._consecutive_blocks + 1, 5)
-                self._blocked_until = time.monotonic() + wait
-                Watcher._route_blocked_until[blocked_route] = self._blocked_until
-                route_changed = self._rotate_proxy()
-                if route_changed and attempt + 1 < max_attempts:
-                    self._blocked_until = 0
-                    continue
-                return None
-            except AvitoHttpError as error:
-                self.last_http_status = error.status
-                if error.status in (400, 404, 410, 422):
-                    try:
-                        await asyncio.to_thread(invalidate_cached_api_url, self.url, API_URLS_FILE)
-                    except Exception as cache_error:
-                        logger.warning("Could not invalidate API URL cache: %s", cache_error)
-                    self._api_url = None
-                logger.error("Avito API error for %s: %s", self.url, error)
-                self._blocked_until = time.monotonic() + min(60.0, self.interval_min)
-                Watcher._route_blocked_until[self._route_key()] = self._blocked_until
-                return None
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                failed_route = self._route_key()
-                logger.error(f"Ошибка запроса к {self.url}: {e}")
-                try:
-                    if ADMIN_CHAT_ID is not None:
-                        await self.bot.send_message(ADMIN_CHAT_ID, _br(f"Ошибка в Watcher: {e}"))
-                except Exception:
-                    pass
-                route_changed = self._rotate_proxy()
-                if route_changed and attempt + 1 < max_attempts:
-                    await asyncio.sleep(2 + random.random() * 2)
-                    continue
-                self._blocked_until = time.monotonic() + min(60.0, self.interval_min)
-                Watcher._route_blocked_until[failed_route] = self._blocked_until
-        return None
-
-    async def _prime_seen(self, limit=30):
-        ads = await self._fetch_ads()
-        if not ads:
-            return
-        for ad in ads[:limit]:
-            self.seen[ad.ad_id] = time.time()
-
-    def _ad_passes_filters(self, ad: Ad, sub: Subscription) -> bool:
-        flt = sub.flt
-        t = f"{ad.title}{ad.description}".lower()
-        if flt.price_min is not None and (ad.price is None or ad.price < flt.price_min):
-            return False
-        if flt.price_max is not None and (ad.price is None or ad.price > flt.price_max):
-            return False
-        if flt.keywords_all and not all(w.lower() in t for w in flt.keywords_all):
-            return False
-        if flt.keywords_stop and any(w.lower() in t for w in flt.keywords_stop):
-            return False
-        return True
-
-    def _bump_interval(self, found_new: bool):
-        self._interval = max(self.interval_min, self._interval * 0.85) if found_new else min(self.interval_max, self._interval * 1.05)
-
-    def _cleanup_seen(self, ttl=7 * 24 * 3600):
-        now = time.time()
-        if len(self.seen) > 20000:
-            items = sorted(self.seen.items(), key=lambda kv: kv[1])
-            for k, _ in items[: len(self.seen) // 2]:
-                self.seen.pop(k, None)
-        for k, ts in list(self.seen.items()):
-            if now - ts > ttl:
-                self.seen.pop(k, None)
-
-    async def _run(self):
-        app = cast(Any, self.bot).app
-        lic: "LicenseManager" = app.license
-        while self.has_subscribers():
-            found_new = False
-            ads_list = await self._fetch_ads()
-            if ads_list:
-                now_ts = time.time()
-                for ad in ads_list:
-                    if ad.ad_id in self.seen:
-                        continue
-
-                    delivered_any = False
-
-                    for sub in list(self.subscribers.values()):
-                        if not lic.is_active(sub.user_id):
-                            logger.info("Пропуск %s для user=%s: лицензия неактивна", ad.ad_id, sub.user_id)
-                            continue
-
-                        # "Только новые" определяется watcher-ом через первичный
-                        # снимок и seen, а не хрупкой датой Avito (она часто
-                        # округляется до часа/дня).
-
-                        if START_STRICT and ad.published_ts is not None and ad.published_ts + START_GRACE_SEC < sub.started_ts:
-                            continue
-
-                        if not self._ad_passes_filters(ad, sub):
-                            logger.info("Пропуск %s для sub=%s: не прошёл фильтры (price=%s, title=%r)", ad.ad_id, sub.id, ad.price, ad.title)
-                            continue
-
-                        if app.sent_was_delivered(sub.user_id, ad.ad_id):
-                            continue
-                        if AVITO_ENRICH and ad.url not in self._enrich_cache:
-                            await self._enrich_ad_details(ad)
-                        caption = self._build_caption(ad)
-
-                        chat_id = app.get_alert_chat_id(sub.user_id)
-                        if chat_id and await app.send_to_alert(chat_id, caption, ad.image_url):
-                            if self.on_deliver:
-                                self.on_deliver(sub.user_id, ad)
-                            app.sent_mark(sub.user_id, ad.ad_id, now_ts)  # per-user
-                            delivered_any = True
-                            found_new = True
-                            logger.info("Отправлено объявление %s пользователю %s в alert_chat=%s", ad.ad_id, sub.user_id, chat_id)
-                        else:
-                            logger.warning("Не удалось отправить объявление %s: alert_chat=%s", ad.ad_id, chat_id)
-                            if app.missing_alert_hint_once(sub.user_id):
-                                link = app.alert_deeplink(sub.user_id)
-                                kb = types.InlineKeyboardMarkup(inline_keyboard=[
-                                    [types.InlineKeyboardButton(text="Подключить оповещения", url=link)]
-                                ])
-                                try:
-                                    await self.bot.send_message(sub.user_id,
-                                        _br("Чтобы получать объявления, подключите бота-оповещателя:"),
-                                        reply_markup=kb, disable_web_page_preview=True)
-                                except Exception:
-                                    pass
-
-                    if delivered_any:
-                        self.seen[ad.ad_id] = now_ts
-                    else:
-                        # Не гоняем одну и ту же карточку по кругу, если она
-                        # отфильтрована по возрасту/условиям подписки.
-                        self.seen[ad.ad_id] = now_ts
-
-            self._cleanup_seen()
-            self._bump_interval(found_new)
-            # Минимальная пауза между заходами
-            await asyncio.sleep(max(1.0, self._interval) * random.uniform(0.9, 1.1))
-
-
-@dataclass
-class FeedItem:
-    ts: float
-    title: str
-    price: Optional[int]
-    url: str
-    date_str: str
-
-
-class WatcherManager:
-    def __init__(self, bot: Bot, subscriptions_file: str = SUBSCRIPTIONS_FILE):
-        self.bot = bot
-        self.watchers: Dict[str, Watcher] = {}
-        self.subs_by_user: Dict[int, List[Subscription]] = {}
-        self._sub_id_seq = 1
-        self.feed: Dict[int, Deque[FeedItem]] = {}
-        self.subscriptions_file = subscriptions_file
-
-    def list_user_subs(self, user_id: int):
-        return self.subs_by_user.get(user_id, [])
-
-    def _next_sub_id(self):
-        v = self._sub_id_seq
-        self._sub_id_seq += 1
-        return v
-
-    def _on_deliver(self, user_id: int, ad: Ad):
-        d = self.feed.setdefault(user_id, deque(maxlen=50))
-        d.appendleft(FeedItem(ts=time.time(), title=ad.title, price=ad.price, url=ad.url, date_str=ad.date_str))
-
-    async def add_subscription(self, user_id: int, url: str, flt: Optional[SubscriberFilter] = None) -> Subscription:
-        if flt is None:
-            flt = SubscriberFilter()
-        key = search_key_from_url(url)
-        sub = Subscription(id=self._next_sub_id(), user_id=user_id, search_key=key, url=url, flt=flt)
-        w = self.watchers.get(key)
-        if not w:
-            w = Watcher(search_key=key, url=url, bot=self.bot, on_deliver=self._on_deliver)
-            self.watchers[key] = w
-            await w.start()
-        w.add_sub(sub)
-        self.subs_by_user.setdefault(user_id, []).append(sub)
-        self.save()
-        return sub
-
-    async def remove_subscription(self, user_id: int, sub_id: int) -> bool:
-        subs = self.subs_by_user.get(user_id, [])
-        for i, sub in enumerate(subs):
-            if sub.id == sub_id:
-                w = self.watchers.get(sub.search_key)
-                if w:
-                    w.remove_sub(sub.id)
-                    if not w.has_subscribers():
-                        await w.stop()
-                        self.watchers.pop(sub.search_key, None)
-                subs.pop(i)
-                self.save()
-                return True
-        return False
-
-    def get_sub_by_id(self, user_id: int, sub_id: int) -> Optional[Subscription]:
-        for s in self.subs_by_user.get(user_id, []):
-            if s.id == sub_id:
-                return s
-        return None
-
-    def recent_feed(self, user_id: int, limit=10) -> List[FeedItem]:
-        return list(self.feed.get(user_id, deque()))[:limit]
-
-    def save(self) -> None:
-        rows = []
-        for subs in self.subs_by_user.values():
-            for sub in subs:
-                rows.append({
-                    "id": sub.id, "user_id": sub.user_id, "search_key": sub.search_key,
-                    "url": sub.url, "name": sub.name, "only_new": sub.only_new,
-                    "started_ts": sub.started_ts, "filter": vars(sub.flt),
-                })
-        save_json(self.subscriptions_file, rows)
-
-    async def restore(self) -> None:
-        try:
-            rows = load_json(self.subscriptions_file, [])
-        except (OSError, ValueError, TypeError) as exc:
-            logger.error("Не удалось восстановить подписки: %s", exc)
-            return
-        for row in rows:
-            try:
-                flt = SubscriberFilter(**row.get("filter", {}))
-                sub = Subscription(id=int(row["id"]), user_id=int(row["user_id"]),
-                    search_key=str(row["search_key"]), url=str(row["url"]), flt=flt,
-                    name=row.get("name"), only_new=bool(row.get("only_new", True)),
-                    started_ts=float(row.get("started_ts", time.time())))
-                self._sub_id_seq = max(self._sub_id_seq, sub.id + 1)
-                self.subs_by_user.setdefault(sub.user_id, []).append(sub)
-                watcher = self.watchers.get(sub.search_key)
-                if not watcher:
-                    watcher = Watcher(sub.search_key, sub.url, self.bot, self._on_deliver)
-                    self.watchers[sub.search_key] = watcher
-                watcher.add_sub(sub)
-            except (KeyError, TypeError, ValueError) as exc:
-                logger.warning("Пропущена поврежденная подписка: %s", exc)
-        for watcher in self.watchers.values():
-            await watcher.start()
-
 
 # === Главное меню ===
 MAIN_INLINE_KB = types.InlineKeyboardMarkup(
@@ -814,6 +125,32 @@ class SearchWizard(StatesGroup):
 
 wizard_router = Router(name="wizard")
 
+
+async def _prompt_search_name(
+    message: types.Message,
+    state: FSMContext,
+    url: str,
+    pmin: Optional[int],
+    pmax: int,
+    keywords: List[str],
+) -> None:
+    await state.update_data(price_min=pmin, price_max=pmax)
+    short_url = html.escape(avito_short_url(url), quote=True)
+    min_text = f"{pmin:,}".replace(",", " ") + " ₽" if pmin is not None else "без ограничения"
+    max_text = f"{pmax:,}".replace(",", " ") + " ₽"
+    summary = [
+        "<b>Новый поиск · 3 из 3</b>",
+        "",
+        f"Цена от: {min_text}",
+        f"Цена до: {max_text}",
+        f"Слова: {html.escape(', '.join(keywords)) if keywords else 'не заданы'}",
+        f"<a href=\"{short_url}\">Открыть поиск на Avito</a>",
+        "",
+        "Отправьте короткое название, например «Samsung до 70 000».",
+    ]
+    await state.set_state(SearchWizard.name)
+    await message.answer(_br("\\n".join(summary)), disable_web_page_preview=True)
+
 @wizard_router.message(F.text.in_(["/newsearch"]))
 async def wizard_start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -844,7 +181,23 @@ async def wizard_got_url(message: types.Message, state: FSMContext):
     url = search_key_from_url(url_in)
     guessed = try_extract_filters_from_url(url)
 
-    await state.update_data(url=url, guessed_kw=guessed.keywords_all)
+    await state.update_data(
+        url=url,
+        guessed_kw=guessed.keywords_all,
+        price_min=guessed.price_min,
+        price_max=guessed.price_max,
+    )
+    if guessed.price_max is not None:
+        await _prompt_search_name(
+            message,
+            state,
+            url,
+            guessed.price_min,
+            guessed.price_max,
+            guessed.keywords_all,
+        )
+        return
+
     await state.set_state(SearchWizard.price_min)
     kw_txt = f"\n\nНайдены слова: <code>{html.escape(', '.join(guessed.keywords_all))}</code>" if guessed.keywords_all else ""
     await message.answer(
@@ -897,23 +250,7 @@ async def wizard_got_max(message: types.Message, state: FSMContext):
     pmin = data.get("price_min")
     kw = data.get("guessed_kw") or []
 
-    await state.update_data(price_max=pmax)
-
-    short_url = html.escape(avito_short_url(url), quote=True)
-    min_text = f"{pmin:,}".replace(",", " ") + " ₽" if pmin is not None else "без ограничения"
-    max_text = f"{pmax:,}".replace(",", " ") + " ₽"
-    summary = [
-        "<b>Новый поиск · 3 из 3</b>",
-        "",
-        f"Цена от: {min_text}",
-        f"Цена до: {max_text}",
-        f"Слова: {html.escape(', '.join(kw)) if kw else 'не заданы'}",
-        f"<a href=\"{short_url}\">Открыть поиск на Avito</a>",
-        "",
-        "Отправьте короткое название, например «Samsung до 70 000».",
-    ]
-    await state.set_state(SearchWizard.name)
-    await message.answer(_br("\\n".join(summary)), disable_web_page_preview=True)
+    await _prompt_search_name(message, state, url, pmin, pmax, kw)
 
 @wizard_router.message(SearchWizard.name, F.text.casefold() == "отмена")
 async def wizard_cancel_name(message: types.Message, state: FSMContext):

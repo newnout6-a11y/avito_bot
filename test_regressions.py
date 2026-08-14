@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import avito_monitor_bot as appmod
+import avito_monitoring as monitoring
 import alert_bot
 import avito_api
 from storage import load_json, update_json
@@ -19,6 +20,27 @@ class FakeBot:
         return None
 
 
+class FakeMessage:
+    def __init__(self, text):
+        self.text = text
+        self.answers = []
+
+    async def answer(self, text, **kwargs):
+        self.answers.append((text, kwargs))
+
+
+class FakeState:
+    def __init__(self):
+        self.data = {}
+        self.state = None
+
+    async def update_data(self, **kwargs):
+        self.data.update(kwargs)
+
+    async def set_state(self, state):
+        self.state = state
+
+
 class RegressionTests(unittest.TestCase):
     def test_regexes_and_newlines(self):
         key = "123e4567-e89b-12d3-a456-426614174000"
@@ -26,6 +48,55 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(appmod._br("a\\nb<br>c"), "a\nb\nc")
         self.assertEqual(appmod.avito_short_url("https://www.avito.ru/moskva/x_123456789"), "https://www.avito.ru/123456789")
         self.assertEqual(appmod._extract_ad_id("/moskva/telefony/iphone_15_123456789"), "123456789")
+
+    def test_search_url_preserves_price_filters(self):
+        url = (
+            "https://www.avito.ru/all/telefony?context=large-value"
+            "&q=samsung&pmin=10000&pmax=70000&params=one&params=two&utm_source=test"
+        )
+
+        normalized = appmod.search_key_from_url(url)
+        visible = appmod.avito_short_url(normalized)
+
+        self.assertIn("pmin=10000", normalized)
+        self.assertIn("pmax=70000", normalized)
+        self.assertEqual(normalized.count("params="), 2)
+        self.assertNotIn("utm_source", normalized)
+        self.assertIn("pmin=10000", visible)
+        self.assertIn("pmax=70000", visible)
+        self.assertIn("q=samsung", visible)
+        self.assertNotIn("context=", visible)
+
+        filters = appmod.try_extract_filters_from_url(normalized)
+        self.assertEqual((filters.price_min, filters.price_max), (10000, 70000))
+
+    def test_price_filter_is_extracted_from_avito_f_parameter(self):
+        url = (
+            "https://www.avito.ru/all/telefony/mobilnye_telefony/samsung-ASgBAgICAkS0wA2crzmwwQ2I_Dc"
+            "?f=ASgBAgECAkS0wA2crzmwwQ2I_DcBRcaaDBV7ImZyb20iOjAsInRvIjo3MDAwMH0&q=samsung&s=104"
+        )
+
+        filters = appmod.try_extract_filters_from_url(url)
+
+        self.assertIsNone(filters.price_min)
+        self.assertEqual(filters.price_max, 70000)
+
+    def test_wizard_uses_price_from_avito_url(self):
+        async def scenario():
+            message = FakeMessage(
+                "https://www.avito.ru/all/telefony?q=samsung&pmin=10000&pmax=70000"
+            )
+            state = FakeState()
+
+            await appmod.wizard_got_url(message, state)
+
+            self.assertEqual(state.data["price_min"], 10000)
+            self.assertEqual(state.data["price_max"], 70000)
+            self.assertEqual(state.state, appmod.SearchWizard.name)
+            self.assertIn("Цена от: 10 000 ₽", message.answers[-1][0])
+            self.assertIn("Цена до: 70 000 ₽", message.answers[-1][0])
+
+        asyncio.run(scenario())
 
     def test_subscription_panel_is_compact_and_menu_callbacks_exist(self):
         sub = appmod.Subscription(
@@ -73,6 +144,10 @@ class RegressionTests(unittest.TestCase):
         watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", FakeBot())
         self.assertIsNotNone(watcher._client.session.cookies)
         watcher._client.close()
+
+    def test_monitoring_classes_are_reexported_from_entrypoint(self):
+        self.assertIs(appmod.Watcher, monitoring.Watcher)
+        self.assertIs(appmod.WatcherManager, monitoring.WatcherManager)
 
     def test_warmup_raises_challenge_without_second_request(self):
         response = MagicMock(
@@ -173,8 +248,8 @@ class RegressionTests(unittest.TestCase):
     def test_fetch_ads_rotates_proxy_and_retries(self):
         async def scenario():
             appmod.Watcher._route_blocked_until.clear()
-            with patch.object(appmod, "AVITO_PROXIES", ["http://one", "http://two"]), \
-                    patch.object(appmod, "AVITO_PROXY_CHANGE_URLS", []):
+            with patch.object(monitoring, "AVITO_PROXIES", ["http://one", "http://two"]), \
+                    patch.object(monitoring, "AVITO_PROXY_CHANGE_URLS", []):
                 watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", FakeBot())
                 watcher._proxy_index = 0
                 watcher._api_url = "https://www.avito.ru/web/1/js/items?q=test"
@@ -200,7 +275,7 @@ class RegressionTests(unittest.TestCase):
             watcher._api_url = "https://www.avito.ru/web/1/js/items?q=stale"
             watcher._client.get_items = MagicMock(side_effect=avito_api.AvitoHttpError(404, "gone"))
             with patch.object(watcher, "_wait_global_rate_limit", AsyncMock()), \
-                    patch.object(appmod, "invalidate_cached_api_url") as invalidate:
+                    patch.object(monitoring, "invalidate_cached_api_url") as invalidate:
                 self.assertIsNone(await watcher._fetch_ads())
             self.assertIsNone(watcher._api_url)
             invalidate.assert_called_once_with(watcher.url, appmod.API_URLS_FILE)
