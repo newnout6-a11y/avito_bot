@@ -1,4 +1,5 @@
 import asyncio
+import os
 import tempfile
 import time
 import unittest
@@ -245,6 +246,19 @@ class RegressionTests(unittest.TestCase):
             update_json(path, {}, lambda data: data.__setitem__("first", 1))
             update_json(path, {}, lambda data: data.__setitem__("second", 2))
             self.assertEqual(load_json(path, {}), {"first": 1, "second": 2})
+
+    def test_json_storage_recovers_from_stale_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "state.json")
+            lock_path = path + ".lock"
+            Path(lock_path).touch()
+            stale_time = time.time() - 60
+            os.utime(lock_path, (stale_time, stale_time))
+
+            update_json(path, {}, lambda data: data.__setitem__("restored", True))
+
+            self.assertEqual(load_json(path, {}), {"restored": True})
+            self.assertFalse(Path(lock_path).exists())
 
     def test_alert_binding_token_is_one_time(self):
         with tempfile.TemporaryDirectory() as tmp:

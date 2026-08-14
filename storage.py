@@ -5,6 +5,14 @@ from contextlib import contextmanager
 from typing import Any, Callable, TypeVar
 
 T = TypeVar("T")
+LOCK_STALE_SEC = 30.0
+
+
+def _lock_is_stale(lock_path: str) -> bool:
+    try:
+        return time.time() - os.path.getmtime(lock_path) >= LOCK_STALE_SEC
+    except FileNotFoundError:
+        return False
 
 
 @contextmanager
@@ -16,6 +24,12 @@ def _file_lock(path: str, timeout: float = 5.0):
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
+            if _lock_is_stale(lock_path):
+                try:
+                    os.unlink(lock_path)
+                except FileNotFoundError:
+                    pass
+                continue
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"Timed out waiting for storage lock: {lock_path}")
             time.sleep(0.05)

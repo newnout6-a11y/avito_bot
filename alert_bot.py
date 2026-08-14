@@ -26,6 +26,8 @@ except Exception:
     def load_dotenv(*args, **kwargs):  # type: ignore
         return None
 
+load_dotenv()
+
 BINDINGS_FILE = os.getenv("BINDINGS_FILE", "user_bindings.json")
 ALERT_LINKS_FILE = os.getenv("ALERT_LINKS_FILE", "alert_links.json")
 SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/Multiscan_service1")
@@ -212,7 +214,6 @@ async def echo(m: types.Message):
 async def main():
     """Главная функция запуска бота"""
     try:
-        load_dotenv()
         token = os.getenv("ALERT_BOT_TOKEN")
         
         if not token:

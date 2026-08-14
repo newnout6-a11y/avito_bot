@@ -2,7 +2,7 @@ aiogram>=3.29,<4
 aiohttp>=3.9.5
 beautifulsoup4>=4.12.3
 python-dotenv>=1.0.1
-flask>=3.0.0
+requests>=2.32.4
 curl-cffi>=0.13.0
 
 

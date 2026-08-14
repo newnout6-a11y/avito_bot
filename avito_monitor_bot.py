@@ -63,13 +63,6 @@ except Exception:
 
 load_dotenv()
 
-# keep-alive (Replit/Render). Если модуля нет — no-op.
-try:
-    from background import keep_alive  # type: ignore
-except Exception:
-    def keep_alive():  # type: ignore
-        return None
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 # ===== ENV =====
@@ -1923,8 +1916,6 @@ class App:
 
 # ===== main =====
 async def main():
-    load_dotenv()
-    keep_alive()  # no-op если нет
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN отсутствует в .env/Secrets")

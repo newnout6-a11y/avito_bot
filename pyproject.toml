@@ -6,7 +6,6 @@ authors = [{name = "Avito Monitor maintainers"}]
 requires-python = ">=3.11"
 dependencies = [
     "aiogram>=3.29,<4",
-    "flask>=3.1.1",
     "requests>=2.32.4",
     "aiohttp>=3.9.5",
     "beautifulsoup4>=4.12.3",
@@ -15,4 +14,4 @@ dependencies = [
 ]
 
 [tool.setuptools]
-py-modules = ["avito_monitor_bot", "alert_bot", "background", "storage"]
+py-modules = ["avito_monitor_bot", "alert_bot", "avito_api", "storage"]
