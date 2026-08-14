@@ -24,7 +24,9 @@ import threading
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol
+from dataclasses import dataclass
+import hashlib
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from curl_cffi import requests as curl_requests
@@ -34,6 +36,7 @@ logger = logging.getLogger(__name__)
 AVITO_HOME = "https://www.avito.ru/"
 SPFA_CONVERT_URL = "https://spfa.ru/api/avito-url/"
 SPFA_MIN_INTERVAL_SEC = 31.0  # у SPFA лимит ~2 преобразования в минуту
+API_ROUTE_TTL_SEC = 7 * 24 * 3600
 
 # Базовые паузы (сек) по типу блока; дальше экспонента 2^n и джиттер.
 BLOCK_BASE_WAIT = {
@@ -276,6 +279,46 @@ _spfa_last_call = 0.0
 _spfa_lock = threading.Lock()
 
 
+class ApiRouteResolver(Protocol):
+    def resolve(self, canonical_url: str) -> str | None: ...
+
+
+class DefaultApiRouteResolver:
+    """Resolve public URLs while retaining route metadata and stale entries."""
+
+    def __init__(self, cache_file: str, timeout: float = 25.0):
+        self.cache_file = cache_file
+        self.timeout = timeout
+
+    def resolve(self, canonical_url: str) -> Optional[str]:
+        from storage import load_state, save_state
+        now = time.time()
+        try:
+            data = load_state(self.cache_file, {}) or {}
+        except Exception:
+            data = {}
+        raw = data.get(canonical_url) if isinstance(data, dict) else None
+        if isinstance(raw, str):
+            raw = {"api_url": raw, "created_at": now, "last_success_at": now}
+        if isinstance(raw, dict):
+            route = raw.get("api_url")
+            last = float(raw.get("last_success_at") or raw.get("created_at") or 0)
+            if route and is_valid_api_url(str(route)) and now - last < API_ROUTE_TTL_SEC:
+                return _ensure_sort_date(str(route))
+        route = convert_url_to_api(canonical_url, self.cache_file, self.timeout)
+        if route:
+            if not isinstance(data, dict):
+                data = {}
+            data[canonical_url] = {"api_url": route, "created_at": now,
+                                   "last_success_at": now, "last_error": None,
+                                   "fail_count": 0}
+            try:
+                save_state(self.cache_file, data)
+            except Exception:
+                pass
+        return route
+
+
 def invalidate_cached_api_url(url: str, cache_file: str) -> None:
     from storage import update_state
 
@@ -314,7 +357,10 @@ def convert_url_to_api(url: str, cache_file: str, timeout: float = 25.0) -> Opti
     try:
         raw = load_state(cache_file, {}) or {}
         if isinstance(raw, dict):
-            cache = {str(k): str(v) for k, v in raw.items()}
+            cache = {
+                str(k): (str(v.get("api_url")) if isinstance(v, dict) and v.get("api_url") else str(v))
+                for k, v in raw.items()
+            }
     except Exception as exc:
         logger.warning("Не удалось прочитать кэш API URL: %s", exc)
     if url in cache and is_valid_api_url(cache[url]):
@@ -381,75 +427,79 @@ def _item_image(item: Dict[str, Any]) -> str:
     return ""
 
 
+@dataclass
+class FeedParseResult:
+    items: List[Dict[str, Any]]
+    warnings: List[str]
+    skipped_items: int
+    schema_fingerprint: str
+
+
+def parse_api_feed(payload: Dict[str, Any], limit: int = 20) -> FeedParseResult:
+    warnings: List[str] = []
+    if limit <= 0:
+        return FeedParseResult([], [], 0, "empty-limit")
+    if not isinstance(payload, dict):
+        return FeedParseResult([], ["API payload is not an object"], 0, "invalid")
+    catalog = payload.get("catalog")
+    if not isinstance(catalog, dict):
+        result = payload.get("result")
+        catalog = result if isinstance(result, dict) else payload
+    raw_items = catalog.get("items") if isinstance(catalog, dict) else None
+    if not isinstance(raw_items, list):
+        return FeedParseResult([], ["API schema mismatch: items missing"], 0, hashlib.sha1(repr(sorted(payload.keys())).encode()).hexdigest()[:12])
+    ads: List[Dict[str, Any]] = []
+    skipped = 0
+    for item in raw_items:
+        if not isinstance(item, dict):
+            skipped += 1; continue
+        if str(item.get("type", "")) in _NON_AD_TYPES:
+            skipped += 1; warnings.append("Skipped service/banner item"); continue
+        ad_id = item.get("id")
+        url_path = item.get("urlPath") or item.get("uriPath")
+        title = item.get("title")
+        if not ad_id or not url_path or not title:
+            skipped += 1; warnings.append("Skipped malformed item"); continue
+        price: Optional[int] = None
+        pd = item.get("priceDetailed")
+        candidates = [pd.get("value")] if isinstance(pd, dict) else []
+        candidates.extend(item.get(k) for k in ("price", "priceValue", "priceInt"))
+        for value in candidates:
+            try:
+                if isinstance(value, str):
+                    value = value.replace(" ", "").replace("\u00a0", "")
+                if isinstance(value, (int, float, str)) and float(value) > 0:
+                    price = int(float(value)); break
+            except (TypeError, ValueError):
+                continue
+        published_ts: Optional[float] = None
+        sts = item.get("sortTimeStamp")
+        if isinstance(sts, (int, float)) and sts > 0:
+            published_ts = float(sts) / 1000.0 if sts > 10_000_000_000 else float(sts)
+        location = ""
+        for candidate in (item.get("geo"), item.get("addressDetailed"), item.get("location")):
+            if isinstance(candidate, str):
+                location = candidate.strip()
+            elif isinstance(candidate, dict):
+                location = _first_str(candidate.get("name"), candidate.get("title"), candidate.get("formattedAddress"), candidate.get("locationName"))
+            if location: break
+        url = str(url_path) if str(url_path).startswith("http") else f"https://www.avito.ru{url_path}"
+        ads.append({"ad_id": str(ad_id), "url": url, "title": str(title), "price": price,
+                    "location": location, "date_str": "", "published_ts": published_ts,
+                    "description": str(item.get("description") or ""), "image_url": _item_image(item),
+                    "seller_id": str(item["sellerId"]) if item.get("sellerId") else None,
+                    "is_verified": bool(item.get("isVerifiedItem"))})
+        if len(ads) >= max(0, limit): break
+    if raw_items and not ads:
+        warnings.append("API returned zero valid listings")
+    fingerprint = hashlib.sha1(repr(sorted(raw_items[0].keys()) if raw_items and isinstance(raw_items[0], dict) else []).encode()).hexdigest()[:12]
+    return FeedParseResult(ads, warnings, skipped, fingerprint)
+
+
 def parse_api_items(payload: Dict[str, Any], limit: int = 20) -> List[Dict[str, Any]]:
     """
     JSON API Авито -> список словарей с ключами под dataclass Ad:
     ad_id, url, title, price, location, date_str, published_ts,
     description, image_url, seller_id, is_verified.
     """
-    if not isinstance(payload, dict):
-        return []
-    catalog = payload.get("catalog")
-    if not isinstance(catalog, dict):
-        result = payload.get("result")
-        catalog = result if isinstance(result, dict) else payload
-    items = catalog.get("items")
-    if not isinstance(items, list):
-        return []
-
-    ads: List[Dict[str, Any]] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        item_type = item.get("type")
-        if item_type and str(item_type) in _NON_AD_TYPES:
-            continue
-        ad_id = item.get("id")
-        url_path = item.get("urlPath")
-        title = item.get("title")
-        if not ad_id or not url_path or not title:
-            continue  # сервисный блок, а не объявление
-
-        price: Optional[int] = None
-        pd = item.get("priceDetailed")
-        if isinstance(pd, dict):
-            value = pd.get("value")
-            if isinstance(value, (int, float)) and value > 0:
-                price = int(value)
-
-        published_ts: Optional[float] = None
-        sts = item.get("sortTimeStamp")
-        if isinstance(sts, (int, float)) and sts > 0:
-            published_ts = float(sts) / 1000.0
-
-        location = ""
-        geo = item.get("geo")
-        if isinstance(geo, dict):
-            location = _first_str(geo.get("formattedAddress"))
-        if not location:
-            addr = item.get("addressDetailed")
-            if isinstance(addr, dict):
-                location = _first_str(addr.get("locationName"))
-        if not location:
-            loc = item.get("location")
-            if isinstance(loc, dict):
-                location = _first_str(loc.get("name"))
-
-        url = url_path if str(url_path).startswith("http") else f"https://www.avito.ru{url_path}"
-
-        ads.append({
-            "ad_id": str(ad_id),
-            "url": url,
-            "title": str(title),
-            "price": price,
-            "location": location,
-            "date_str": "",
-            "published_ts": published_ts,
-            "description": str(item.get("description") or ""),
-            "image_url": _item_image(item),
-            "seller_id": str(item["sellerId"]) if item.get("sellerId") else None,
-            "is_verified": bool(item.get("isVerifiedItem")),
-        })
-        if len(ads) >= limit:
-            break
-    return ads
+    return parse_api_feed(payload, limit).items

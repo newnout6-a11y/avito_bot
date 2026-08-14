@@ -318,6 +318,8 @@ class Watcher:
             return False
         if filters.keywords_all and not all(word.lower() in text for word in filters.keywords_all):
             return False
+        if filters.keywords_any and not any(word.casefold() in text.casefold() for word in filters.keywords_any):
+            return False
         if filters.keywords_stop and any(word.lower() in text for word in filters.keywords_stop):
             return False
         return True
@@ -457,7 +459,7 @@ class WatcherManager:
             id=self._next_sub_id(),
             user_id=user_id,
             search_key=key,
-            url=url,
+            url=key,
             flt=filters,
         )
         watcher = self.watchers.get(key)
@@ -520,8 +522,8 @@ class WatcherManager:
                 sub = Subscription(
                     id=int(row["id"]),
                     user_id=int(row["user_id"]),
-                    search_key=str(row["search_key"]),
-                    url=str(row["url"]),
+                    search_key=search_key_from_url(str(row.get("search_key") or row.get("url") or "")),
+                    url=search_key_from_url(str(row.get("url") or row.get("search_key") or "")),
                     flt=SubscriberFilter(**row.get("filter", {})),
                     name=row.get("name"),
                     only_new=bool(row.get("only_new", True)),

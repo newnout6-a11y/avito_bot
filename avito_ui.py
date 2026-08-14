@@ -42,6 +42,7 @@ from avito_domain import (
     _parse_price_input,
     avito_short_url,
     is_valid_avito_url,
+    parse_avito_url,
     search_key_from_url,
     try_extract_filters_from_url,
 )
@@ -213,16 +214,20 @@ async def wizard_cancel_from_url(message: types.Message, state: FSMContext):
 @wizard_router.message(SearchWizard.url)
 async def wizard_got_url(message: types.Message, state: FSMContext):
     raw = (message.text or "").strip()
-    m = re.search(r"https?://\S+", raw)
+    m = re.search(r"(?:(?:https?://)?(?:www\.)?avito\.ru)\S*", raw, re.I)
     url_in = m.group(0) if m else raw
-    if not is_valid_avito_url(url_in):
+    try:
+        parsed = parse_avito_url(url_in)
+    except ValueError:
         await message.answer(
             _br("Похоже, это не ссылка Авито. Вставьте корректный URL.")
         )
         return
-
-    url = search_key_from_url(url_in)
-    guessed = try_extract_filters_from_url(url)
+    if parsed.kind == "item":
+        await message.answer(_br("Это ссылка на карточку объявления. Пришлите ссылку на результаты поиска Avito."))
+        return
+    url = parsed.canonical_url
+    guessed = parsed.filters
 
     await state.update_data(
         url=url,
@@ -1358,14 +1363,20 @@ class App:
                     )
                 )
                 return
-            url = parts[1].strip()
-            if not is_valid_avito_url(url):
+            url = parts[1].strip().strip(".,;:!?)]}>'\"»")
+            try:
+                parsed_url = parse_avito_url(url)
+            except ValueError:
                 await m.reply(
                     _br("Разрешены только ссылки https://avito.ru и его поддоменов.")
                 )
                 return
+            if parsed_url.kind == "item":
+                await m.reply(_br("Это ссылка на карточку объявления. Нужна ссылка на результаты поиска Avito."))
+                return
+            url = parsed_url.canonical_url
             params = parts[2].strip() if len(parts) >= 3 else ""
-            flt = try_extract_filters_from_url(url)
+            flt = parsed_url.filters
             if params:
                 p = params.replace(" ", "")
                 for token in p.split(","):
