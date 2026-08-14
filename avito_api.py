@@ -174,7 +174,7 @@ class AvitoHttpClient:
     # ----- внутреннее -----
 
     def _build_session(self) -> "curl_requests.Session":
-        kwargs: Dict[str, Any] = {"impersonate": "chrome"}
+        kwargs: Dict[str, Any] = {"impersonate": "chrome124"}
         if self.proxy:
             kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
         session = curl_requests.Session(**kwargs)
