@@ -291,6 +291,21 @@ def _filter_preview(spec: SearchSpec) -> str:
     warnings = "\n".join(
         f"• {html.escape(warning)}" for warning in spec.warnings
     ) or "нет"
+
+    extra_info: list[str] = []
+    if spec.category:
+        extra_info.append(f"Категория: <b>{html.escape(spec.category)}</b>")
+    if spec.location:
+        extra_info.append(f"Регион: <b>{html.escape(spec.location)}</b>")
+    if spec.color:
+        extra_info.append(f"Цвет: <b>{html.escape(spec.color)}</b>")
+    if spec.delivery:
+        extra_info.append("Доставка: <b>включена (cd=1)</b>")
+    if spec.sort_title:
+        extra_info.append(f"Сортировка: <b>{html.escape(spec.sort_title)}</b>")
+
+    extra_str = ("\n" + "\n".join(extra_info)) if extra_info else ""
+
     return (
         "<b>Проверка ссылки</b>\n\n"
         f"Тип: <b>{'поиск' if spec.kind == 'search' else 'объявление'}</b>\n"
@@ -299,7 +314,8 @@ def _filter_preview(spec: SearchSpec) -> str:
         f"Цена: {price(filters.price_min)} — {price(filters.price_max)}\n"
         f"Все слова: {html.escape(', '.join(filters.keywords_all)) or 'не заданы'}\n"
         f"Любое из слов: {html.escape(', '.join(filters.keywords_any)) or 'не заданы'}\n"
-        f"Стоп-слова: {html.escape(', '.join(filters.keywords_stop)) or 'не заданы'}\n\n"
+        f"Стоп-слова: {html.escape(', '.join(filters.keywords_stop)) or 'не заданы'}"
+        f"{extra_str}\n\n"
         f"<b>Предупреждения</b>\n{warnings}"
     )
 

@@ -61,6 +61,316 @@ class SubscriberFilter:
     price_max: Optional[int] = None
 
 
+AVITO_LOCATIONS = {
+    "all": "Вся Россия",
+    # Города федерального значения
+    "moskva": "Москва",
+    "sankt-peterburg": "Санкт-Петербург",
+    "sevastopol": "Севастополь",
+    # Столицы регионов и крупные города
+    "novosibirsk": "Новосибирск",
+    "ekaterinburg": "Екатеринбург",
+    "kazan": "Казань",
+    "nizhniy_novgorod": "Нижний Новгород",
+    "chelyabinsk": "Челябинск",
+    "samara": "Самара",
+    "ufa": "Уфа",
+    "rostov-na-donu": "Ростов-на-Дону",
+    "krasnodar": "Краснодар",
+    "omsk": "Омск",
+    "voronezh": "Воронеж",
+    "perm": "Пермь",
+    "volgograd": "Волгоград",
+    "krasnoyarsk": "Красноярск",
+    "saratov": "Саратов",
+    "tyumen": "Тюмень",
+    "tolyatti": "Тольятти",
+    "barnaul": "Барнаул",
+    "izhevsk": "Ижевск",
+    "mahachkala": "Махачкала",
+    "habarovsk": "Хабаровск",
+    "ulyanovsk": "Ульяновск",
+    "irkutsk": "Иркутск",
+    "vladivostok": "Владивосток",
+    "yaroslavl": "Ярославль",
+    "tomsk": "Томск",
+    "stavropol": "Ставрополь",
+    "kemerovo": "Кемерово",
+    "naberezhnye_chelny": "Набережные Челны",
+    "orenburg": "Оренбург",
+    "novokuznetsk": "Новокузнецк",
+    "balashiha": "Балашиха",
+    "ryazan": "Рязань",
+    "cheboksary": "Чебоксары",
+    "penza": "Пенза",
+    "lipetsk": "Липецк",
+    "kaliningrad": "Калининград",
+    "astrahan": "Астрахань",
+    "tula": "Тула",
+    "kirov": "Киров",
+    "sochi": "Сочи",
+    "kursk": "Курск",
+    "ulan-ude": "Улан-Удэ",
+    "tver": "Тверь",
+    "magnitogorsk": "Магнитогорск",
+    "surgut": "Сургут",
+    "bryansk": "Брянск",
+    "ivanovo": "Иваново",
+    "yakutsk": "Якутск",
+    "vladimir": "Владимир",
+    "belgorod": "Белгород",
+    "nizhniy_tagil": "Нижний Тагил",
+    "kaluga": "Калуга",
+    "chita": "Чита",
+    "smolensk": "Смоленск",
+    "volzhskiy": "Волжский",
+    "kurgan": "Курган",
+    "cherepovets": "Череповец",
+    "orel": "Орёл",
+    "saransk": "Саранск",
+    "vologda": "Вологда",
+    "podolsk": "Подольск",
+    "vladikavkaz": "Владикавказ",
+    "tambov": "Тамбов",
+    "murmansk": "Мурманск",
+    "petrozavodsk": "Петрозаводск",
+    "nizhnevartovsk": "Нижневартовск",
+    "kostroma": "Кострома",
+    "yoshkar-ola": "Йошкар-Ола",
+    "novorossiysk": "Новороссийск",
+    "sterlitamak": "Стерлитамак",
+    "himki": "Химки",
+    "taganrog": "Таганрог",
+    "mytischi": "Мытищи",
+    "syktyvkar": "Сыктывкар",
+    "komsomolsk-na-amure": "Комсомольск-на-Амуре",
+    "nizhnekamsk": "Нижнекамск",
+    "nalchik": "Нальчик",
+    "shahty": "Шахты",
+    "dzerzhinsk": "Дзержинск",
+    "engels": "Энгельс",
+    "orsk": "Орск",
+    "bratsk": "Братск",
+    "velikiy_novgorod": "Великий Новгород",
+    "korolev": "Королёв",
+    "staryy_oskol": "Старый Оскол",
+    "angarsk": "Ангарск",
+    "pskov": "Псков",
+    "lyubertsy": "Люберцы",
+    "yuzhno-sahalinsk": "Южно-Сахалинск",
+    "biysk": "Бийск",
+    "prokopevsk": "Прокопьевск",
+    "abakan": "Абакан",
+    "armavir": "Армавир",
+    "balakovo": "Балаково",
+    "norilsk": "Норильск",
+    "rybinsk": "Рыбинск",
+    "severodvinsk": "Северодвинск",
+    "petropavlovsk-kamchatskiy": "Петропавловск-Камчатский",
+    "krasnogorsk": "Красногорск",
+    "ussuriysk": "Уссурийск",
+    "volgodonsk": "Волгодонск",
+    "novocherkassk": "Новочеркасск",
+    "syzran": "Сызрань",
+    "zlatoust": "Златоуст",
+    "kamensk-uralskiy": "Каменск-Уральский",
+    "elektrostal": "Электросталь",
+    "almetevsk": "Альметьевск",
+    "salavat": "Салават",
+    "miass": "Миасс",
+    "nahodka": "Находка",
+    "kopeysk": "Копейск",
+    "pyatigorsk": "Пятигорск",
+    "rubtsovsk": "Рубцовск",
+    "berezniki": "Березники",
+    "kolomna": "Коломна",
+    "maykop": "Майкоп",
+    "odintsovo": "Одинцово",
+    "kovrov": "Ковров",
+    "hasavyurt": "Хасавюрт",
+    "kislovodsk": "Кисловодск",
+    "nefteyugansk": "Нефтеюганск",
+    "bataysk": "Батайск",
+    "novomoskovsk": "Новомосковск",
+    "serpuhov": "Серпухов",
+    "cherkessk": "Черкесск",
+    "pervouralsk": "Первоуральск",
+    "neftekamsk": "Нефтекамск",
+    "novocheboksarsk": "Новочебоксарск",
+    "orehovo-zuevo": "Орехово-Зуево",
+    "derbent": "Дербент",
+    "dimitrovgrad": "Димитровград",
+    "nevinnomyssk": "Невинномысск",
+    "kamyshin": "Камышин",
+    "kyzyl": "Кызыл",
+    "novyy_urengoy": "Новый Уренгой",
+    "murom": "Муром",
+    "obninsk": "Обнинск",
+    "nazran": "Назрань",
+    "kaspiysk": "Каспийск",
+    "essentuki": "Ессентуки",
+    "ramenskoe": "Раменское",
+    "berdsk": "Бердск",
+    "serov": "Серов",
+    "votkinsk": "Воткинск",
+    "seversk": "Северск",
+    "zhukovskiy": "Жуковский",
+    "noyabrsk": "Ноябрьск",
+    "hanty-mansiysk": "Ханты-Мансийск",
+    "achinsk": "Ачинск",
+    "elets": "Елец",
+    "zheleznogorsk": "Железногорск",
+    "anapa": "Анапа",
+    "gelendzhik": "Геленджик",
+    "domodedovo": "Домодедово",
+    "schelkovo": "Щёлково",
+    "dolgoprudnyy": "Долгопрудный",
+    "reutov": "Реутов",
+    "pushkino": "Пушкино",
+    "lobnya": "Лобня",
+    "vidnoe": "Видное",
+    "murino": "Мурино",
+    "kudrovo": "Кудрово",
+    "gatchina": "Гатчина",
+    "vyborg": "Выборг",
+    "vsevolozhsk": "Всеволожск",
+    "kerch": "Керчь",
+    "simferopol": "Симферополь",
+    "evpatoriya": "Евпатория",
+    "yalta": "Ялта",
+    "feodosiya": "Феодосия",
+    "gorno-altaysk": "Горно-Алтайск",
+    "birobidzhan": "Биробиджан",
+    "magadan": "Магадан",
+    "naryan-mar": "Нарьян-Мар",
+    "anadyr": "Анадырь",
+    "salehard": "Салехард",
+    "elista": "Элиста",
+}
+
+AVITO_CATEGORIES = {
+    "telefony": "Телефоны",
+    "mobilnye_telefony": "Мобильные телефоны",
+    "avtomobili": "Автомобили",
+    "kvartiry": "Квартиры",
+    "doma_dachi_kottedzhi": "Дома, дачи, коттеджи",
+    "noutbuki": "Ноутбуки",
+    "audio_i_video": "Аудио и видео",
+    "bytovaya_tehnika": "Бытовая техника",
+    "tovary_dlya_kompyutera": "Компьютерная техника",
+    "planshety_i_elektronnye_knigi": "Планшеты",
+    "odezhda_obuv_aksessuary": "Одежда и обувь",
+    "chasy_i_ukrasheniya": "Часы и украшения",
+    "remont_i_stroitelstvo": "Ремонт и строительство",
+    "mebel_i_interer": "Мебель и интерьер",
+    "posuda_i_tovary_dlya_kuhni": "Посуда и товары для кухни",
+    "rasteniya": "Растения",
+    "sobaki": "Собаки",
+    "koshki": "Кошки",
+    "velosipedy": "Велосипеды",
+    "knigi_i_zhurnaly": "Книги и журналы",
+    "muzykalnye_instrumenty": "Музыкальные инструменты",
+    "sport_i_otdyh": "Спорт и отдых",
+    "igry_pristavki_i_programmy": "Игры и приставки",
+    "nastolnye_kompyutery": "Компьютеры",
+    "fototehnika": "Фототехника",
+}
+
+AVITO_COLORS = {
+    "belyy": "Белый",
+    "chernyy": "Чёрный",
+    "siniy": "Синий",
+    "krasnyy": "Красный",
+    "seryy": "Серый",
+    "zelenyy": "Зелёный",
+    "zolotoy": "Золотой",
+    "serebristyy": "Серебристый",
+    "fioletovyy": "Фиолетовый",
+    "rozovyy": "Розовый",
+    "goluboy": "Голубой",
+    "zheltyy": "Жёлтый",
+    "bezhevyy": "Бежевый",
+    "oranzhevyy": "Оранжевый",
+    "korichnevyy": "Коричневый",
+    "biryuzovyy": "Бирюзовый",
+}
+
+AVITO_SORTS = {
+    "104": "По дате (новые)",
+    "101": "По умолчанию",
+    "1": "Дешевле",
+    "2": "Дороже",
+}
+
+_TRANSLIT_RULES = (
+    ("shch", "щ"), ("sch", "щ"), ("yo", "ё"), ("zh", "ж"),
+    ("ch", "ч"), ("sh", "ш"), ("kh", "х"), ("ts", "ц"),
+    ("yu", "ю"), ("ya", "я"), ("iy", "ий"), ("yy", "ый"),
+)
+
+_SINGLE_TRANSLIT = {
+    "a": "а", "b": "б", "v": "в", "g": "г", "d": "д", "e": "е",
+    "z": "з", "i": "и", "j": "й", "k": "к", "l": "л", "m": "м",
+    "n": "н", "o": "о", "p": "п", "r": "р", "s": "с", "t": "т",
+    "u": "у", "f": "ф", "h": "х", "c": "ц", "y": "ы", "w": "в",
+    "x": "кс", "q": "к",
+}
+
+
+def _translit_location(slug: str) -> str:
+    res = slug.lower().replace("_", " ").replace("-", " - ")
+    for lat, cyr in _TRANSLIT_RULES:
+        res = res.replace(lat, cyr)
+    chars = [_SINGLE_TRANSLIT.get(c, c) for c in res]
+    res = "".join(chars).replace(" - ", "-")
+    return " ".join(w.capitalize() for w in res.split())
+
+
+def extract_url_metadata(url_str: str) -> dict[str, object]:
+    parsed = urlparse(url_str)
+    path_parts = [p for p in (parsed.path or "").strip("/").split("/") if p]
+
+    loc: Optional[str] = None
+    cats: list[str] = []
+    color: Optional[str] = None
+
+    if path_parts:
+        first = path_parts[0].lower()
+        if first in AVITO_LOCATIONS:
+            loc = AVITO_LOCATIONS[first]
+            path_parts = path_parts[1:]
+        elif not any(first.startswith(c) for c in AVITO_CATEGORIES):
+            loc = _translit_location(first)
+            path_parts = path_parts[1:]
+
+    for part in path_parts:
+        clean_part = re.sub(r"-ASgBA[A-Za-z0-9_-]+$", "", part)
+        color_match = re.match(r"^([a-z]+)-(.*)$", clean_part)
+        if color_match and color_match.group(1) in AVITO_COLORS:
+            color = AVITO_COLORS[color_match.group(1)]
+            clean_part = color_match.group(2)
+        elif clean_part in AVITO_COLORS:
+            color = AVITO_COLORS[clean_part]
+            continue
+
+        if clean_part in AVITO_CATEGORIES:
+            cats.append(AVITO_CATEGORIES[clean_part])
+        elif clean_part:
+            cats.append(clean_part.replace("_", " ").title())
+
+    qs = parse_qs(parsed.query)
+    delivery = qs.get("cd", ["0"])[0] == "1"
+    sort_title = AVITO_SORTS.get(qs.get("s", [""])[0])
+
+    return {
+        "location": loc,
+        "category": " / ".join(cats) if cats else None,
+        "color": color,
+        "delivery": delivery,
+        "sort_title": sort_title,
+    }
+
+
 @dataclass(frozen=True)
 class SearchSpec:
     canonical_url: str
@@ -69,6 +379,11 @@ class SearchSpec:
     kind: Literal["search", "item"]
     filters: SubscriberFilter
     warnings: tuple[str, ...] = ()
+    location: Optional[str] = None
+    category: Optional[str] = None
+    color: Optional[str] = None
+    delivery: bool = False
+    sort_title: Optional[str] = None
 
 
 # Backwards-compatible public name used by existing integrations.
@@ -165,6 +480,7 @@ def parse_avito_url(url: str) -> SearchSpec:
     kind: Literal["search", "item"] = "item" if re.search(r"(?:^|[_/-])\d{7,}(?:$|[/?_-])", parsed.path) else "search"
     filters, filter_warnings = parse_filters(canonical)
     warnings.extend(filter_warnings)
+    meta = extract_url_metadata(canonical)
     return SearchSpec(
         canonical,
         original or canonical,
@@ -172,6 +488,11 @@ def parse_avito_url(url: str) -> SearchSpec:
         kind,
         filters,
         tuple(dict.fromkeys(warnings)),
+        location=meta.get("location"),  # type: ignore
+        category=meta.get("category"),  # type: ignore
+        color=meta.get("color"),  # type: ignore
+        delivery=bool(meta.get("delivery")),
+        sort_title=meta.get("sort_title"),  # type: ignore
     )
 
 
@@ -281,28 +602,40 @@ def _parse_query_filters(query: dict[str, list[str]]) -> SubscriberFilter:
 
 def _decode_filter_payload(encoded_filter: str) -> dict[str, object]:
     token = encoded_filter.strip()
-    # Avito may split the base64url token with `~`; it is not payload data.
-    token = token.replace("~", "")
-    if not re.fullmatch(r"[A-Za-z0-9_-]+={0,2}", token):
-        raise ValueError("malformed base64")
-    token = token.rstrip("=")
-    padding = "=" * ((4 - len(token) % 4) % 4)
-    try:
-        raw_decoded = base64.urlsafe_b64decode(token + padding)
-    except (binascii.Error, ValueError) as exc:
-        raise ValueError("malformed base64") from exc
-    json_start = raw_decoded.find(b"{")
-    if json_start < 0:
-        raise ValueError("JSON object not found")
-    try:
-        payload = json.loads(raw_decoded[json_start:].decode("utf-8"))
-    except UnicodeDecodeError as exc:
-        raise ValueError("invalid UTF-8") from exc
-    except json.JSONDecodeError as exc:
-        raise ValueError("malformed JSON") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("decoded filter is not an object")
-    return payload
+    # Avito uses `~` as a separator between independent filter segments.
+    # Each segment is a separate base64-encoded filter. The segment containing
+    # JSON price data may have a variable-length binary prefix before the JSON.
+    # Try to decode each segment and search for JSON within it.
+    segments = [s for s in token.split("~") if s]
+
+    for segment in segments:
+        # Try the full segment first
+        for start_offset in range(0, min(len(segment), 10)):
+            test_segment = segment[start_offset:]
+
+            if not re.fullmatch(r"[A-Za-z0-9_-]+={0,2}", test_segment):
+                continue
+
+            test_segment = test_segment.rstrip("=")
+            padding = "=" * ((4 - len(test_segment) % 4) % 4)
+
+            try:
+                raw_decoded = base64.urlsafe_b64decode(test_segment + padding)
+            except (binascii.Error, ValueError):
+                continue
+
+            json_start = raw_decoded.find(b"{")
+            if json_start < 0:
+                continue
+
+            try:
+                payload = json.loads(raw_decoded[json_start:].decode("utf-8"))
+                if isinstance(payload, dict):
+                    return payload
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+
+    raise ValueError("JSON object not found")
 
 
 def _parse_encoded_filter(encoded_filter: str) -> SubscriberFilter:

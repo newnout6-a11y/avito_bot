@@ -152,6 +152,32 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(filters.keywords_all, ["samsung"])
         self.assertNotIn("Не удалось разобрать фильтр f", " ".join(warnings))
 
+    def test_real_avito_search_link_with_multisegment_f(self):
+        url = (
+            "https://www.avito.ru/all/telefony/mobilnye_telefony/samsung-"
+            "ASgBAgICAkS0wA2crzmwwQ2I_Dc?cd=1&context=H4sIAAAAAAAA_wEmANn_YToxOntzOjE6InkiO3M6MTY6IjRnQUlxVlU3SFhyNVB2RmwiO3094LcAJgAAAA"
+            "&f=ASgBAQECAkS0wA2crzmwwQ2I_DcBQOjrDiT6_dsC~P3bAgFFxpoMFXsiZnJvbSI6MCwidG8iOjcwMDAwfQ"
+            "&q=samsung&s=104"
+        )
+        spec = avito_domain.parse_avito_url(url)
+        self.assertEqual(spec.filters.price_min, None)
+        self.assertEqual(spec.filters.price_max, 70000)
+        self.assertEqual(spec.filters.keywords_all, ["samsung"])
+        self.assertEqual(spec.warnings, ())
+
+    def test_real_avito_search_link_with_color_filter(self):
+        url = (
+            "https://www.avito.ru/all/telefony/mobilnye_telefony/samsung/belyy-"
+            "ASgBAgICA0SwwA3u_ze0wA2crzmwwQ2I_Dc?cd=1&context=H4sIAAAAAAAA_wEmANn_YToxOntzOjE6InkiO3M6MTY6Imp0T2xTNk5sTWtwM3plVlUiO31lmxiJJgAAAA"
+            "&f=ASgBAQECA0SwwA3u_ze0wA2crzmwwQ2I_DcDQOTgDTSMwlyOwlyQwlzo6w4k~v3bAvj92wK0xRYkpL2XA6a9lwMBRcaaDBV7ImZyb20iOjAsInRvIjo3MDAwMH0"
+            "&q=samsung&s=104"
+        )
+        spec = avito_domain.parse_avito_url(url)
+        self.assertEqual(spec.filters.price_min, None)
+        self.assertEqual(spec.filters.price_max, 70000)
+        self.assertEqual(spec.filters.keywords_all, ["samsung"])
+        self.assertEqual(spec.warnings, ())
+
     def test_wizard_uses_price_from_avito_url(self):
         async def scenario():
             message = FakeMessage(
