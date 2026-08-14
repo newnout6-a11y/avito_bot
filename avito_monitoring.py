@@ -281,6 +281,25 @@ class Watcher:
         for attempt in range(max_attempts):
             try:
                 await self._wait_global_rate_limit()
+                # 1. Сначала пробуем прямой HTML-парсинг поисковой выдачи (работает надежно через Safari-отпечаток)
+                try:
+                    raw_items = await asyncio.to_thread(self._client.get_search_page_items, self.url, 50)
+                    if raw_items:
+                        self.last_http_status = self._client.last_status
+                        self._consecutive_blocks = 0
+                        self.last_block_kind = None
+                        self.conversion_status = "ready"
+                        self.conversion_error = None
+                        return [Ad(**item) for item in raw_items]
+                except (AvitoBlock, AvitoHttpError) as page_block:
+                    if not self._api_url:
+                        raise page_block
+                except Exception as page_exc:
+                    logger.debug("Парсинг страницы %s: %s", self.url, page_exc)
+
+                if not self._api_url:
+                    return None
+
                 payload = await asyncio.to_thread(self._client.get_items, self._api_url)
                 self.last_http_status = self._client.last_status
                 self._consecutive_blocks = 0

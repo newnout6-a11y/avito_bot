@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import random
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Protocol
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from bs4 import BeautifulSoup
 from curl_cffi import requests as curl_requests
 
 logger = logging.getLogger(__name__)
@@ -174,7 +176,7 @@ class AvitoHttpClient:
     # ----- внутреннее -----
 
     def _build_session(self) -> "curl_requests.Session":
-        kwargs: Dict[str, Any] = {"impersonate": "chrome124"}
+        kwargs: Dict[str, Any] = {"impersonate": "safari15_5"}
         if self.proxy:
             kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
         session = curl_requests.Session(**kwargs)
@@ -233,6 +235,29 @@ class AvitoHttpClient:
         return False
 
     # ----- основной запрос -----
+
+    def get_search_page_items(self, search_url: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        Прямое получение объявлений со страницы поисковой выдачи Avito (HTML-рендеринг).
+        """
+        headers = {
+            "referer": AVITO_HOME,
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "sec-fetch-site": "none",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-dest": "document",
+        }
+        r = self._session.get(search_url, timeout=self.timeout, headers=headers, allow_redirects=True)
+        self.last_status = r.status_code
+        text = r.text or ""
+        block = classify_block(r.status_code, r.headers, text)
+        if block:
+            self.total_blocked += 1
+            raise block
+        if r.status_code != 200:
+            raise AvitoHttpError(r.status_code, text[:200])
+        self.total_ok += 1
+        return parse_html_feed(text, limit=limit)
 
     def get_items(self, api_url: str) -> Dict[str, Any]:
         """
@@ -593,3 +618,60 @@ def parse_api_items(payload: Dict[str, Any], limit: int = 20) -> List[Dict[str, 
     description, image_url, seller_id, is_verified.
     """
     return parse_api_feed(payload, limit).items
+
+
+def parse_html_feed(html_text: str, limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    Парсинг карточек объявлений напрямую из HTML страницы поисковой выдачи Avito.
+    """
+    if not html_text:
+        return []
+    soup = BeautifulSoup(html_text, "html.parser")
+    items_elements = soup.select('[data-marker="item"]')
+    if not items_elements:
+        items_elements = soup.select('div[itemprop="itemListElement"]')
+    ads: List[Dict[str, Any]] = []
+    now = time.time()
+    for item in items_elements[:limit]:
+        item_id = item.get("data-item-id") or item.get("id")
+        title_el = item.select_one('[itemprop="name"], [data-marker="item-title"]')
+        title = title_el.get_text(strip=True) if title_el else ""
+        if not item_id or not title:
+            continue
+        link_el = item.select_one('a[itemprop="url"], a[data-marker="item-title"]')
+        href = link_el.get("href") if link_el else ""
+        url = ("https://www.avito.ru" + href) if href.startswith("/") else href
+        if not url:
+            continue
+        price: Optional[int] = None
+        price_meta = item.select_one('meta[itemprop="price"]')
+        if price_meta and price_meta.get("content", "").isdigit():
+            price = int(price_meta.get("content"))
+        else:
+            price_el = item.select_one('[data-marker="item-price"], [itemprop="price"]')
+            if price_el:
+                digits = re.sub(r"[^\d]", "", price_el.get_text(strip=True))
+                if digits.isdigit():
+                    price = int(digits)
+        img_el = item.select_one('img[itemprop="image"], img[class*="image"]')
+        image_url = (img_el.get("src") or img_el.get("data-src")) if img_el else None
+        desc_el = item.select_one('[class*="description"], [data-marker="item-description"]')
+        description = desc_el.get_text(strip=True) if desc_el else ""
+        date_el = item.select_one('[data-marker="item-date"]')
+        date_str = date_el.get_text(strip=True) if date_el else ""
+        loc_el = item.select_one('[class*="geo"], [data-marker="item-address"]')
+        location = loc_el.get_text(strip=True) if loc_el else ""
+        ads.append({
+            "ad_id": str(item_id),
+            "url": url,
+            "title": str(title),
+            "price": price,
+            "location": location,
+            "date_str": date_str,
+            "published_ts": now,
+            "description": description,
+            "image_url": image_url,
+            "seller_id": None,
+            "is_verified": False,
+        })
+    return ads
