@@ -169,6 +169,61 @@ HELP_TEXT = (
 )
 
 
+def build_help_content(
+    app: Optional[Any], user_id: int
+) -> tuple[str, types.InlineKeyboardMarkup]:
+    alert_chat_id = (
+        app.get_alert_chat_id(user_id)
+        if app and hasattr(app, "get_alert_chat_id")
+        else None
+    )
+    alert_username = (
+        getattr(app, "alert_username", ALERT_BOT_USERNAME) or ALERT_BOT_USERNAME
+    )
+
+    if alert_chat_id:
+        status_line = "🔔 <b>Бот оповещений:</b> ✅ Подключен"
+        alert_btn_text = "🔔 Открыть бот оповещений"
+        alert_url = f"https://t.me/{alert_username}" if alert_username else ""
+    else:
+        status_line = "🔔 <b>Бот оповещений:</b> ❌ Не подключен"
+        alert_btn_text = "🔔 Подключить оповещения"
+        alert_url = (
+            app.alert_deeplink(user_id)
+            if app and hasattr(app, "alert_deeplink")
+            else (f"https://t.me/{alert_username}" if alert_username else "")
+        )
+
+    text = (
+        "<b>Как начать пользоваться</b>\n\n"
+        "1. Активируйте ключ доступа (отправьте ключ в чат).\n"
+        "2. Подключите бот-оповещатель.\n"
+        "3. Создайте поиск (отправьте ссылку с Avito).\n\n"
+        f"{status_line}\n\n"
+        "Новые объявления будут мгновенно приходить в отдельный бот-оповещатель."
+    )
+
+    rows: List[List[types.InlineKeyboardButton]] = []
+    if alert_url:
+        rows.append(
+            [
+                _inline_button(
+                    text=alert_btn_text,
+                    url=alert_url,
+                    style="success" if not alert_chat_id else "primary",
+                )
+            ]
+        )
+    rows.append(
+        [
+            _inline_button(text="Написать в поддержку", url=SUPPORT_LINK),
+            _inline_button(text="Назад в меню", callback_data="main_menu"),
+        ]
+    )
+
+    return text, types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def show_main_menu(
     message: types.Message,
     text: str = MAIN_MENU_TEXT,
@@ -744,8 +799,10 @@ async def support_callback(cq: types.CallbackQuery):
 
 @support_router.callback_query(F.data == "help")
 async def help_callback(cq: types.CallbackQuery):
+    app = getattr(cq.bot, "app", None) or cast(Any, cq.bot).app
+    text, kb = build_help_content(app, cq.from_user.id)
     if isinstance(cq.message, types.Message):
-        await cq.message.edit_text(HELP_TEXT, reply_markup=MAIN_INLINE_KB)
+        await cq.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
     await cq.answer()
 
 
@@ -1748,11 +1805,16 @@ class App:
             await state.clear()
             await show_main_menu(m, clear_reply_keyboard=True)
 
-        @self.dp.message(F.text.in_(["📘 Инструкция", "Инструкция", "/help"]))
+        @self.dp.message(
+            F.text.in_(
+                ["📘 Инструкция", "Инструкция", "ℹ️ Помощь", "Помощь", "/help"]
+            )
+        )
         async def help_cmd(m: types.Message):
             self.account_register_if_needed(m.chat.id)
+            text, kb = build_help_content(self, m.chat.id)
             await m.answer(
-                HELP_TEXT, reply_markup=MAIN_INLINE_KB, disable_web_page_preview=True
+                text, reply_markup=kb, disable_web_page_preview=True
             )
 
         @self.dp.message(Command("start"))
