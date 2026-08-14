@@ -104,7 +104,7 @@ class Watcher:
             )
             self._client_closed = False
         if PRIME_ON_START:
-            await self._prime_seen(30)
+            await self._prime_seen(None)
         self.task = asyncio.create_task(self._run(), name=f"watch:{self.search_key}")
 
     async def stop(self):
@@ -230,10 +230,10 @@ class Watcher:
             if badges:
                 price_line += " " + " ".join(badges)
             lines.append(price_line)
-        if ad.published_ts:
-            lines.append("🗓 " + _fmt_dt(ad.published_ts))
-        elif ad.date_str:
+        if ad.date_str:
             lines.append("🗓 " + html.escape(ad.date_str))
+        elif ad.published_ts:
+            lines.append("🗓 " + _fmt_dt(ad.published_ts))
         if ad.seller_name:
             icon = "🏪" if "магазин" in ad.seller_name.lower() else "👤"
             lines.append(f"{icon} {html.escape(ad.seller_name)}")
@@ -270,27 +270,7 @@ class Watcher:
         for attempt in range(max_attempts):
             try:
                 await self._wait_global_rate_limit()
-                # 1. Прямой HTML-парсинг поисковой выдачи Avito (Safari impersonation)
-                try:
-                    raw_items = await asyncio.to_thread(self._client.get_search_page_items, self.url, 50)
-                    if raw_items:
-                        self.last_http_status = self._client.last_status
-                        self._consecutive_blocks = 0
-                        self.last_block_kind = None
-                        self.conversion_status = "ready"
-                        self.conversion_error = None
-                        return [Ad(**item) for item in raw_items]
-                except (AvitoBlock, AvitoHttpError) as page_block:
-                    if not self._api_url:
-                        raise page_block
-                except Exception as page_exc:
-                    logger.debug("Парсинг страницы %s: %s", self.url, page_exc)
-
-                # 2. Опциональный fallback на JSON API, если URL был сконвертирован
-                if not self._api_url:
-                    api_url = await asyncio.to_thread(self.route_resolver.resolve, self.url)
-                    self._api_url = api_url
-
+                # 1. Если задан _api_url, пробуем JSON API
                 if self._api_url:
                     payload = await asyncio.to_thread(self._client.get_items, self._api_url)
                     self.last_http_status = self._client.last_status
@@ -307,24 +287,22 @@ class Watcher:
                         except Exception as cache_error:
                             logger.warning("Could not invalidate schema-mismatched route: %s", cache_error)
                         self._api_url = None
-                        logger.error(
-                            "Avito API schema mismatch for %s (%s): %s",
-                            self.url,
-                            parsed.schema_fingerprint,
-                            self.conversion_error,
-                        )
-                        return None
-                    self.parser_health = "warning" if parsed.warnings else "ok"
-                    if parsed.warnings:
-                        logger.warning(
-                            "Avito feed warnings for %s (%s): %s",
-                            self.url,
-                            parsed.schema_fingerprint,
-                            "; ".join(parsed.warnings),
-                        )
+                    elif parsed.items:
+                        self.parser_health = "warning" if parsed.warnings else "ok"
+                        self.conversion_status = "ready"
+                        self.conversion_error = None
+                        return [Ad(**item) for item in parsed.items]
+
+                # 2. Прямой HTML-парсинг выдачи Avito (Safari impersonation)
+                raw_items = await asyncio.to_thread(self._client.get_search_page_items, self.url, 50)
+                if raw_items:
+                    self.last_http_status = self._client.last_status
+                    self._consecutive_blocks = 0
+                    self.last_block_kind = None
                     self.conversion_status = "ready"
                     self.conversion_error = None
-                    return [Ad(**item) for item in parsed.items]
+                    return [Ad(**item) for item in raw_items]
+
                 return None
             except AvitoBlock as block:
                 blocked_route = self._route_key()
@@ -371,7 +349,7 @@ class Watcher:
                 Watcher._route_blocked_until[failed_route] = self._blocked_until
         return None
 
-    async def _prime_seen(self, limit=30):
+    async def _prime_seen(self, limit: Optional[int] = None):
         sub_names = [s.name or f"Поиск #{s.id}" for s in self.subscribers.values()]
         name_hint = ", ".join(f"«{n}»" for n in sub_names) if sub_names else self.search_key[:40]
         logger.info("[Мониторинг] Инициализация %s: загрузка текущих объявлений с Avito...", name_hint)
@@ -379,7 +357,8 @@ class Watcher:
         if not ads:
             logger.warning("[Мониторинг] Инициализация %s: не удалось получить первичные объявления", name_hint)
             return
-        for ad in ads[:limit]:
+        to_prime = ads[:limit] if limit is not None else ads
+        for ad in to_prime:
             self.seen[ad.ad_id] = time.time()
         logger.info("[Мониторинг] Инициализация %s завершена: запомнено %d объявлений, запущен мониторинг новых", name_hint, len(self.seen))
 

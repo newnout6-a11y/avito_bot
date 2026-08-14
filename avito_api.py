@@ -631,7 +631,6 @@ def parse_html_feed(html_text: str, limit: int = 50) -> List[Dict[str, Any]]:
     if not items_elements:
         items_elements = soup.select('div[itemprop="itemListElement"]')
     ads: List[Dict[str, Any]] = []
-    now = time.time()
     for item in items_elements[:limit]:
         item_id = item.get("data-item-id") or item.get("id")
         title_el = item.select_one('[itemprop="name"], [data-marker="item-title"]')
@@ -668,7 +667,7 @@ def parse_html_feed(html_text: str, limit: int = 50) -> List[Dict[str, Any]]:
             "price": price,
             "location": location,
             "date_str": date_str,
-            "published_ts": now,
+            "published_ts": None,
             "description": description,
             "image_url": image_url,
             "seller_id": None,
