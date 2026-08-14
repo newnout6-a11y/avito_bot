@@ -321,7 +321,7 @@ class RegressionTests(unittest.TestCase):
         self.assertNotIn("\\n", panel)
         self.assertNotIn("context=very-long-value", panel)
         self.assertIn("Открыть поиск на Avito", panel)
-        self.assertIn("Любое из слов: 256GB", panel)
+        self.assertIn("Хотя бы одно: 256GB", panel)
 
         sub_callbacks = {
             button.callback_data

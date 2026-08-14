@@ -314,9 +314,9 @@ async def _prompt_search_name(
         "",
         f"Цена от: {min_text}",
         f"Цена до: {max_text}",
-        f"Слова: {html.escape(', '.join(keywords)) if keywords else 'не заданы'}",
-        f"Любое из слов: {html.escape(', '.join(keywords_any)) if keywords_any else 'не заданы'}",
-        f"Стоп-слова: {html.escape(', '.join(keywords_stop)) if keywords_stop else 'не заданы'}",
+        f"Обязательные слова: {html.escape(', '.join(keywords)) if keywords else 'не заданы'}",
+        f"Хотя бы одно: {html.escape(', '.join(keywords_any)) if keywords_any else 'не заданы'}",
+        f"Исключить: {html.escape(', '.join(keywords_stop)) if keywords_stop else 'не заданы'}",
         f'<a href="{short_url}">Открыть поиск на Avito</a>',
         "",
         "Отправьте короткое название, например «Samsung до 70 000».",
@@ -371,9 +371,9 @@ def _filter_preview(spec: SearchSpec) -> str:
         f'🔗 <a href="{html.escape(spec.canonical_url, quote=True)}">Нормализованная ссылка</a>\n\n'
         "⚙️ <b>Найденные фильтры</b>\n"
         f"💰 Цена: {price(filters.price_min)} — {price(filters.price_max)}\n"
-        f"🔤 Все слова: {html.escape(', '.join(filters.keywords_all)) or 'не заданы'}\n"
-        f"🔀 Любое из слов: {html.escape(', '.join(filters.keywords_any)) or 'не заданы'}\n"
-        f"🚫 Стоп-слова: {html.escape(', '.join(filters.keywords_stop)) or 'не заданы'}"
+        f"🔤 Обязательные слова: {html.escape(', '.join(filters.keywords_all)) or 'не заданы'}\n"
+        f"🔀 Хотя бы одно: {html.escape(', '.join(filters.keywords_any)) or 'не заданы'}\n"
+        f"🚫 Исключить: {html.escape(', '.join(filters.keywords_stop)) or 'не заданы'}"
         f"{extra_str}\n\n"
         f"⚠️ <b>Предупреждения</b>\n{warnings}"
     )
@@ -917,9 +917,9 @@ def format_sub_panel(
         f"⏳ Доступ до: <b>{access}</b>\n\n"
         f"⚙️ <b>Фильтры</b>\n"
         f"💰 Цена: <b>{price_min} — {price_max}</b>\n"
-        f"🔤 Все слова: {target}\n"
-        f"🔀 Любое из слов: {any_words}\n"
-        f"🚫 Стоп-слова: {stop}\n"
+        f"🔤 Обязательные слова: {target}\n"
+        f"🔀 Хотя бы одно: {any_words}\n"
+        f"🚫 Исключить: {stop}\n"
         f"🆕 Только новые: <b>{'включено' if sub.only_new else 'выключено'}</b>\n\n"
         f"📡 API: <b>{_conversion_text(watcher)}</b>\n\n"
         f'🔗 <a href="{url}">Открыть поиск на Avito</a>'
@@ -935,13 +935,13 @@ def build_sub_inline_kb(sub: Subscription) -> types.InlineKeyboardMarkup:
         ],
         [
             _inline_button(
-                text="Все слова", callback_data=f"sub:{rid}:pos"
+                text="Обязательные", callback_data=f"sub:{rid}:pos"
             ),
-            _inline_button(text="Любое слово", callback_data=f"sub:{rid}:any"),
+            _inline_button(text="Хотя бы одно", callback_data=f"sub:{rid}:any"),
         ],
         [
             _inline_button(
-                text="Стоп-слова", callback_data=f"sub:{rid}:stop"
+                text="Исключить", callback_data=f"sub:{rid}:stop"
             ),
             _inline_button(
                 text=f"Только новые: {'вкл' if sub.only_new else 'выкл'}",
@@ -1163,9 +1163,9 @@ async def cb_sub_actions(cq: types.CallbackQuery, state: FSMContext):
         await state.update_data(mode=action, sub_id=sub.id)
         if isinstance(cq.message, types.Message):
             hint = {
-                "pos": "слова, которые должны встретиться все",
-                "any": "слова, из которых достаточно одного",
-                "stop": "стоп-слова",
+                "pos": "обязательные слова (должны встретиться все)",
+                "any": "слова-варианты (достаточно хотя бы одного)",
+                "stop": "слова для исключения (минус-слова)",
             }[action]
             current_words = {
                 "pos": sub.flt.keywords_all,
