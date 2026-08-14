@@ -163,7 +163,7 @@ class AvitoHttpClient:
     """
 
     def __init__(self, proxy: Optional[str] = None, proxy_change_url: Optional[str] = None,
-                 timeout: float = 30.0):
+                 timeout: float = 15.0):
         self.proxy = proxy
         self.proxy_change_url = proxy_change_url
         self.timeout = timeout
