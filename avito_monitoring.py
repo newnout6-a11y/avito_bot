@@ -427,7 +427,9 @@ class Watcher:
             names_str = ", ".join(f"«{n}»" for n in sub_names) if sub_names else self.search_key[:40]
             ads = await self._fetch_ads()
             if ads is None:
-                logger.warning("[Мониторинг] %s: запрос отложен (cooldown/пауза)", names_str)
+                route_until = Watcher._route_blocked_until.get(self._route_key(), 0.0)
+                remaining = max(1, int(max(self._blocked_until, route_until) - time.monotonic()))
+                logger.info("[Мониторинг] %s: пауза защиты от блокировок (ещё ~%dс до следующего опроса)", names_str, remaining)
             elif not ads:
                 logger.info("[Мониторинг] %s: получено 0 объявлений от Avito API", names_str)
             else:

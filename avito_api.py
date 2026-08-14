@@ -42,11 +42,11 @@ API_ROUTE_TTL_SEC = 7 * 24 * 3600
 
 # Базовые паузы (сек) по типу блока; дальше экспонента 2^n и джиттер.
 BLOCK_BASE_WAIT = {
-    "rate_limit": 120.0,   # 403 {"too-many-requests": …} — лёгкий троттлинг
-    "challenge": 300.0,    # 439 «проверка безопасности»
-    "ip_block": 900.0,     # 429 / HTML «Доступ ограничен: проблема с IP»
+    "rate_limit": 30.0,   # 403 {"too-many-requests": …} — лёгкий троттлинг
+    "challenge": 45.0,    # 439 «проверка безопасности»
+    "ip_block": 60.0,     # 429 / 403 «Доступ ограничен: проблема с IP»
 }
-BLOCK_MAX_WAIT = 6 * 3600.0
+BLOCK_MAX_WAIT = 1800.0
 
 BROWSER_HEADERS = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -114,9 +114,9 @@ class AvitoBlock(Exception):
         self.retry_after = retry_after
 
     def suggested_wait(self, consecutive: int) -> float:
-        base = self.retry_after if self.retry_after else BLOCK_BASE_WAIT.get(self.kind, 300.0)
+        base = self.retry_after if self.retry_after else BLOCK_BASE_WAIT.get(self.kind, 45.0)
         wait = min(base * (2 ** max(0, consecutive)), BLOCK_MAX_WAIT)
-        return wait + random.uniform(15.0, 60.0)
+        return wait + random.uniform(5.0, 15.0)
 
 
 class AvitoHttpError(RuntimeError):
