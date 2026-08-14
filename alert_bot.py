@@ -113,6 +113,16 @@ async def start_cmd(m: types.Message):
                 logger.error("Ошибка проверки токена привязки: %s", exc)
         
         if main_user_id is None:
+            existing_bindings = _load_bindings()
+            if str(m.chat.id) in existing_bindings or m.chat.id in existing_bindings.values():
+                await m.answer(
+                    "✅ <b>Оповещения уже подключены</b>\n\n"
+                    "Этот чат привязан для получения уведомлений. Все новые объявления по вашим поискам приходят сюда.",
+                    reply_markup=SUPPORT_KB,
+                    disable_web_page_preview=True,
+                )
+                return
+
             await m.answer(
                 "<b>Оповещения Avito</b>\n\n"
                 "Откройте основной бот и нажмите кнопку подключения оповещений.",

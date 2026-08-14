@@ -1558,8 +1558,6 @@ class App:
 
     # ===== работа с привязками main_user_id -> alert_chat_id
     def _load_bindings(self) -> Dict[str, int]:
-        if not os.path.exists(self.bindings_file):
-            return {}
         try:
             data = load_state(self.bindings_file, {}) or {}
             return {str(k): int(v) for k, v in data.items()}
@@ -1694,8 +1692,6 @@ class App:
 
     # ===== антидубликаты per-user + global =====
     def _load_sent(self) -> Dict[str, Dict[str, float]]:
-        if not os.path.exists(self.sent_file):
-            return {}
         try:
             data = load_state(self.sent_file, {}) or {}
             out: Dict[str, Dict[str, float]] = {}
