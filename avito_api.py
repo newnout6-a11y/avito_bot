@@ -277,13 +277,13 @@ _spfa_lock = threading.Lock()
 
 
 def invalidate_cached_api_url(url: str, cache_file: str) -> None:
-    from storage import update_json
+    from storage import update_state
 
     def remove(data: Any) -> None:
         if isinstance(data, dict):
             data.pop(url, None)
 
-    update_json(cache_file, {}, remove)
+    update_state(cache_file, {}, remove)
 
 
 def _ensure_sort_date(api_url: str) -> str:
@@ -305,11 +305,11 @@ def convert_url_to_api(url: str, cache_file: str, timeout: float = 25.0) -> Opti
     if is_valid_api_url(url):
         return _ensure_sort_date(url)
 
-    from storage import load_json, save_json  # локальный импорт, чтобы не тянуть при тестах парсера
+    from storage import load_state, save_state  # локальный импорт, чтобы не тянуть при тестах парсера
 
     cache: Dict[str, str] = {}
     try:
-        raw = load_json(cache_file, {}) or {}
+        raw = load_state(cache_file, {}) or {}
         if isinstance(raw, dict):
             cache = {str(k): str(v) for k, v in raw.items()}
     except Exception as exc:
@@ -341,7 +341,7 @@ def convert_url_to_api(url: str, cache_file: str, timeout: float = 25.0) -> Opti
                 return None
             cache[url] = api_url
             try:
-                save_json(cache_file, cache)
+                save_state(cache_file, cache)
             except Exception as exc:
                 logger.warning("Не удалось сохранить кэш API URL: %s", exc)
             return api_url

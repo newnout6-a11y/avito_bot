@@ -12,7 +12,8 @@ import avito_monitor_bot as appmod
 import avito_monitoring as monitoring
 import alert_bot
 import avito_api
-from storage import load_json, update_json
+from storage import load_json, load_state, update_json, update_state
+from avito_accounts import AccountService, LicenseManager
 
 
 class FakeBot:
@@ -420,6 +421,36 @@ class RegressionTests(unittest.TestCase):
 
             self.assertEqual(load_json(path, {}), {"restored": True})
             self.assertFalse(Path(lock_path).exists())
+
+    def test_sqlite_state_updates_are_transactional(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "state.sqlite3")
+            with patch.dict(os.environ, {"STORAGE_BACKEND": "sqlite", "DATABASE_FILE": db_path}):
+                update_state("sqlite_test_accounts.json", {}, lambda data: data.__setitem__("first", 1))
+                update_state("sqlite_test_accounts.json", {}, lambda data: data.__setitem__("second", 2))
+                self.assertEqual(load_state("sqlite_test_accounts.json", {}), {"first": 1, "second": 2})
+                self.assertTrue(Path(db_path).exists())
+
+    def test_account_service_redeems_key_once_and_restores_license(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = AccountService(
+                LicenseManager(),
+                accounts_file=str(Path(tmp) / "accounts.json"),
+                keys_file=str(Path(tmp) / "keys.json"),
+            )
+            key = service.issue_key(hours=1)
+            redeemed = service.redeem_key(key)
+            self.assertIsNotNone(redeemed)
+            self.assertIsNone(service.redeem_key(key))
+            service.register_if_needed(42)
+            service.add_key(42, key, redeemed[0], redeemed[1])
+            restored = AccountService(
+                LicenseManager(),
+                accounts_file=service.accounts_file,
+                keys_file=service.keys_file,
+            )
+            restored._restore_licenses()
+            self.assertTrue(restored.license.is_active(42))
 
     def test_alert_binding_token_is_one_time(self):
         with tempfile.TemporaryDirectory() as tmp:

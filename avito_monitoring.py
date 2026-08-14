@@ -45,7 +45,7 @@ from avito_settings import (
     START_STRICT,
     SUBSCRIPTIONS_FILE,
 )
-from storage import load_json, save_json
+from storage import load_state, save_state
 
 logger = logging.getLogger(__name__)
 
@@ -507,11 +507,11 @@ class WatcherManager:
             for subscriptions in self.subs_by_user.values()
             for sub in subscriptions
         ]
-        save_json(self.subscriptions_file, rows)
+        save_state(self.subscriptions_file, rows)
 
     async def restore(self) -> None:
         try:
-            rows = load_json(self.subscriptions_file, [])
+            rows = load_state(self.subscriptions_file, [])
         except (OSError, ValueError, TypeError) as exc:
             logger.error("Не удалось восстановить подписки: %s", exc)
             return
@@ -538,3 +538,10 @@ class WatcherManager:
                 logger.warning("Пропущена поврежденная подписка: %s", exc)
         for watcher in self.watchers.values():
             await watcher.start()
+
+    async def close(self) -> None:
+        """Stop all polling workers and release their HTTP sessions."""
+        watchers = list(self.watchers.values())
+        self.watchers.clear()
+        for watcher in watchers:
+            await watcher.stop()

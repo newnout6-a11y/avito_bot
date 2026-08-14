@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse, urlu
 from bs4.element import Tag
 
 from avito_settings import DISPLAY_TZ_NAME, DISPLAY_TZ_OFFSET_MIN
+from avito_accounts import LicenseManager
 
 try:
     from zoneinfo import ZoneInfo
@@ -48,25 +49,6 @@ def _br(text: str) -> str:
     value = text or ""
     value = value.replace("<br/>", "\n").replace("<br />", "\n").replace("<br>", "\n")
     return value.replace("\\n", "\n")
-
-
-class LicenseManager:
-    def __init__(self):
-        self._expires: Dict[int, float] = {}
-
-    def activate_for(self, user_id: int, hours: int = 24):
-        self._expires[user_id] = time.time() + hours * 3600
-
-    def activate_until(self, user_id: int, expires_ts: float):
-        self._expires[user_id] = float(expires_ts)
-
-    def is_active(self, user_id: int) -> bool:
-        expires_ts = self._expires.get(user_id)
-        return expires_ts is not None and expires_ts > time.time()
-
-    def expiry_dt(self, user_id: int) -> Optional[datetime]:
-        expires_ts = self._expires.get(user_id)
-        return datetime.fromtimestamp(expires_ts, _tz()) if expires_ts else None
 
 
 @dataclass

@@ -14,7 +14,7 @@ from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from storage import load_json, save_json, update_json
+from storage import load_state, save_state, update_state
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -45,18 +45,12 @@ def _consume_link_token(token: str):
         if record and float(record.get("expires", 0)) >= time.time():
             return int(record["user_id"])
         return None
-    return update_json(ALERT_LINKS_FILE, {}, consume)
+    return update_state(ALERT_LINKS_FILE, {}, consume)
 
 def _load_bindings():
     """Безопасная загрузка привязок"""
     try:
-        if not os.path.exists(BINDINGS_FILE):
-            logger.info(f"Файл привязок {BINDINGS_FILE} не существует, создаем пустой")
-            # Создаем пустой файл
-            _save_bindings({})
-            return {}
-        
-        raw_data = load_json(BINDINGS_FILE, {})
+        raw_data = load_state(BINDINGS_FILE, {})
         if not raw_data:
             logger.info("Данные привязок пустые")
             return {}
@@ -94,7 +88,7 @@ def _save_bindings(data):
                 continue
         
         # Сохраняем с блокировкой
-        save_json(BINDINGS_FILE, save_data)
+        save_state(BINDINGS_FILE, save_data)
         
         logger.info("Сохранено привязок: %s", len(save_data))
         
@@ -129,7 +123,7 @@ async def start_cmd(m: types.Message):
         def bind(data):
             data[str(main_user_id)] = int(m.chat.id)
             return dict(data)
-        update_json(BINDINGS_FILE, {}, bind)
+        update_state(BINDINGS_FILE, {}, bind)
         
         logger.info(f"Создана привязка: main_user_id={main_user_id} -> alert_chat_id={m.chat.id}")
         
@@ -250,3 +244,7 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Неожиданная ошибка: {e}")
         print(f"НЕОЖИДАННАЯ ОШИБКА: {e}")
+
+
+def run() -> None:
+    asyncio.run(main())
