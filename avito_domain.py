@@ -296,10 +296,14 @@ AVITO_COLORS = {
 }
 
 AVITO_SORTS = {
-    "104": "По дате (новые)",
+    "104": "По дате",
     "101": "По умолчанию",
     "1": "Дешевле",
     "2": "Дороже",
+    "date": "По дате",
+    "default": "По умолчанию",
+    "price_asc": "Дешевле",
+    "price_desc": "Дороже",
 }
 
 _TRANSLIT_RULES = (
@@ -360,7 +364,10 @@ def extract_url_metadata(url_str: str) -> dict[str, object]:
 
     qs = parse_qs(parsed.query)
     delivery = qs.get("cd", ["0"])[0] == "1"
-    sort_title = AVITO_SORTS.get(qs.get("s", [""])[0])
+    sort_value = str((qs.get("s") or qs.get("sort") or [""])[0]).casefold()
+    sort_title = AVITO_SORTS.get(sort_value)
+    if sort_title is None:
+        sort_title = f"Неизвестная ({sort_value})" if sort_value else "По умолчанию"
 
     return {
         "location": loc,
@@ -413,6 +420,8 @@ class Ad:
     location: str = ""
     date_str: str = ""
     published_ts: Optional[float] = None
+    published_exact: bool = False
+    is_promoted: bool = False
     description: str = ""
     image_url: Optional[str] = None
     seller_name: Optional[str] = None

@@ -85,6 +85,8 @@ class Watcher:
         self.route_resolver = route_resolver or DefaultApiRouteResolver(API_URLS_FILE)
         self._enrich_cache: set[str] = set()
         self._api_url: Optional[str] = None
+        self._api_route_managed = False
+        self._skip_initial_poll = False
         self._blocked_until = 0.0
         self._consecutive_blocks = 0
         self.last_http_status: Optional[int] = None
@@ -230,10 +232,14 @@ class Watcher:
             if badges:
                 price_line += " " + " ".join(badges)
             lines.append(price_line)
-        if ad.date_str:
+        if ad.published_exact and ad.published_ts:
+            lines.append("🗓 " + _fmt_dt(ad.published_ts))
+        elif ad.date_str:
             lines.append("🗓 " + html.escape(ad.date_str))
         elif ad.published_ts:
             lines.append("🗓 " + _fmt_dt(ad.published_ts))
+        if ad.is_promoted:
+            lines.append("📣 Продвинуто")
         if ad.seller_name:
             icon = "🏪" if "магазин" in ad.seller_name.lower() else "👤"
             lines.append(f"{icon} {html.escape(ad.seller_name)}")
@@ -253,6 +259,67 @@ class Watcher:
             return
         await asyncio.to_thread(invalidate_cached_api_url, self.url, API_URLS_FILE)
 
+    async def _fetch_api_fallback(self) -> Optional[List[Ad]]:
+        """Use the JSON endpoint only when the primary HTML request failed."""
+        if not self._api_url:
+            self.conversion_status = "pending"
+            self.conversion_error = None
+            try:
+                route = await asyncio.to_thread(self.route_resolver.resolve, self.url)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.conversion_status = "retry"
+                self.conversion_error = str(exc)
+                logger.warning(
+                    "[Мониторинг] Не удалось получить резервный API-маршрут для %s: %s",
+                    self.search_key[:40],
+                    exc,
+                )
+                return None
+            if not route:
+                self.conversion_status = "retry"
+                self.conversion_error = "API-маршрут не найден"
+                return None
+            self._api_url = route
+            self._api_route_managed = True
+
+        try:
+            payload = await asyncio.to_thread(self._client.get_items, self._api_url)
+        except asyncio.CancelledError:
+            raise
+        except Exception as api_error:
+            self.last_http_status = getattr(api_error, "status", self._client.last_status)
+            self.last_block_kind = getattr(api_error, "kind", None)
+            self.conversion_status = "retry"
+            self.conversion_error = str(api_error)
+            if self._api_route_managed:
+                try:
+                    await self._invalidate_api_route(str(api_error))
+                except Exception as cache_error:
+                    logger.warning("Could not invalidate API route: %s", cache_error)
+            self._api_url = None
+            self._api_route_managed = False
+            raise
+
+        parsed = parse_api_feed(payload, limit=50)
+        self.parser_warnings = tuple(parsed.warnings)
+        if parsed.schema_mismatch:
+            self.parser_health = "schema_mismatch"
+            self.conversion_status = "retry"
+            self.conversion_error = "; ".join(parsed.warnings)
+            await self._invalidate_api_route(self.conversion_error)
+            self._api_url = None
+            self._api_route_managed = False
+            return None
+        if not parsed.items:
+            return None
+        self.last_http_status = self._client.last_status
+        self.parser_health = "warning" if parsed.warnings else "ok"
+        self.conversion_status = "ready"
+        self.conversion_error = None
+        return [Ad(**item) for item in parsed.items]
+
     async def _fetch_ads(self) -> Optional[List[Ad]]:
         """Fetch the feed with per-watcher and shared-route cooldowns."""
         now = time.monotonic()
@@ -269,40 +336,45 @@ class Watcher:
             max_attempts = max(max_attempts, 2)
         for attempt in range(max_attempts):
             try:
+                primary_error: Optional[Exception] = None
                 await self._wait_global_rate_limit()
-                # 1. Если задан _api_url, пробуем JSON API
-                if self._api_url:
-                    payload = await asyncio.to_thread(self._client.get_items, self._api_url)
-                    self.last_http_status = self._client.last_status
-                    self._consecutive_blocks = 0
-                    self.last_block_kind = None
-                    parsed = parse_api_feed(payload, limit=20)
-                    self.parser_warnings = tuple(parsed.warnings)
-                    if parsed.schema_mismatch:
-                        self.parser_health = "schema_mismatch"
-                        self.conversion_status = "retry"
-                        self.conversion_error = "; ".join(parsed.warnings)
-                        try:
-                            await self._invalidate_api_route(self.conversion_error)
-                        except Exception as cache_error:
-                            logger.warning("Could not invalidate schema-mismatched route: %s", cache_error)
-                        self._api_url = None
-                    elif parsed.items:
-                        self.parser_health = "warning" if parsed.warnings else "ok"
-                        self.conversion_status = "ready"
-                        self.conversion_error = None
-                        return [Ad(**item) for item in parsed.items]
-
-                # 2. Прямой HTML-парсинг выдачи Avito (Safari impersonation)
-                raw_items = await asyncio.to_thread(self._client.get_search_page_items, self.url, 50)
+                try:
+                    raw_items = await asyncio.to_thread(
+                        self._client.get_search_page_items,
+                        self.url,
+                        50,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    primary_error = exc
+                    raw_items = []
                 if raw_items:
                     self.last_http_status = self._client.last_status
                     self._consecutive_blocks = 0
                     self.last_block_kind = None
+                    self.parser_health = "ok"
+                    self.parser_warnings = ()
                     self.conversion_status = "ready"
                     self.conversion_error = None
                     return [Ad(**item) for item in raw_items]
 
+                await self._wait_global_rate_limit()
+                try:
+                    fallback_items = await self._fetch_api_fallback()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as fallback_error:
+                    if primary_error is None:
+                        primary_error = fallback_error
+                else:
+                    if fallback_items:
+                        self._consecutive_blocks = 0
+                        self.last_block_kind = None
+                        return fallback_items
+
+                if primary_error is not None:
+                    raise primary_error
                 return None
             except AvitoBlock as block:
                 blocked_route = self._route_key()
@@ -319,7 +391,7 @@ class Watcher:
                 return None
             except AvitoHttpError as error:
                 self.last_http_status = error.status
-                if error.status in (400, 404, 410, 422):
+                if error.status in (400, 404, 410, 422) and self._api_url:
                     try:
                         await self._invalidate_api_route(str(error))
                     except Exception as cache_error:
@@ -327,7 +399,7 @@ class Watcher:
                     self._api_url = None
                     self.conversion_status = "retry"
                     self.conversion_error = str(error)
-                logger.error("Avito API error for %s: %s", self.url, error)
+                logger.error("Avito HTTP error for %s: %s", self.url, error)
                 self._blocked_until = time.monotonic() + min(60.0, self.interval_min)
                 Watcher._route_blocked_until[self._route_key()] = self._blocked_until
                 return None
@@ -364,6 +436,7 @@ class Watcher:
         to_prime = ads[:limit] if limit is not None else ads
         for ad in to_prime:
             self.seen[ad.ad_id] = time.time()
+        self._skip_initial_poll = True
         logger.info("[Мониторинг] Инициализация %s завершена: запомнено %d объявлений, запущен мониторинг новых", name_hint, len(self.seen))
 
     @staticmethod
@@ -404,6 +477,9 @@ class Watcher:
         sub_names = [s.name or f"Поиск #{s.id}" for s in self.subscribers.values()]
         name_hint = ", ".join(f"«{n}»" for n in sub_names) if sub_names else self.search_key[:40]
         logger.info("[Мониторинг] Фоновый процесс активен для %s (интервал: ~%d сек)", name_hint, int(self._interval))
+        if self._skip_initial_poll:
+            self._skip_initial_poll = False
+            await asyncio.sleep(max(1.0, self._interval) * random.uniform(0.9, 1.1))
         while self.has_subscribers():
             found_new = False
             sub_names = [s.name or f"Поиск #{s.id}" for s in self.subscribers.values()]
@@ -430,6 +506,16 @@ class Watcher:
                         if not app.license.is_active(sub.user_id):
                             logger.info("Пропуск %s для user=%s: лицензия неактивна", ad.ad_id, sub.user_id)
                             continue
+                        if sub.only_new and START_STRICT and (
+                            not ad.published_exact or ad.published_ts is None
+                        ):
+                            logger.info(
+                                "Пропуск %s (%s) для sub=%s: нет точного времени публикации",
+                                ad.ad_id,
+                                ad.title,
+                                sub.id,
+                            )
+                            continue
                         if (
                             sub.only_new
                             and START_STRICT
@@ -437,10 +523,12 @@ class Watcher:
                             and ad.published_ts + START_GRACE_SEC < sub.started_ts
                         ):
                             logger.info(
-                                "Пропуск %s (%s) для sub=%s: старое объявление (дата: %s, поиск запущен: %s)",
+                                "Пропуск %s (%s) для sub=%s: старое%s объявление "
+                                "(дата: %s, поиск запущен: %s)",
                                 ad.ad_id,
                                 ad.title,
                                 sub.id,
+                                " продвинутое" if ad.is_promoted else "",
                                 ad.date_str or _fmt_dt(ad.published_ts),
                                 _fmt_dt(sub.started_ts),
                             )

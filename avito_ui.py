@@ -43,6 +43,7 @@ from avito_domain import (
     _fmt_dt,
     _parse_price_input,
     avito_short_url,
+    extract_url_metadata,
     normalize_filter,
     parse_avito_url,
 )
@@ -332,7 +333,7 @@ async def _prompt_search_name(
 def _filter_from_data(data: Dict[str, Any]) -> SubscriberFilter:
     return normalize_filter(
         SubscriberFilter(
-            keywords_all=list(data.get("keywords_all") or data.get("guessed_kw") or []),
+            keywords_all=list(data.get("keywords_all", data.get("guessed_kw")) or []),
             keywords_any=list(data.get("keywords_any") or []),
             keywords_stop=list(data.get("keywords_stop") or []),
             price_min=data.get("price_min"),
@@ -401,7 +402,7 @@ async def _continue_after_filter_review(message: types.Message, state: FSMContex
             "Минимальная цена больше максимальной. Введите корректную минимальную цену или «-»."
         )
         return
-    if filters.price_max is None:
+    if filters.price_min is None and filters.price_max is None:
         await state.set_state(SearchWizard.price_min)
         await message.answer(
             "<b>Минимальная цена</b>\nВведите число или «-», если ограничения нет.",
@@ -426,7 +427,7 @@ async def _continue_after_filter_review(message: types.Message, state: FSMContex
     )
 
 
-@wizard_router.message(F.text.in_(["/newsearch"]))
+@wizard_router.message(Command("newsearch"))
 async def wizard_start(message: types.Message, state: FSMContext):
     await state.clear()
     await state.set_state(SearchWizard.url)
@@ -910,6 +911,9 @@ def format_sub_panel(
         ", ".join(html.escape(word) for word in sub.flt.keywords_any) or "не заданы"
     )
     stop = ", ".join(html.escape(word) for word in sub.flt.keywords_stop) or "не заданы"
+    sort_title = html.escape(
+        str(extract_url_metadata(sub.url).get("sort_title") or "По умолчанию")
+    )
     url = html.escape(avito_short_url(sub.url), quote=True)
     access = exp.strftime("%d.%m.%Y %H:%M") if exp else "не активен"
     return (
@@ -920,7 +924,9 @@ def format_sub_panel(
         f"🔤 Обязательные слова: {target}\n"
         f"🔀 Хотя бы одно: {any_words}\n"
         f"🚫 Исключить: {stop}\n"
-        f"🆕 Только новые: <b>{'включено' if sub.only_new else 'выключено'}</b>\n\n"
+        f"↕️ Сортировка Avito: <b>{sort_title}</b>\n"
+        f"🆕 Только новые после запуска: "
+        f"<b>{'включено' if sub.only_new else 'выключено'}</b>\n\n"
         f"📡 API: <b>{_conversion_text(watcher)}</b>\n\n"
         f'🔗 <a href="{url}">Открыть поиск на Avito</a>'
     )
@@ -1490,16 +1496,6 @@ async def account_callback(cq: types.CallbackQuery):
             account_panel_text(app, cq.from_user.id),
             reply_markup=build_account_kb(),
         )
-    await cq.answer()
-
-
-@account_router.callback_query(F.data == "account:close")
-async def account_close(cq: types.CallbackQuery):
-    if isinstance(cq.message, types.Message):
-        try:
-            await cq.message.delete()
-        except Exception:
-            pass
     await cq.answer()
 
 

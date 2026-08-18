@@ -463,9 +463,20 @@ def _ensure_sort_date(api_url: str) -> str:
     """Мониторингу новых нужна сортировка по дате (на сайте это s=104)."""
     parts = urlsplit(api_url)
     query = parse_qsl(parts.query, keep_blank_values=True)
-    if not any(k == "sort" for k, _ in query):
-        query.append(("sort", "date"))
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+    normalized_query: list[tuple[str, str]] = []
+    sort_seen = False
+    for key, value in query:
+        if key == "sort":
+            if not sort_seen:
+                normalized_query.append((key, "date"))
+                sort_seen = True
+            continue
+        normalized_query.append((key, value))
+    if not sort_seen:
+        normalized_query.append(("sort", "date"))
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(normalized_query), parts.fragment)
+    )
 
 
 def _request_api_route(url: str, timeout: float) -> tuple[Optional[str], Optional[str]]:
@@ -555,6 +566,65 @@ class FeedParseResult:
     schema_mismatch: bool = False
 
 
+def _timestamp_seconds(value: Any) -> Optional[float]:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric <= 0:
+        return None
+    return numeric / 1000.0 if numeric > 10_000_000_000 else numeric
+
+
+def _iva_payloads(
+    item: Dict[str, Any],
+    step_name: str,
+    component: str,
+) -> List[Dict[str, Any]]:
+    iva = item.get("iva")
+    entries = iva.get(step_name) if isinstance(iva, dict) else None
+    if not isinstance(entries, list):
+        return []
+    payloads: List[Dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        component_data = entry.get("componentData")
+        if not isinstance(component_data, dict) or component_data.get("component") != component:
+            continue
+        payload = entry.get("payload")
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
+
+
+def _item_date_str(item: Dict[str, Any]) -> str:
+    for payload in _iva_payloads(item, "DateInfoStep", "date-info"):
+        value = _first_str(payload.get("absolute"), payload.get("relative"))
+        if value:
+            return value
+    return ""
+
+
+def _item_description(item: Dict[str, Any]) -> str:
+    direct = item.get("description")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    for payload in _iva_payloads(item, "DescriptionStep", "description"):
+        value = payload.get("description")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _item_is_promoted(item: Dict[str, Any]) -> bool:
+    for payload in _iva_payloads(item, "DateInfoStep", "vas"):
+        vas = payload.get("vas")
+        if isinstance(vas, list) and vas:
+            return True
+    return False
+
+
 def parse_api_feed(payload: Dict[str, Any], limit: int = 20) -> FeedParseResult:
     warnings: List[str] = []
     if limit <= 0:
@@ -601,14 +671,7 @@ def parse_api_feed(payload: Dict[str, Any], limit: int = 20) -> FeedParseResult:
                     break
             except (TypeError, ValueError):
                 continue
-        published_ts: Optional[float] = None
-        sts = item.get("sortTimeStamp")
-        try:
-            numeric_ts = float(sts)
-        except (TypeError, ValueError):
-            numeric_ts = 0.0
-        if numeric_ts > 0:
-            published_ts = numeric_ts / 1000.0 if numeric_ts > 10_000_000_000 else numeric_ts
+        published_ts = _timestamp_seconds(item.get("sortTimeStamp"))
         location = ""
         for candidate in (item.get("geo"), item.get("addressDetailed"), item.get("location")):
             if isinstance(candidate, str):
@@ -617,11 +680,21 @@ def parse_api_feed(payload: Dict[str, Any], limit: int = 20) -> FeedParseResult:
                 location = _first_str(candidate.get("name"), candidate.get("title"), candidate.get("formattedAddress"), candidate.get("locationName"))
             if location:
                 break
-        ads.append({"ad_id": str(ad_id), "url": url, "title": str(title), "price": price,
-                    "location": location, "date_str": "", "published_ts": published_ts,
-                    "description": str(item.get("description") or ""), "image_url": _item_image(item),
-                    "seller_id": str(item["sellerId"]) if item.get("sellerId") else None,
-                    "is_verified": bool(item.get("isVerifiedItem"))})
+        ads.append({
+            "ad_id": str(ad_id),
+            "url": url,
+            "title": str(title),
+            "price": price,
+            "location": location,
+            "date_str": _item_date_str(item),
+            "published_ts": published_ts,
+            "published_exact": published_ts is not None,
+            "is_promoted": _item_is_promoted(item),
+            "description": _item_description(item),
+            "image_url": _item_image(item),
+            "seller_id": str(item["sellerId"]) if item.get("sellerId") else None,
+            "is_verified": bool(item.get("isVerifiedItem")),
+        })
         if len(ads) >= limit:
             break
     if raw_items and not ads:
@@ -634,7 +707,7 @@ def parse_api_items(payload: Dict[str, Any], limit: int = 20) -> List[Dict[str, 
     """
     JSON API Авито -> список словарей с ключами под dataclass Ad:
     ad_id, url, title, price, location, date_str, published_ts,
-    description, image_url, seller_id, is_verified.
+    published_exact, is_promoted, description, image_url, seller_id, is_verified.
     """
     return parse_api_feed(payload, limit).items
 
@@ -670,11 +743,30 @@ def parse_relative_date(text: str, now: Optional[float] = None) -> Optional[floa
     m_time = re.search(r"(сегодня|вчера)\s+в\s+(\d{1,2}):(\d{2})", s)
     if m_time:
         day_word, hh, mm = m_time.groups()
-        dt = datetime.now()
+        dt = datetime.fromtimestamp(now)
         if day_word == "вчера":
             dt -= timedelta(days=1)
         dt = dt.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
         return dt.timestamp()
+    return None
+
+
+def _embedded_catalog(soup: BeautifulSoup) -> Optional[Dict[str, Any]]:
+    for script in soup.find_all("script"):
+        body = script.string or script.get_text() or ""
+        if '"catalog"' not in body or '"sortTimeStamp"' not in body:
+            continue
+        try:
+            state = json.loads(body)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(state, dict):
+            continue
+        loader_data = state.get("loaderData")
+        data = loader_data.get("data") if isinstance(loader_data, dict) else None
+        catalog = data.get("catalog") if isinstance(data, dict) else None
+        if isinstance(catalog, dict) and isinstance(catalog.get("items"), list):
+            return catalog
     return None
 
 
@@ -685,11 +777,16 @@ def parse_html_feed(html_text: str, limit: int = 50) -> List[Dict[str, Any]]:
     if not html_text:
         return []
     soup = BeautifulSoup(html_text, "html.parser")
+    catalog = _embedded_catalog(soup)
+    if catalog is not None:
+        parsed = parse_api_feed({"catalog": catalog}, limit=limit)
+        if parsed.items:
+            return parsed.items
+
     items_elements = soup.select('[data-marker="item"]')
     if not items_elements:
         items_elements = soup.select('div[itemprop="itemListElement"]')
     ads: List[Dict[str, Any]] = []
-    now = time.time()
     for item in items_elements[:limit]:
         item_id = item.get("data-item-id") or item.get("id")
         title_el = item.select_one('[itemprop="name"], [data-marker="item-title"]')
@@ -717,7 +814,7 @@ def parse_html_feed(html_text: str, limit: int = 50) -> List[Dict[str, Any]]:
         description = desc_el.get_text(strip=True) if desc_el else ""
         date_el = item.select_one('[data-marker="item-date"]')
         date_str = date_el.get_text(strip=True) if date_el else ""
-        published_ts = parse_relative_date(date_str, now)
+        published_ts = parse_relative_date(date_str)
         loc_el = item.select_one('[class*="geo"], [data-marker="item-address"]')
         location = loc_el.get_text(strip=True) if loc_el else ""
         ads.append({
@@ -728,6 +825,8 @@ def parse_html_feed(html_text: str, limit: int = 50) -> List[Dict[str, Any]]:
             "location": location,
             "date_str": date_str,
             "published_ts": published_ts,
+            "published_exact": False,
+            "is_promoted": False,
             "description": description,
             "image_url": image_url,
             "seller_id": None,
