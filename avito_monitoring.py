@@ -3,6 +3,7 @@
 import asyncio
 import html
 import logging
+import os
 import random
 import re
 import time
@@ -79,6 +80,7 @@ class Watcher:
         self._client = AvitoHttpClient(
             proxy=self._proxy(),
             proxy_change_url=self._proxy_change_url(),
+            cookie_store=self._cookie_store_path(),
         )
         self._client_closed = False
         self.on_deliver = on_deliver
@@ -103,6 +105,7 @@ class Watcher:
             self._client = AvitoHttpClient(
                 proxy=self._proxy(),
                 proxy_change_url=self._proxy_change_url(),
+                cookie_store=self._cookie_store_path(),
             )
             self._client_closed = False
         if PRIME_ON_START:
@@ -131,6 +134,13 @@ class Watcher:
 
     def _proxy(self) -> Optional[str]:
         return AVITO_PROXIES[self._proxy_index] if AVITO_PROXIES else None
+
+    def _cookie_store_path(self) -> str:
+        """Cookie store per route (proxy): одна «личность» на канал выхода."""
+        route = self._route_key()
+        slug = re.sub(r"[^a-z0-9]+", "_", route.lower())[:48] or "direct"
+        data_dir = os.getenv("DATABASE_FILE", os.path.join("data", "avito_monitor.sqlite3"))
+        return os.path.join(os.path.dirname(data_dir) or "data", f"cookies_{slug}.json")
 
     def _route_key(self) -> str:
         return self._proxy() or "direct"

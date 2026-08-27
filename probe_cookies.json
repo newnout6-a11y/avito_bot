@@ -1,0 +1,237 @@
+{
+  "steps": [
+    {
+      "label": "home",
+      "cookies": [
+        "_avisc",
+        "gMltIuegZN2COuSe",
+        "h_u",
+        "selected_locale",
+        "srv_id",
+        "u",
+        "v"
+      ],
+      "status": 200,
+      "set_cookie_names": [
+        "srv_id",
+        "23-Aug-2043 16:40:57 GMT; HttpOnly; Max-Age",
+        "gMltIuegZN2COuSe",
+        "28-Aug-26 16:40:57 GMT; HttpOnly; Max-Age",
+        "_avisc",
+        "27-Aug-26 16:41:57 GMT; HttpOnly; Max-Age",
+        "u",
+        "23-Aug-2043 16:40:57 GMT; HttpOnly; Max-Age",
+        "v",
+        "27-Aug-26 17:10:57 GMT; HttpOnly; Max-Age",
+        "h_u",
+        "23-Aug-2043 16:40:57 GMT; HttpOnly; Max-Age",
+        "v",
+        "27 Aug 2026 17:10:57 GMT; HttpOnly; Secure; SameSite",
+        "selected_locale",
+        "selected_locale"
+      ]
+    },
+    {
+      "label": "api_first",
+      "cookies": [
+        "_avisc",
+        "gMltIuegZN2COuSe",
+        "h_u",
+        "pow_challenge",
+        "selected_locale",
+        "srv_id",
+        "u",
+        "v"
+      ],
+      "status": 439,
+      "set_cookie_names": [
+        "pow_challenge",
+        "27-Aug-26 16:46:00 GMT; Max-Age"
+      ]
+    },
+    {
+      "label": "after_pow_solve",
+      "cookies": [
+        "_adcc",
+        "_avisc",
+        "gMltIuegZN2COuSe",
+        "h_u",
+        "pow_challenge",
+        "pow_solved",
+        "selected_locale",
+        "srv_id",
+        "u",
+        "v"
+      ]
+    },
+    {
+      "label": "api_retry",
+      "cookies": [
+        "_adcc",
+        "_avisc",
+        "buyer_location_id",
+        "gMltIuegZN2COuSe",
+        "h_u",
+        "luri",
+        "pow_challenge",
+        "pow_solved",
+        "selected_locale",
+        "srv_id",
+        "sx",
+        "u",
+        "v"
+      ],
+      "status": 200,
+      "set_cookie_names": [
+        "_adcc",
+        "28-Aug-26 16:41:03 GMT; HttpOnly; Max-Age",
+        "v",
+        "27-Aug-26 17:11:03 GMT; HttpOnly; Max-Age",
+        "buyer_location_id",
+        "27 Aug 2027 16:41:03 GMT; Max-Age",
+        "luri",
+        "28 Aug 2026 16:41:03 GMT; Max-Age",
+        "sx",
+        "03 Sep 2026 16:41:03 GMT; Max-Age"
+      ]
+    },
+    {
+      "label": "api_immediately_again",
+      "cookies": [
+        "_adcc",
+        "_avisc",
+        "buyer_location_id",
+        "gMltIuegZN2COuSe",
+        "h_u",
+        "luri",
+        "pow_challenge",
+        "pow_solved",
+        "selected_locale",
+        "srv_id",
+        "sx",
+        "u",
+        "v"
+      ],
+      "status": 200,
+      "set_cookie_names": [
+        "_adcc",
+        "28-Aug-26 16:41:06 GMT; HttpOnly; Max-Age",
+        "v",
+        "27-Aug-26 17:11:06 GMT; HttpOnly; Max-Age",
+        "buyer_location_id",
+        "27 Aug 2027 16:41:06 GMT; Max-Age",
+        "sx",
+        "03 Sep 2026 16:41:06 GMT; Max-Age"
+      ]
+    },
+    {
+      "label": "search_page_html",
+      "cookies": [
+        "_adcc",
+        "_avisc",
+        "buyer_location_id",
+        "gMltIuegZN2COuSe",
+        "h_u",
+        "luri",
+        "pow_challenge",
+        "pow_solved",
+        "selected_locale",
+        "srv_id",
+        "sx",
+        "u",
+        "v"
+      ],
+      "status": 200,
+      "set_cookie_names": [
+        "_adcc",
+        "28-Aug-26 16:41:10 GMT; HttpOnly; Max-Age",
+        "v",
+        "27-Aug-26 17:11:10 GMT; HttpOnly; Max-Age",
+        "v",
+        "27 Aug 2026 17:11:10 GMT; HttpOnly; Secure; SameSite",
+        "selected_locale",
+        "selected_locale"
+      ]
+    }
+  ],
+  "cookie_detail": {
+    "srv_id": {
+      "value_len": 134,
+      "domain": ".avito.ru",
+      "path": "/",
+      "expires": 1822408860
+    },
+    "gMltIuegZN2COuSe": {
+      "value_len": 32,
+      "domain": ".avito.ru",
+      "path": "/",
+      "expires": 1787935260
+    },
+    "_avisc": {
+      "value_len": 44,
+      "domain": ".avito.ru",
+      "path": "/",
+      "expires": 1787848920
+    },
+    "u": {
+      "value_len": 28,
+      "domain": ".avito.ru",
+      "path": "/",
+      "expires": 1822408860
+    },
+    "h_u": {
+      "value_len": 27,
+      "domain": ".avito.ru",
+      "path": "/",
+      "expires": 1822408860
+    },
+    "v": {
+      "value_len": 10,
+      "domain": ".avito.ru",
+      "path": "/",
+      "expires": 1787850672
+    },
+    "selected_locale": {
+      "value_len": 5,
+      "domain": ".avito.ru",
+      "path": "/",
+      "expires": null
+    },
+    "pow_challenge": {
+      "value_len": 158,
+      "domain": ".avito.ru",
+      "path": "/",
+      "expires": 1787849162
+    },
+    "_adcc": {
+      "value_len": 158,
+      "domain": ".avito.ru",
+      "path": "/",
+      "expires": 1787935272
+    },
+    "pow_solved": {
+      "value_len": 1,
+      "domain": ".avito.ru",
+      "path": "/",
+      "expires": null
+    },
+    "buyer_location_id": {
+      "value_len": 6,
+      "domain": ".avito.ru",
+      "path": "/",
+      "expires": 1819384869
+    },
+    "luri": {
+      "value_len": 3,
+      "domain": ".avito.ru",
+      "path": "/",
+      "expires": 1787935266
+    },
+    "sx": {
+      "value_len": 148,
+      "domain": ".avito.ru",
+      "path": "/",
+      "expires": 1788453669
+    }
+  }
+}

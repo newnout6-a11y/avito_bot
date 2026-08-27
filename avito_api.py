@@ -27,6 +27,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Protocol
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
@@ -43,12 +44,15 @@ SPFA_MIN_INTERVAL_SEC = 31.0  # у SPFA лимит ~2 преобразовани
 API_ROUTE_TTL_SEC = 7 * 24 * 3600
 
 # Базовые паузы (сек) по типу блока; дальше экспонента 2^n и джиттер.
+# ip_block: реальный 429-бан Avito держится 30–60+ минут (проверено живьём
+# 08.2026: через 15 мин после серии ~30 запросов бан всё ещё активен),
+# поэтому база 20 минут, а не минута — долбить в бан только продлевает его.
 BLOCK_BASE_WAIT = {
-    "rate_limit": 30.0,   # 403 {"too-many-requests": …} — лёгкий троттлинг
-    "challenge": 45.0,    # 439 «проверка безопасности»
-    "ip_block": 60.0,     # 429 / 403 «Доступ ограничен: проблема с IP»
+    "rate_limit": 30.0,     # 403 {"too-many-requests": …} — лёгкий троттлинг
+    "challenge": 45.0,      # 439 «проверка безопасности» (решается PoW отдельно)
+    "ip_block": 1200.0,     # 429 / 403 «Доступ ограничен: проблема с IP» — 20 мин база
 }
-BLOCK_MAX_WAIT = 1800.0
+BLOCK_MAX_WAIT = 7200.0
 
 BROWSER_HEADERS = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -165,14 +169,16 @@ class AvitoHttpClient:
     """
 
     def __init__(self, proxy: Optional[str] = None, proxy_change_url: Optional[str] = None,
-                 timeout: float = 15.0):
+                 timeout: float = 15.0, cookie_store: Optional[str] = None):
         self.proxy = proxy
         self.proxy_change_url = proxy_change_url
         self.timeout = timeout
+        self.cookie_store = cookie_store
         self.warmed_at = 0.0
         self.last_status: Optional[int] = None
         self.total_ok = 0
         self.total_blocked = 0
+        self.cookies_loaded = 0
         self._session = self._build_session()
 
     # ----- внутреннее -----
@@ -183,14 +189,78 @@ class AvitoHttpClient:
             kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
         session = curl_requests.Session(**kwargs)
         session.headers.update(BROWSER_HEADERS)
+        if self.cookie_store:
+            self._load_cookies(session)
         return session
+
+    # ----- cookie persistence: репутация сессии живёт между запусками -----
+
+    def _load_cookies(self, session: "curl_requests.Session") -> int:
+        """Загрузить сохранённые cookies в сессию. Возвращает число загруженных."""
+        try:
+            with open(self.cookie_store, "r", encoding="utf-8") as f:  # type: ignore[arg-type]
+                entries = json.load(f)
+        except FileNotFoundError:
+            return 0
+        except Exception as exc:
+            logger.warning("Cookie store %s: не читается: %s", self.cookie_store, exc)
+            return 0
+        now = time.time()
+        loaded = 0
+        for entry in entries:
+            try:
+                expires = entry.get("expires")
+                if expires and 0 < expires < now:
+                    continue  # истекшая кука не восстанавливаем
+                session.cookies.set(
+                    entry["name"], entry["value"],
+                    domain=entry.get("domain", ".avito.ru"),
+                    path=entry.get("path", "/"),
+                )
+                loaded += 1
+            except Exception:
+                continue
+        if loaded:
+            logger.info("Cookie store: восстановлено %d cookies из %s", loaded, self.cookie_store)
+        self.cookies_loaded = loaded
+        return loaded
+
+    def save_cookies(self) -> int:
+        """Сериализовать текущий jar в store. Вызывается после успешных ответов."""
+        if not self.cookie_store:
+            return 0
+        entries = []
+        try:
+            for c in self._session.cookies.jar:
+                entries.append({
+                    "name": c.name, "value": c.value, "domain": c.domain,
+                    "path": c.path, "expires": c.expires,
+                })
+        except Exception as exc:
+            logger.warning("Cookie store: не удалось снять cookies: %s", exc)
+            return 0
+        try:
+            store_path = Path(self.cookie_store)
+            store_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = store_path.with_suffix(store_path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(entries, f, ensure_ascii=False)
+            tmp.replace(store_path)
+            return len(entries)
+        except Exception as exc:
+            logger.warning("Cookie store %s: запись не удалась: %s", self.cookie_store, exc)
+            return 0
 
     @property
     def session(self) -> "curl_requests.Session":
         return self._session
 
     def warmup(self) -> bool:
-        """Прогрев: заходим на главную за cookies (u, _avisc и пр.)."""
+        """Прогрев: заходим на главную за cookies (u, _avisc и пр.).
+        Если cookies уже восстановлены из store — считаем сессию тёплой."""
+        if self.cookies_loaded >= 3:
+            self.warmed_at = time.time()
+            return True
         try:
             r = self._session.get(AVITO_HOME, timeout=self.timeout, allow_redirects=False)
             self.last_status = r.status_code
@@ -209,7 +279,8 @@ class AvitoHttpClient:
         return False
 
     def reset(self) -> None:
-        """Пересоздать сессию (после блока): чистые cookies, новый TLS."""
+        """Пересоздать сессию (после блока): свежий TLS, но сохранённые cookies
+        восстанавливаются из store — репутация не сбрасывается."""
         try:
             self._session.close()
         except Exception:
@@ -323,6 +394,8 @@ class AvitoHttpClient:
                 if r.status_code != 200:
                     raise AvitoHttpError(r.status_code, text[:200])
                 self.total_ok += 1
+                if self.cookie_store:
+                    self.save_cookies()
                 return json.loads(text)
             except AvitoBlock:
                 raise

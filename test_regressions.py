@@ -829,6 +829,71 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(raised.exception.kind, "challenge")
         client.close()
 
+    def test_cookie_store_roundtrip(self):
+        # Cookies сохраняются в store и восстанавливаются в новом клиенте.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = str(Path(tmp) / "cookies_direct.json")
+            first = avito_api.AvitoHttpClient(timeout=1, cookie_store=store)
+            first._session.cookies.set("srv_id", "x" * 40, domain=".avito.ru", path="/")
+            first._session.cookies.set("u", "y" * 20, domain=".avito.ru", path="/")
+            saved = first.save_cookies()
+            self.assertEqual(saved, 2)
+            self.assertTrue(Path(store).exists())
+            first.close()
+
+            second = avito_api.AvitoHttpClient(timeout=1, cookie_store=store)
+            self.assertEqual(second.cookies_loaded, 2)
+            self.assertEqual(second._session.cookies.get("srv_id"), "x" * 40)
+            self.assertEqual(second._session.cookies.get("u"), "y" * 20)
+            second.close()
+
+    def test_cookie_store_skips_expired(self):
+        # Истёкшие cookies не восстанавливаются.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = str(Path(tmp) / "cookies_direct.json")
+            entries = [
+                {"name": "dead", "value": "v", "domain": ".avito.ru", "path": "/",
+                 "expires": time.time() - 100},
+                {"name": "alive", "value": "w", "domain": ".avito.ru", "path": "/",
+                 "expires": time.time() + 3600},
+            ]
+            Path(store).write_text(json.dumps(entries), encoding="utf-8")
+            client = avito_api.AvitoHttpClient(timeout=1, cookie_store=store)
+            self.assertEqual(client.cookies_loaded, 1)
+            self.assertIsNone(client._session.cookies.get("dead"))
+            self.assertEqual(client._session.cookies.get("alive"), "w")
+            client.close()
+
+    def test_warmup_skipped_when_cookies_restored(self):
+        # >=3 восстановленных cookies -> warmup сразу возвращает True без запроса.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = str(Path(tmp) / "cookies_direct.json")
+            entries = [
+                {"name": f"c{i}", "value": f"v{i}", "domain": ".avito.ru", "path": "/",
+                 "expires": time.time() + 3600}
+                for i in range(3)
+            ]
+            Path(store).write_text(json.dumps(entries), encoding="utf-8")
+            client = avito_api.AvitoHttpClient(timeout=1, cookie_store=store)
+            client._session.get = MagicMock()
+            self.assertTrue(client.warmup())
+            client._session.get.assert_not_called()
+            client.close()
+
+    def test_reset_keeps_cookie_store(self):
+        # reset() пересоздаёт сессию, но cookies из store возвращаются.
+        with tempfile.TemporaryDirectory() as tmp:
+            store = str(Path(tmp) / "cookies_direct.json")
+            entries = [
+                {"name": "keep", "value": "kept", "domain": ".avito.ru", "path": "/",
+                 "expires": time.time() + 3600},
+            ]
+            Path(store).write_text(json.dumps(entries), encoding="utf-8")
+            client = avito_api.AvitoHttpClient(timeout=1, cookie_store=store)
+            client.reset()
+            self.assertEqual(client._session.cookies.get("keep"), "kept")
+            client.close()
+
     def test_block_classification_and_retry_after(self):
         block = avito_api.classify_block(403, {}, '{"too-many-requests": true}')
         self.assertEqual((block.kind, block.status), ("rate_limit", 403))
