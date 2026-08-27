@@ -19,6 +19,7 @@ import avito_monitoring as monitoring
 import avito_pow
 import avito_sitemap
 import avito_ui
+import proxy_harvest
 from avito_accounts import AccountService, LicenseManager
 from storage import load_json, load_state, update_json, update_state
 
@@ -1000,6 +1001,44 @@ class RegressionTests(unittest.TestCase):
         # Parole исчерпан — снова обычные паузы.
         after = watcher._poll_delay()
         self.assertLess(after, 45.0)
+
+    def test_proxy_harvest_dedup_and_parse(self):
+        # harvest(): дедуп по url между источниками + парсинг обоих форматов.
+        with patch.object(proxy_harvest, "_fetch_text", side_effect=[
+            json.dumps({"data": [
+                {"ip": "1.2.3.4", "port": 8080, "asn": "AS1", "org": "Test Org", "anonymityLevel": "elite"},
+            ]}),                                   # geonode
+            "5.6.7.8:3128\n\n1.2.3.4:8080\n",      # proxyscrape (дубль должен уйти)
+            "7.7.7.7:80\n",                        # proxifly
+        ]):
+            candidates = proxy_harvest.harvest()
+        urls = [c.url for c in candidates]
+        self.assertEqual(len(urls), len(set(urls)))
+        self.assertEqual(set(urls), {"http://1.2.3.4:8080", "http://5.6.7.8:3128", "http://7.7.7.7:80"})
+        geo = [c for c in candidates if c.source == "geonode"][0]
+        self.assertEqual(geo.asn, "AS1")
+
+    def test_proxy_harvest_check_and_export(self):
+        # Проверка одного кандидата: connect/status/ms; экспорт строки env.
+        cand = proxy_harvest.ProxyCandidate(url="http://9.9.9.9:80", source="test")
+        fake_response = MagicMock(status_code=200, content=b"x" * 100)
+        fake_session = MagicMock()
+        fake_session.get.return_value = fake_response
+        with patch.object(proxy_harvest.curl_requests, "Session", return_value=fake_session):
+            result = proxy_harvest.check_proxy(cand)
+        self.assertTrue(result["connect"])
+        self.assertEqual(result["status"], 200)
+
+        report = proxy_harvest.HarvestReport(target="t")
+        report.harvested = 2
+        report.by_source = {"test": 2}
+        report.connected = 1
+        report.passed = 1
+        report.statuses = {200: 1, 403: 0}
+        report.working = [result]
+        env = proxy_harvest.export_env_string(report)
+        self.assertEqual(env, "http://9.9.9.9:80")
+        self.assertIn("собрано 2", report.summary())
 
     def test_block_classification_and_retry_after(self):
         block = avito_api.classify_block(403, {}, '{"too-many-requests": true}')
