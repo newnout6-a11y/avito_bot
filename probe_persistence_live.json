@@ -1,0 +1,51 @@
+{
+  "started": "2026-08-27 20:53:37",
+  "phases": [
+    {
+      "name": "unbanned",
+      "code": 200,
+      "t": "20:53:49"
+    },
+    {
+      "name": "silence_15min",
+      "note": "после разбана IP на проверочном режиме — не дёргаем",
+      "t": "20:53:49"
+    },
+    {
+      "name": "c1_warmup",
+      "status": 200,
+      "t": "21:09:00"
+    },
+    {
+      "name": "c1_get_items",
+      "status": 200,
+      "items": 50,
+      "pow": 1,
+      "t": "21:14:02"
+    },
+    {
+      "name": "c2_cookies_loaded",
+      "count": 11,
+      "t": "21:19:10"
+    },
+    {
+      "name": "c2_warmup_skipped",
+      "warm": true,
+      "ms": 0,
+      "t": "21:19:10"
+    },
+    {
+      "name": "c2_get_items",
+      "status": 200,
+      "items": 50,
+      "pow": 0,
+      "t": "21:19:11"
+    },
+    {
+      "name": "VERDICT",
+      "persistence_works": true,
+      "note": "новый клиент с куками из store получил items; warmup пропущен",
+      "t": "21:19:11"
+    }
+  ]
+}
