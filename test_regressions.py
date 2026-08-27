@@ -17,6 +17,7 @@ import avito_domain
 import avito_monitor_bot as appmod
 import avito_monitoring as monitoring
 import avito_pow
+import avito_sitemap
 import avito_ui
 from avito_accounts import AccountService, LicenseManager
 from storage import load_json, load_state, update_json, update_state
@@ -893,6 +894,95 @@ class RegressionTests(unittest.TestCase):
             client.reset()
             self.assertEqual(client._session.cookies.get("keep"), "kept")
             client.close()
+
+    def test_sitemap_index_decodes_item_maps(self):
+        # Из index.xml достаём item_<slug>_<catId>_<block>.xml.gz-карты.
+        locs = [
+            "https://www.avito.ru/sitemap/site/canonical_serp_telefony_84_0.xml.gz",
+            "https://www.avito.ru/sitemap/site/item_telefony_84_0.xml.gz",
+            "https://www.avito.ru/sitemap/site/item_telefony_84_16.xml.gz",
+            "https://www.avito.ru/sitemap/site/item_noutbuki_10_1.xml.gz",
+        ]
+        maps = avito_sitemap._decode_index(locs)
+        self.assertEqual(len(maps), 3)
+        telefony = [m for m in maps if m.category_slug == "telefony"]
+        self.assertEqual({m.block for m in telefony}, {0, 16})
+        self.assertEqual(telefony[0].category_id, 84)
+        noutbuki = [m for m in maps if m.category_slug == "noutbuki"]
+        self.assertEqual((noutbuki[0].category_id, noutbuki[0].block), (10, 1))
+
+    def test_sitemap_latest_block_per_category(self):
+        with patch.object(avito_sitemap, "fetch_index", return_value=[
+            avito_sitemap.ItemSitemap("telefony", 84, 0, "u0"),
+            avito_sitemap.ItemSitemap("telefony", 84, 16, "u16"),
+            avito_sitemap.ItemSitemap("telefony", 84, 7, "u7"),
+            avito_sitemap.ItemSitemap("noutbuki", 10, 2, "n2"),
+        ]):
+            latest = avito_sitemap.latest_item_sitemaps()
+            self.assertEqual(len(latest), 2)
+            by_slug = {m.category_slug: m for m in latest}
+            self.assertEqual(by_slug["telefony"].block, 16)
+            self.assertEqual(by_slug["noutbuki"].block, 2)
+            only_tel = avito_sitemap.latest_item_sitemaps(category_slug="telefony")
+            self.assertEqual(len(only_tel), 1)
+            self.assertEqual(only_tel[0].block, 16)
+
+    def test_sitemap_mark_seen_extracts_ids(self):
+        # item-ID (числовой суффикс URL) попадает в seen.
+        items = [
+            ("https://www.avito.ru/irkutsk/telefony/chasy_apple_watch_8_45_mm_8330204224", "2026-08-27T03:24:45Z"),
+            ("https://www.avito.ru/omsk/telefony/infinix_gt_30_pro_8256_gb_2_sim_8385803323", "2026-08-27T03:24:48Z"),
+        ]
+        with patch.object(avito_sitemap, "fetch_fresh_items", return_value=items):
+            seen = {}
+            marked = avito_sitemap.mark_seen_from_sitemap("telefony", 84, seen)
+        self.assertEqual(marked, 2)
+        self.assertIn("8330204224", seen)
+        self.assertIn("8385803323", seen)
+
+    def test_sitemap_mark_seen_swallows_errors(self):
+        # Сетевая ошибка в sitemap-канале не ломает Watcher.
+        with patch.object(avito_sitemap, "fetch_fresh_items", side_effect=OSError("boom")):
+            seen = {}
+            marked = avito_sitemap.mark_seen_from_sitemap("telefony", 84, seen)
+        self.assertEqual(marked, 0)
+        self.assertEqual(seen, {})
+
+    def test_watcher_marks_seen_from_sitemap_on_ip_block(self):
+        # При ip_block Watcher вызывает sitemap-пометку (best-effort seen).
+        appmod.Watcher._route_blocked_until.clear()
+        watcher = appmod.Watcher("key", "https://www.avito.ru/moskva/telefony?q=iphone", FakeBot())
+        watcher._api_url = "https://www.avito.ru/web/1/js/items?categoryId=84&q=iphone"
+        watcher._client = MagicMock()
+        watcher._client.get_search_page_items = MagicMock(
+            side_effect=avito_api.AvitoBlock("ip_block", 429)
+        )
+        watcher._client.get_items = MagicMock(
+            side_effect=avito_api.AvitoBlock("ip_block", 429)
+        )
+        watcher._proxy = lambda: None
+        watcher._rotate_proxy = lambda: False
+        marked_urls = [
+            ("https://www.avito.ru/moskva/telefony/iphone_16_8323342236", "2026-08-27T03:25:04Z"),
+        ]
+        watcher._mark_seen_from_sitemap = AsyncMock(
+            side_effect=lambda: avito_sitemap.mark_seen_from_sitemap(
+                *(watcher._sitemap_category() + (watcher.seen,))
+            )
+        )
+        with patch.object(avito_sitemap, "fetch_fresh_items", return_value=marked_urls):
+            ads = asyncio.run(watcher._fetch_ads())
+        self.assertIsNone(ads)
+        self.assertEqual(watcher.last_block_kind, "ip_block")
+        watcher._mark_seen_from_sitemap.assert_awaited_once()
+        self.assertIn("8323342236", watcher.seen)
+
+    def test_watcher_sitemap_category_parsed(self):
+        watcher = appmod.Watcher("key", "https://www.avito.ru/moskva/telefony?q=iphone", FakeBot())
+        watcher._api_url = "https://www.avito.ru/web/1/js/items?categoryId=84&q=iphone"
+        slug, cat_id = watcher._sitemap_category()
+        self.assertEqual(cat_id, 84)
+        self.assertEqual(slug, "telefony")
 
     def test_block_classification_and_retry_after(self):
         block = avito_api.classify_block(403, {}, '{"too-many-requests": true}')

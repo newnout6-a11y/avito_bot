@@ -13,6 +13,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, cast
 from aiogram import Bot, types
 from bs4 import BeautifulSoup
 
+import avito_sitemap
 from avito_api import (
     ApiRouteResolver,
     AvitoBlock,
@@ -141,6 +142,37 @@ class Watcher:
         slug = re.sub(r"[^a-z0-9]+", "_", route.lower())[:48] or "direct"
         data_dir = os.getenv("DATABASE_FILE", os.path.join("data", "avito_monitor.sqlite3"))
         return os.path.join(os.path.dirname(data_dir) or "data", f"cookies_{slug}.json")
+
+    async def _mark_seen_from_sitemap(self) -> int:
+        """Sitemap-fallback при ip_block: пометить свежие item-ID в seen."""
+        slug, cat_id = self._sitemap_category()
+        if not slug and not cat_id:
+            return 0
+        try:
+            return await asyncio.to_thread(
+                avito_sitemap.mark_seen_from_sitemap, slug, cat_id, self.seen
+            )
+        except Exception as exc:
+            logger.warning("Sitemap seen-marking не удался: %s", exc)
+            return 0
+
+    def _sitemap_category(self) -> tuple[Optional[str], Optional[int]]:
+        """(category_slug, category_id) для текущего поиска, если известны."""
+        url = self._api_url or ""
+        m = re.search(r"[?&]categoryId=(\d+)", url)
+        cat_id = int(m.group(1)) if m else None
+        if not cat_id:
+            return None, None
+        # slug — второй сегмент пути публичного URL: avito.ru/<city>/<slug>/...
+        try:
+            path = self.url.split("?", 1)[0].split("#", 1)[0]
+            parts = [p for p in path.split("/")[3:] if p]
+            slug = parts[1] if len(parts) >= 2 else None
+        except Exception:
+            slug = None
+        if slug and re.fullmatch(r"[a-z0-9_]+", slug):
+            return slug, cat_id
+        return None, cat_id
 
     def _route_key(self) -> str:
         return self._proxy() or "direct"
@@ -394,6 +426,11 @@ class Watcher:
                 self._consecutive_blocks = min(self._consecutive_blocks + 1, 5)
                 self._blocked_until = time.monotonic() + wait
                 Watcher._route_blocked_until[blocked_route] = self._blocked_until
+                if block.kind == "ip_block":
+                    # Sitemap открыт даже при IP-бане (CDN вне Qrator):
+                    # помечаем свежие item-ID в seen, чтобы после разбана
+                    # не засыпать пользователя накопившимся старьём.
+                    await self._mark_seen_from_sitemap()
                 route_changed = self._rotate_proxy()
                 if route_changed and attempt + 1 < max_attempts:
                     self._blocked_until = 0
