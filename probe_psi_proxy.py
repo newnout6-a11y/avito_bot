@@ -5,8 +5,8 @@
 import json
 import sys
 import time
-import urllib.request
 import urllib.parse
+import urllib.request
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
