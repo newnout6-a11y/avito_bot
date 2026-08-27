@@ -27,8 +27,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, List, Optional, Protocol
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from typing import Any, Dict, Iterator, List, Optional, Protocol
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests as curl_requests
@@ -751,22 +751,97 @@ def parse_relative_date(text: str, now: Optional[float] = None) -> Optional[floa
     return None
 
 
+def _find_catalog(node: Any, _depth: int = 0) -> Optional[Dict[str, Any]]:
+    """Recursively locate a catalog-like dict that holds an items list of ads."""
+    if _depth > 12:
+        return None
+    if isinstance(node, dict):
+        items = node.get("items")
+        if isinstance(items, list) and any(
+            isinstance(entry, dict)
+            and any(key in entry for key in ("urlPath", "uriPath", "sortTimeStamp", "id"))
+            for entry in items
+        ):
+            return node
+        for value in node.values():
+            found = _find_catalog(value, _depth + 1)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_catalog(value, _depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _iter_brace_blocks(text: str) -> Iterator[str]:
+    """Yield top-level balanced {...} substrings, ignoring braces inside strings."""
+    depth = 0
+    start = -1
+    in_str = False
+    escape = False
+    quote = ""
+    for index, char in enumerate(text):
+        if in_str:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == quote:
+                in_str = False
+            continue
+        if char in ('"', "'"):
+            in_str = True
+            quote = char
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start >= 0:
+                yield text[start : index + 1]
+                start = -1
+
+
+def _script_state_candidates(body: str) -> Iterator[Any]:
+    """Yield parsed JSON states from a <script> body across Avito's embedding forms."""
+    text = body.strip()
+    if not text:
+        return
+    # 1) Whole script is JSON (e.g. <script type="application/json">).
+    try:
+        yield json.loads(text)
+        return
+    except (ValueError, TypeError):
+        pass
+    # 2) URI-encoded JSON string literal, e.g. window.__initialData__ = "%7B...%7D".
+    for match in re.finditer(r'"((?:[^"\\]|\\.)*)"', text):
+        raw = match.group(1)
+        if "%7b" not in raw.lower():
+            continue
+        try:
+            yield json.loads(unquote(raw))
+        except (ValueError, TypeError):
+            continue
+    # 3) Direct object assignment, e.g. window.__initialData__ = {...};
+    for block in _iter_brace_blocks(text):
+        try:
+            yield json.loads(block)
+        except (ValueError, TypeError):
+            continue
+
+
 def _embedded_catalog(soup: BeautifulSoup) -> Optional[Dict[str, Any]]:
     for script in soup.find_all("script"):
         body = script.string or script.get_text() or ""
-        if '"catalog"' not in body or '"sortTimeStamp"' not in body:
+        if "catalog" not in body or "sortTimeStamp" not in body:
             continue
-        try:
-            state = json.loads(body)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            continue
-        if not isinstance(state, dict):
-            continue
-        loader_data = state.get("loaderData")
-        data = loader_data.get("data") if isinstance(loader_data, dict) else None
-        catalog = data.get("catalog") if isinstance(data, dict) else None
-        if isinstance(catalog, dict) and isinstance(catalog.get("items"), list):
-            return catalog
+        for state in _script_state_candidates(body):
+            catalog = _find_catalog(state)
+            if catalog is not None:
+                return catalog
     return None
 
 

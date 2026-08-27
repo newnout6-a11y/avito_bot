@@ -402,21 +402,6 @@ async def _continue_after_filter_review(message: types.Message, state: FSMContex
             "Минимальная цена больше максимальной. Введите корректную минимальную цену или «-»."
         )
         return
-    if filters.price_min is None and filters.price_max is None:
-        await state.set_state(SearchWizard.price_min)
-        await message.answer(
-            "<b>Минимальная цена</b>\nВведите число или «-», если ограничения нет.",
-            reply_markup=types.ReplyKeyboardMarkup(
-                keyboard=[
-                    [
-                        _keyboard_button(text="-", style="primary"),
-                        _keyboard_button(text="Отмена", style="danger"),
-                    ],
-                ],
-                resize_keyboard=True,
-            ),
-        )
-        return
     await _prompt_search_name(
         message,
         state,

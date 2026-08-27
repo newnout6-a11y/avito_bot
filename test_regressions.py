@@ -872,6 +872,7 @@ class RegressionTests(unittest.TestCase):
             appmod.Watcher._route_blocked_until.clear()
             watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", FakeBot())
             watcher._api_url = "https://www.avito.ru/web/1/js/items?q=test"
+            watcher._client.get_search_page_items = MagicMock(return_value=[])
             watcher._client.get_items = MagicMock(side_effect=avito_api.AvitoBlock("ip_block", 429, 30))
             watcher._client.reset = MagicMock()
             watcher._client.request_new_ip = MagicMock(return_value=False)
@@ -893,6 +894,8 @@ class RegressionTests(unittest.TestCase):
             second = appmod.Watcher("two", "https://www.avito.ru/spb", FakeBot())
             first._api_url = "https://www.avito.ru/web/1/js/items?q=one"
             second._api_url = "https://www.avito.ru/web/1/js/items?q=two"
+            first._client.get_search_page_items = MagicMock(return_value=[])
+            second._client.get_search_page_items = MagicMock(return_value=[])
             first._client.get_items = MagicMock(side_effect=avito_api.AvitoBlock("challenge", 439, 30))
             second._client.get_items = MagicMock(return_value={"catalog": {"items": []}})
             first._client.request_new_ip = MagicMock(return_value=False)
@@ -914,6 +917,7 @@ class RegressionTests(unittest.TestCase):
                 watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", FakeBot())
                 watcher._proxy_index = 0
                 watcher._api_url = "https://www.avito.ru/web/1/js/items?q=test"
+                watcher._client.get_search_page_items = MagicMock(return_value=[])
                 watcher._client.get_items = MagicMock(side_effect=[
                     avito_api.AvitoBlock("challenge", 439, 1),
                     {"catalog": {"items": [{"id": 2, "urlPath": "/x_2345678", "title": "OK"}]}},
@@ -934,6 +938,8 @@ class RegressionTests(unittest.TestCase):
             appmod.Watcher._route_blocked_until.clear()
             watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", FakeBot())
             watcher._api_url = "https://www.avito.ru/web/1/js/items?q=stale"
+            watcher._api_route_managed = True
+            watcher._client.get_search_page_items = MagicMock(return_value=[])
             watcher._client.get_items = MagicMock(side_effect=avito_api.AvitoHttpError(404, "gone"))
             with patch.object(watcher, "_wait_global_rate_limit", AsyncMock()), \
                     patch.object(watcher.route_resolver, "invalidate") as invalidate:
