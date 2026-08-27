@@ -1,0 +1,77 @@
+[
+  {
+    "impersonate": "safari15_5",
+    "home_status": 200,
+    "home_ms": 908,
+    "home_bytes": 1573587,
+    "cookies": [
+      "srv_id",
+      "gMltIuegZN2COuSe",
+      "_avisc",
+      "u",
+      "h_u",
+      "v",
+      "selected_locale"
+    ],
+    "qrator_jsid": false,
+    "api_status": 439,
+    "api_ms": 36,
+    "api_bytes": 8324
+  },
+  {
+    "impersonate": "chrome146",
+    "home_status": 200,
+    "home_ms": 1110,
+    "home_bytes": 2931284,
+    "cookies": [
+      "srv_id",
+      "_adcc",
+      "gMltIuegZN2COuSe",
+      "_avisc",
+      "u",
+      "h_u",
+      "v",
+      "selected_locale"
+    ],
+    "qrator_jsid": false,
+    "api_status": 439,
+    "api_ms": 38,
+    "api_bytes": 8324
+  },
+  {
+    "impersonate": "chrome131_android",
+    "home_status": 301,
+    "home_ms": 478,
+    "home_bytes": 60,
+    "cookies": [
+      "srv_id",
+      "gMltIuegZN2COuSe",
+      "_avisc",
+      "u",
+      "h_u",
+      "v",
+      "selected_locale"
+    ],
+    "qrator_jsid": false
+  },
+  {
+    "impersonate": "firefox147",
+    "home_status": 200,
+    "home_ms": 1015,
+    "home_bytes": 2483803,
+    "cookies": [
+      "srv_id",
+      "gMltIuegZN2COuSe",
+      "_avisc",
+      "u",
+      "h_u",
+      "v",
+      "selected_locale"
+    ],
+    "qrator_jsid": false,
+    "api_status": 200,
+    "api_ms": 414,
+    "api_bytes": 1674063,
+    "items": 50
+  }
+]

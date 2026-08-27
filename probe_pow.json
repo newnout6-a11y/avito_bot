@@ -1,0 +1,29 @@
+[
+  {
+    "impersonate": "firefox147",
+    "home": 200,
+    "api_1st": 439,
+    "pow_solved": true,
+    "pow_sec": 0.14,
+    "api_retry": 200,
+    "items": 50
+  },
+  {
+    "impersonate": "safari15_5",
+    "home": 200,
+    "api_1st": 439,
+    "pow_solved": true,
+    "pow_sec": 0.19,
+    "api_retry": 200,
+    "items": 50
+  },
+  {
+    "impersonate": "chrome146",
+    "home": 200,
+    "api_1st": 439,
+    "pow_solved": true,
+    "pow_sec": 0.26,
+    "api_retry": 200,
+    "items": 50
+  }
+]

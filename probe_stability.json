@@ -1,0 +1,44 @@
+[
+  {
+    "i": 0,
+    "status": 439,
+    "ms": 63,
+    "bytes": 8324,
+    "snippet": "<!DOCTYPE html>\n<html lang=\"ru\">\n<head>\n    <meta charset=\"UTF-8\" />\n    <meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\" />\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n    <title>Доступ ограничен: проверка безопасности</title>\n    <style>\n        body {\n        "
+  },
+  {
+    "i": 1,
+    "status": 439,
+    "ms": 61,
+    "bytes": 8324,
+    "snippet": "<!DOCTYPE html>\n<html lang=\"ru\">\n<head>\n    <meta charset=\"UTF-8\" />\n    <meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\" />\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n    <title>Доступ ограничен: проверка безопасности</title>\n    <style>\n        body {\n        "
+  },
+  {
+    "i": 2,
+    "status": 200,
+    "ms": 387,
+    "bytes": 1701761,
+    "items": 50
+  },
+  {
+    "i": 3,
+    "status": 439,
+    "ms": 58,
+    "bytes": 8324,
+    "snippet": "<!DOCTYPE html>\n<html lang=\"ru\">\n<head>\n    <meta charset=\"UTF-8\" />\n    <meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\" />\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n    <title>Доступ ограничен: проверка безопасности</title>\n    <style>\n        body {\n        "
+  },
+  {
+    "i": 4,
+    "status": 200,
+    "ms": 522,
+    "bytes": 1701599,
+    "items": 50
+  },
+  {
+    "i": 5,
+    "status": 200,
+    "ms": 418,
+    "bytes": 1701603,
+    "items": 50
+  }
+]
