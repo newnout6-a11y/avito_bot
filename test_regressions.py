@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import tempfile
@@ -15,6 +16,7 @@ import avito_api
 import avito_domain
 import avito_monitor_bot as appmod
 import avito_monitoring as monitoring
+import avito_pow
 import avito_ui
 from avito_accounts import AccountService, LicenseManager
 from storage import load_json, load_state, update_json, update_state
@@ -733,6 +735,98 @@ class RegressionTests(unittest.TestCase):
             client.get_items("https://www.avito.ru/web/1/js/items?q=test")
         self.assertEqual(raised.exception.kind, "challenge")
         self.assertEqual(client._session.get.call_count, 1)
+        client.close()
+
+    def test_pow_solver_finds_nonce_for_known_complexity(self):
+        nonce = avito_pow.solve_nonce("test-id", 1)
+        digest = hashlib.sha256(f"test-id:{nonce}".encode()).hexdigest()
+        self.assertTrue(digest.startswith("0"))
+        nonce4 = avito_pow.solve_nonce("test-id-4", 4)
+        digest4 = hashlib.sha256(f"test-id-4:{nonce4}".encode()).hexdigest()
+        self.assertTrue(digest4.startswith("0000"))
+
+    def test_pow_b64url_jwt_payload(self):
+        payload = {"id": "abc", "compl": 4}
+        segment = base64.urlsafe_b64encode(
+            json.dumps(payload).encode()
+        ).decode().rstrip("=")
+        self.assertEqual(avito_pow._b64url_json(segment), payload)
+
+    def test_get_items_solves_pow_and_retries(self):
+        # 439 с pow_challenge -> PoW решён -> повторный GET даёт 200 JSON.
+        challenge_jwt_payload = {"id": "pow-id", "compl": 1}
+        jwt_segment = base64.urlsafe_b64encode(
+            json.dumps(challenge_jwt_payload).encode()
+        ).decode().rstrip("=")
+        challenge_jwt = f"header.{jwt_segment}.signature"
+
+        blocked_response = MagicMock(
+            status_code=439,
+            headers={"Content-Type": "text/html", "set-cookie": "pow_challenge=abc123; Path=/"},
+            text="Доступ ограничен: проверка безопасности",
+        )
+        ok_response = MagicMock(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            text='{"catalog": {"items": [{"id": 1}]}}',
+        )
+
+        client = avito_api.AvitoHttpClient(timeout=1)
+        client.warmed_at = time.time()
+        client._session.get = MagicMock(side_effect=[blocked_response, ok_response])
+        client._session.post = MagicMock(
+            side_effect=[
+                MagicMock(status_code=200, json=lambda: {"success": {"result": {"challenge_jwt": challenge_jwt}}}),
+                MagicMock(status_code=200, json=lambda: {"success": {"result": {"verified": True}}}),
+            ]
+        )
+        client._session.cookies = MagicMock()
+        client._session.cookies.__iter__ = MagicMock(return_value=iter([]))
+        client._session.cookies.get = MagicMock(side_effect=lambda k, default=None: {
+            "pow_challenge": "abc123",
+        }.get(k, default))
+
+        data = client.get_items("https://www.avito.ru/web/1/js/items?q=test")
+        self.assertEqual(len(data["catalog"]["items"]), 1)
+        self.assertEqual(client._session.get.call_count, 2)
+        self.assertEqual(client._session.post.call_count, 2)
+        self.assertEqual(getattr(client, "total_pow_solved", 0), 1)
+        client.close()
+
+    def test_get_items_raises_when_pow_not_verified(self):
+        # verify вернул verified=False -> блок пробрасывается наружу.
+        challenge_jwt_payload = {"id": "pow-id", "compl": 1}
+        jwt_segment = base64.urlsafe_b64encode(
+            json.dumps(challenge_jwt_payload).encode()
+        ).decode().rstrip("=")
+        challenge_jwt = f"header.{jwt_segment}.signature"
+
+        blocked_response = MagicMock(
+            status_code=439,
+            headers={"Content-Type": "text/html", "set-cookie": "pow_challenge=abc123; Path=/"},
+            text="Доступ ограничен: проверка безопасности",
+        )
+
+        client = avito_api.AvitoHttpClient(timeout=1)
+        client.warmed_at = time.time()
+        client._session.get = MagicMock(return_value=blocked_response)
+        client._session.post = MagicMock(
+            side_effect=[
+                MagicMock(status_code=200, json=lambda: {"success": {"result": {"challenge_jwt": challenge_jwt}}}),
+                MagicMock(status_code=200, json=lambda: {"success": {"result": {"verified": False}}}),
+                MagicMock(status_code=200, json=lambda: {"success": {"result": {"challenge_jwt": challenge_jwt}}}),
+                MagicMock(status_code=200, json=lambda: {"success": {"result": {"verified": False}}}),
+            ]
+        )
+        client._session.cookies = MagicMock()
+        client._session.cookies.__iter__ = MagicMock(return_value=iter([]))
+        client._session.cookies.get = MagicMock(side_effect=lambda k, default=None: {
+            "pow_challenge": "abc123",
+        }.get(k, default))
+
+        with self.assertRaises(avito_api.AvitoBlock) as raised:
+            client.get_items("https://www.avito.ru/web/1/js/items?q=test")
+        self.assertEqual(raised.exception.kind, "challenge")
         client.close()
 
     def test_block_classification_and_retry_after(self):

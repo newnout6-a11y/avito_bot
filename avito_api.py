@@ -33,6 +33,8 @@ from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 from bs4 import BeautifulSoup
 from curl_cffi import requests as curl_requests
 
+from avito_pow import solve_pow_challenge
+
 logger = logging.getLogger(__name__)
 
 AVITO_HOME = "https://www.avito.ru/"
@@ -215,6 +217,20 @@ class AvitoHttpClient:
         self._session = self._build_session()
         self.warmed_at = 0.0
 
+    def _solve_pow(self, response) -> bool:
+        """
+        Пройти firewall PoW (429/439 challenge) в текущей сессии.
+        Кука pow_challenge приезжает с самим блок-ответом; решаем и верифицируем.
+        """
+        try:
+            solved = solve_pow_challenge(self._session, response)
+            if solved:
+                self.total_pow_solved = getattr(self, "total_pow_solved", 0) + 1
+            return solved
+        except Exception as exc:
+            logger.warning("PoW: ошибка решения challenge: %s", exc)
+            return False
+
     def set_proxy(self, proxy: Optional[str], change_url: Optional[str] = None) -> None:
         self.proxy = proxy
         self.proxy_change_url = change_url
@@ -248,7 +264,7 @@ class AvitoHttpClient:
             "sec-fetch-mode": "navigate",
             "sec-fetch-dest": "document",
         }
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 r = self._session.get(search_url, timeout=self.timeout, headers=headers, allow_redirects=True)
                 self.last_status = r.status_code
@@ -256,16 +272,21 @@ class AvitoHttpClient:
                 block = classify_block(r.status_code, r.headers, text)
                 if block:
                     self.total_blocked += 1
+                    if block.kind == "challenge" and attempt < 2 and self._solve_pow(r):
+                        time.sleep(1.0)
+                        continue
                     raise block
                 if r.status_code != 200:
                     raise AvitoHttpError(r.status_code, text[:200])
                 self.total_ok += 1
                 return parse_html_feed(text, limit=limit)
-            except (AvitoBlock, AvitoHttpError):
+            except AvitoBlock:
+                raise
+            except AvitoHttpError:
                 raise
             except Exception as exc:
                 self.reset()
-                if attempt == 0:
+                if attempt < 2:
                     time.sleep(1.0)
                     continue
                 raise exc
@@ -287,7 +308,7 @@ class AvitoHttpClient:
         }
         if not is_valid_api_url(api_url):
             raise ValueError(f"invalid Avito API URL: {api_url!r}")
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 r = self._session.get(api_url, timeout=self.timeout, headers=headers, allow_redirects=False)
                 self.last_status = r.status_code
@@ -295,16 +316,21 @@ class AvitoHttpClient:
                 block = classify_block(r.status_code, r.headers, text)
                 if block:
                     self.total_blocked += 1
+                    if block.kind == "challenge" and attempt < 2 and self._solve_pow(r):
+                        time.sleep(1.0)
+                        continue
                     raise block
                 if r.status_code != 200:
                     raise AvitoHttpError(r.status_code, text[:200])
                 self.total_ok += 1
                 return json.loads(text)
-            except (AvitoBlock, AvitoHttpError):
+            except AvitoBlock:
+                raise
+            except AvitoHttpError:
                 raise
             except Exception as exc:
                 self.reset()
-                if attempt == 0:
+                if attempt < 2:
                     time.sleep(1.0)
                     continue
                 raise exc
