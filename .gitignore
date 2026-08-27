@@ -1,5 +1,8 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+
+# Archive of superseded local state (tokens/accounts history)
+archive/
 *.py[cod]
 *$py.class
 
@@ -122,6 +125,7 @@ celerybeat.pid
 # Environments
 .env
 accounts.json
+api_urls.json
 issued_keys.json
 keys.sqlite3*
 sent_ads.json
