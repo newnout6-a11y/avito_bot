@@ -984,6 +984,23 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(cat_id, 84)
         self.assertEqual(slug, "telefony")
 
+    def test_ip_block_engages_parole_mode(self):
+        # ip_block включает parole: первые PAROLE_POLLS пауз длиннее в PAROLE_FACTOR.
+        watcher = appmod.Watcher("key", "https://www.avito.ru/moskva/telefony", FakeBot())
+        watcher._interval = 30.0
+        self.assertEqual(watcher._parole_polls_left, 0)
+        normal = watcher._poll_delay()
+        self.assertLess(normal, 45.0)
+
+        watcher._parole_polls_left = monitoring.PAROLE_POLLS
+        for expected_left in (monitoring.PAROLE_POLLS - 1, monitoring.PAROLE_POLLS - 2, 0):
+            parole = watcher._poll_delay()
+            self.assertGreaterEqual(parole, 30.0 * 0.9 * monitoring.PAROLE_FACTOR)
+            self.assertEqual(watcher._parole_polls_left, expected_left)
+        # Parole исчерпан — снова обычные паузы.
+        after = watcher._poll_delay()
+        self.assertLess(after, 45.0)
+
     def test_block_classification_and_retry_after(self):
         block = avito_api.classify_block(403, {}, '{"too-many-requests": true}')
         self.assertEqual((block.kind, block.status), ("rate_limit", 403))

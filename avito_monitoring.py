@@ -54,6 +54,11 @@ from storage import load_state, save_state
 
 logger = logging.getLogger(__name__)
 
+# Parole-режим после ip_block: первые N опросов реже в PAROLE_FACTOR раз.
+# Живой замер 08.2026: сразу после разбана 4 запроса за 90 сек ре-банят.
+PAROLE_POLLS = 3
+PAROLE_FACTOR = 4.0
+
 
 class Watcher:
     _request_lock = asyncio.Lock()
@@ -92,6 +97,7 @@ class Watcher:
         self._skip_initial_poll = False
         self._blocked_until = 0.0
         self._consecutive_blocks = 0
+        self._parole_polls_left = 0
         self.last_http_status: Optional[int] = None
         self.last_block_kind: Optional[str] = None
         self.conversion_status = "pending"
@@ -431,6 +437,9 @@ class Watcher:
                     # помечаем свежие item-ID в seen, чтобы после разбана
                     # не засыпать пользователя накопившимся старьём.
                     await self._mark_seen_from_sitemap()
+                    # После снятия бана IP на «проверочном режиме» (живой
+                    # замер: 4 запроса за 90 сек ре-банят) — parole-режим.
+                    self._parole_polls_left = PAROLE_POLLS
                 route_changed = self._rotate_proxy()
                 if route_changed and attempt + 1 < max_attempts:
                     self._blocked_until = 0
@@ -508,6 +517,23 @@ class Watcher:
             if found_new
             else min(self.interval_max, self._interval * 1.05)
         )
+
+    def _poll_delay(self) -> float:
+        """Пауза между опросами; после ip_block — parole-режим (реже в N раз).
+
+        Живой замер 08.2026: сразу после снятия бана IP на «проверочном
+        режиме» — 4 запроса за 90 сек ре-банят. Первые запросы после бана
+        должны идти с большим интервалом.
+        """
+        delay = max(1.0, self._interval) * random.uniform(0.9, 1.1)
+        if self._parole_polls_left > 0:
+            self._parole_polls_left -= 1
+            delay *= PAROLE_FACTOR
+            logger.info(
+                "[Мониторинг] %s: parole-режим после бана, пауза ~%dс (осталось %d)",
+                self.search_key[:32], int(delay), self._parole_polls_left,
+            )
+        return delay
 
     def _cleanup_seen(self, ttl=7 * 24 * 3600):
         now = time.time()
@@ -620,7 +646,7 @@ class Watcher:
                     logger.info("[Мониторинг] %s: найдено и отправлено новых объявлений: %d! След. проверка через ~%dс", names_str, new_count, int(self._interval))
             self._cleanup_seen()
             self._bump_interval(found_new)
-            await asyncio.sleep(max(1.0, self._interval) * random.uniform(0.9, 1.1))
+            await asyncio.sleep(self._poll_delay())
 
     async def _send_missing_alert_hint(self, app: Any, user_id: int) -> None:
         if not app.missing_alert_hint_once(user_id):
