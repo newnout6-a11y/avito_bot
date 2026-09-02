@@ -330,6 +330,32 @@ def _translit_location(slug: str) -> str:
     return " ".join(w.capitalize() for w in res.split())
 
 
+def translit_to_cyrillic(text: str) -> str:
+    """Best-effort latin->cyrillic transliteration for fuzzy keyword matching.
+
+    'samsung' -> 'самсунг'. Both the keyword and the ad text are passed through
+    this, so a latin query matches a cyrillic listing and vice versa.
+    """
+    res = (text or "").casefold()
+    for lat, cyr in _TRANSLIT_RULES:
+        res = res.replace(lat, cyr)
+    return "".join(_SINGLE_TRANSLIT.get(ch, ch) for ch in res)
+
+
+def keyword_in_text(keyword: str, haystack_casefold: str, haystack_translit: str) -> bool:
+    """True if keyword occurs in the text, ignoring case and latin/cyrillic script.
+
+    ``haystack_casefold`` and ``haystack_translit`` are the text pre-normalised
+    once by the caller (``text.casefold()`` and ``translit_to_cyrillic(text)``).
+    """
+    word = (keyword or "").strip().casefold()
+    if not word:
+        return False
+    if word in haystack_casefold:
+        return True
+    return translit_to_cyrillic(word) in haystack_translit
+
+
 def extract_url_metadata(url_str: str) -> dict[str, object]:
     parsed = urlparse(url_str)
     path_parts = [p for p in (parsed.path or "").strip("/").split("/") if p]

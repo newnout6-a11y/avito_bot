@@ -351,6 +351,29 @@ class RegressionTests(unittest.TestCase):
         self.assertTrue(appmod.Watcher._ad_passes_filters(ad, passing))
         self.assertFalse(appmod.Watcher._ad_passes_filters(ad, blocked))
 
+    def test_keyword_filter_ignores_latin_cyrillic_script(self):
+        ad = appmod.Ad(
+            ad_id="1",
+            url="https://avito.ru/1",
+            title="Смартфон Самсунг Галакси S23",
+            description="новый",
+        )
+        # latin query keyword matches a cyrillic listing
+        latin = appmod.Subscription(
+            1, 1, "key", "https://avito.ru/moskva",
+            appmod.SubscriberFilter(keywords_all=["Samsung"]),
+        )
+        self.assertTrue(appmod.Watcher._ad_passes_filters(ad, latin))
+        # and a cyrillic stop-word blocks a latin listing
+        latin_ad = appmod.Ad(
+            ad_id="2", url="https://avito.ru/2", title="Samsung Galaxy", description="",
+        )
+        stop = appmod.Subscription(
+            2, 1, "key", "https://avito.ru/moskva",
+            appmod.SubscriberFilter(keywords_stop=["самсунг"]),
+        )
+        self.assertFalse(appmod.Watcher._ad_passes_filters(latin_ad, stop))
+
     def test_add_options_preserve_full_filter_contract(self):
         spec = appmod.parse_avito_url(
             "https://avito.ru/moskva?q=Samsung&pmin=10000&pmax=70000"

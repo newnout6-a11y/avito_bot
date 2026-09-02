@@ -33,8 +33,10 @@ from avito_domain import (
     _fmt_dt,
     _get_text,
     avito_short_url,
+    keyword_in_text,
     normalize_filter,
     parse_avito_url,
+    translit_to_cyrillic,
 )
 from avito_settings import (
     ADMIN_CHAT_ID,
@@ -498,16 +500,22 @@ class Watcher:
     @staticmethod
     def _ad_passes_filters(ad: Ad, sub: Subscription) -> bool:
         filters = sub.flt
-        text = f"{ad.title} {ad.description}".casefold()
         if filters.price_min is not None and (ad.price is None or ad.price < filters.price_min):
             return False
         if filters.price_max is not None and (ad.price is None or ad.price > filters.price_max):
             return False
-        if filters.keywords_all and not all(word.casefold() in text for word in filters.keywords_all):
+        raw = f"{ad.title} {ad.description}"
+        text_cf = raw.casefold()
+        text_tr = translit_to_cyrillic(raw)
+
+        def has(word: str) -> bool:
+            return keyword_in_text(word, text_cf, text_tr)
+
+        if filters.keywords_all and not all(has(w) for w in filters.keywords_all):
             return False
-        if filters.keywords_any and not any(word.casefold() in text for word in filters.keywords_any):
+        if filters.keywords_any and not any(has(w) for w in filters.keywords_any):
             return False
-        if filters.keywords_stop and any(word.casefold() in text for word in filters.keywords_stop):
+        if filters.keywords_stop and any(has(w) for w in filters.keywords_stop):
             return False
         return True
 
