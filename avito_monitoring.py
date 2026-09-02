@@ -99,6 +99,8 @@ class Watcher:
         self._api_route_managed = False
         self._skip_initial_poll = False
         self._id_frontier = 0
+        self._prev_batch_max_id = 0
+        self._window_cap = 0.0
         self._blocked_until = 0.0
         self._consecutive_blocks = 0
         self._parole_polls_left = 0
@@ -233,6 +235,38 @@ class Watcher:
         batch_max = max((self._numeric_id(ad.ad_id) for ad in ads), default=0)
         if batch_max > self._id_frontier:
             self._id_frontier = batch_max
+
+    @staticmethod
+    def _feed_window_seconds(ads: List[Ad]) -> float:
+        """Сколько секунд «покрывает» текущая страница выдачи (span по времени)."""
+        stamps = [ad.published_ts for ad in ads if ad.published_ts]
+        return (max(stamps) - min(stamps)) if len(stamps) >= 2 else 0.0
+
+    def _watch_feed_window(self, ads: List[Ad], names_str: str) -> None:
+        """Держать темп быстрее прокрутки ленты и ловить пропуски по item-ID.
+
+        Выдача показывает ~50 объявлений. Если между опросами их «утекло»
+        больше, чем помещается на странице, новые ушли из окна незамеченными —
+        это видно по монотонным ID: min(текущей партии) > max(прошлой) значит
+        окна не пересеклись, целая пачка проскочила. Тогда ускоряемся и кричим.
+        """
+        batch_ids = [i for i in (self._numeric_id(ad.ad_id) for ad in ads) if i]
+        batch_min = min(batch_ids, default=0)
+        if self._prev_batch_max_id and batch_min and batch_min > self._prev_batch_max_id:
+            logger.warning(
+                "[Мониторинг] %s: лента прокрутилась целиком между опросами "
+                "(min id %s > прошлый max %s) — вероятен пропуск новых. "
+                "Ускоряю опрос; если повторяется — уменьшите POLL_PERIOD_SEC "
+                "или категория слишком объёмная для одной страницы.",
+                names_str, batch_min, self._prev_batch_max_id,
+            )
+            self._interval = self.interval_min
+        if batch_ids:
+            self._prev_batch_max_id = max(batch_ids)
+        span = self._feed_window_seconds(ads)
+        if span:
+            # перепроверять до того, как утечёт половина видимого окна
+            self._window_cap = max(self.interval_min, span * 0.5)
 
     @staticmethod
     def _fmt_price(value: Optional[int]) -> str:
@@ -511,6 +545,7 @@ class Watcher:
         for ad in to_prime:
             self.seen[ad.ad_id] = time.time()
         self._note_id_frontier(ads)
+        self._watch_feed_window(ads, name_hint)
         self._skip_initial_poll = True
         logger.info("[Мониторинг] Инициализация %s завершена: запомнено %d объявлений, запущен мониторинг новых", name_hint, len(self.seen))
 
@@ -542,6 +577,11 @@ class Watcher:
             if found_new
             else min(self.interval_max, self._interval * 1.05)
         )
+        # Не давать адаптивному дрейфу подниматься выше окна ленты: иначе в
+        # объёмной категории опрос замедляется до 300с, а окно ~6мин, и новое
+        # утекает. Границу interval_min (порог анти-бана) не переступаем.
+        if self._window_cap:
+            self._interval = min(self._interval, max(self.interval_min, self._window_cap))
 
     def _poll_delay(self) -> float:
         """Пауза между опросами; после ip_block — parole-режим (реже в N раз).
@@ -592,6 +632,7 @@ class Watcher:
             else:
                 new_count = 0
                 now = time.time()
+                self._watch_feed_window(ads, names_str)
                 for ad in ads:
                     was_seen = ad.ad_id in self.seen
                     for sub in list(self.subscribers.values()):

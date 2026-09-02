@@ -713,6 +713,50 @@ class RegressionTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_feed_window_gap_detection_and_cadence_cap(self):
+        bot = FakeBot()
+        bot.app = FakeDeliveryApp()
+        watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+        try:
+            def ad(i, ts):
+                return appmod.Ad(
+                    ad_id=str(i), url=f"https://www.avito.ru/{i}",
+                    title="x", published_ts=ts, published_exact=True,
+                )
+
+            # window span = 120s -> re-poll before half (60s) scrolls out
+            batch = [ad(8_400_000_500, 1000.0), ad(8_400_000_600, 1120.0)]
+            self.assertEqual(watcher._feed_window_seconds(batch), 120.0)
+
+            # first observation only seeds the frontier, no gap warning/reset
+            watcher._interval = watcher.interval_max
+            watcher._watch_feed_window(batch, "t")
+            self.assertEqual(watcher._prev_batch_max_id, 8_400_000_600)
+            self.assertEqual(watcher._interval, watcher.interval_max)
+
+            # next batch starts entirely above the previous max -> feed scrolled
+            # past a full page between polls -> gap: reset to the fast bound
+            gap_batch = [ad(8_400_001_000, 1200.0), ad(8_400_001_050, 1260.0)]
+            watcher._watch_feed_window(gap_batch, "t")
+            self.assertEqual(watcher._interval, watcher.interval_min)
+            self.assertEqual(watcher._prev_batch_max_id, 8_400_001_050)
+
+            # overlapping batch (min id <= prev max) is normal, no reset
+            watcher._interval = watcher.interval_max
+            overlap = [ad(8_400_000_900, 1300.0), ad(8_400_001_100, 1360.0)]
+            watcher._watch_feed_window(overlap, "t")
+            self.assertEqual(watcher._interval, watcher.interval_max)
+
+            # window cap pulls the adaptive drift down but never below interval_min
+            watcher.interval_min = 30.0
+            watcher.interval_max = 300.0
+            watcher._interval = 300.0
+            watcher._window_cap = 60.0
+            watcher._bump_interval(found_new=False)
+            self.assertEqual(watcher._interval, 60.0)
+        finally:
+            watcher._client.close()
+
     def test_only_new_rejects_bumped_old_listing_by_id_frontier(self):
         # Avito stamps sortTimeStamp/allowTimeStamp = now when an old listing is
         # bumped, so it looks fresh by time. The monotonic item-ID is the only
