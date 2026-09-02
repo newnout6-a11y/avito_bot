@@ -170,3 +170,9 @@ cython_debug/
 # VS Code
 .vscode/
 
+# Agent/tool runtime state and local data blobs
+session.jsonl
+AGENTS.md
+.freebuff/
+*PROXIES*.txt
+
