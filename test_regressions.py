@@ -54,22 +54,11 @@ class FakeState:
 
 
 class FakeDeliveryApp:
-    def __init__(self, *, global_dedup=False):
+    def __init__(self):
         self.license = MagicMock()
         self.license.is_active.return_value = True
-        self.global_dedup = global_dedup
-        self.global_sent = set()
         self.user_sent = set()
         self.deliveries = []
-
-    def dedup_global_enabled(self):
-        return self.global_dedup
-
-    def sent_global_was_delivered(self, ad_id):
-        return ad_id in self.global_sent
-
-    def sent_global_mark(self, ad_id, ts=None):
-        self.global_sent.add(ad_id)
 
     def sent_was_delivered(self, user_id, ad_id):
         return (user_id, ad_id) in self.user_sent
@@ -701,10 +690,12 @@ class RegressionTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_global_dedup_delivers_an_ad_only_once(self):
+    def test_same_ad_reaches_every_subscribed_user_once(self):
+        # Dedup is per user: two users watching the same search each get the ad
+        # exactly once — one user's delivery never suppresses another's.
         async def scenario():
             bot = FakeBot()
-            bot.app = FakeDeliveryApp(global_dedup=True)
+            bot.app = FakeDeliveryApp()
             watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
             ad = appmod.Ad(ad_id="1", url="https://www.avito.ru/1", title="Phone")
             watcher.add_sub(appmod.Subscription(
@@ -719,8 +710,8 @@ class RegressionTests(unittest.TestCase):
                 with self.assertRaises(asyncio.CancelledError):
                     await watcher._run()
 
-            self.assertEqual(bot.app.deliveries, [1])
-            self.assertEqual(bot.app.global_sent, {"1"})
+            self.assertEqual(sorted(bot.app.deliveries), [1, 2])
+            self.assertEqual(bot.app.user_sent, {(1, "1"), (2, "1")})
             watcher._client.close()
 
         asyncio.run(scenario())

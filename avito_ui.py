@@ -80,7 +80,6 @@ from avito_settings import (
     ALERT_LINKS_FILE,
     ALERT_MESSAGE_EFFECT_ID,
     BINDINGS_FILE,
-    DEDUP_GLOBAL,
     DEDUP_TTL_DAYS,
     KEYS_FILE,
     SENT_FILE,
@@ -1709,21 +1708,6 @@ class App:
 
         update_state(self.sent_file, {}, mark)
 
-    def dedup_global_enabled(self) -> bool:
-        return DEDUP_GLOBAL
-
-    def sent_global_was_delivered(self, ad_id: str) -> bool:
-        data = self._load_sent()
-        inner = data.get("_global", {})
-        return ad_id in inner
-
-    def sent_global_mark(self, ad_id: str, ts: Optional[float] = None) -> None:
-        def mark(data):
-            data.setdefault("_global", {})[ad_id] = float(ts or time.time())
-            self._cleanup_sent_locked(data)
-
-        update_state(self.sent_file, {}, mark)
-
     # ===== аккаунты =====
     def _load_accounts(self) -> Dict[str, Dict[str, Any]]:
         return self.accounts._load_accounts()
@@ -1965,15 +1949,8 @@ class App:
             target = parts[1].strip().lower() if len(parts) > 1 else ""
             data = self._load_sent()
             if not target or target == "all":
-                data = {}
-                self._save_sent(data)
-                await m.reply(_br("Антидубликат очищен полностью (per-user и global)."))
-                return
-            if target == "global":
-                if "_global" in data:
-                    del data["_global"]
-                self._save_sent(data)
-                await m.reply(_br("Глобальный антидубликат очищен."))
+                self._save_sent({})
+                await m.reply(_br("Антидубликат очищен полностью."))
                 return
             if target.isdigit():
                 if target in data:
@@ -1983,7 +1960,7 @@ class App:
                 else:
                     await m.reply(_br(f"Для user_id={target} записей не было."))
                 return
-            await m.reply(_br("Формат: /dedup_clear [all|global|<user_id>]"))
+            await m.reply(_br("Формат: /dedup_clear [all|<user_id>]"))
 
     async def setup_menu(self):
         await self.bot.set_my_commands(

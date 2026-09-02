@@ -52,5 +52,4 @@ KEYS_FILE = os.getenv("KEYS_FILE", "issued_keys.json")
 SENT_FILE = os.getenv("SENT_FILE", "sent_ads.json")
 ACCOUNTS_FILE = os.getenv("ACCOUNTS_FILE", "accounts.json")
 DEDUP_TTL_DAYS = int(os.getenv("DEDUP_TTL_DAYS", "14"))
-DEDUP_GLOBAL = os.getenv("DEDUP_GLOBAL", "1") == "1"
 SUBSCRIPTIONS_FILE = os.getenv("SUBSCRIPTIONS_FILE", "subscriptions.json")

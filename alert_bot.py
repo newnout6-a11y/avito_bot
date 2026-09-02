@@ -16,7 +16,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 
-from storage import load_state, save_state, update_state
+from storage import load_state, update_state
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -72,31 +72,6 @@ def _load_bindings():
         logger.error(f"Критическая ошибка загрузки привязок: {e}")
         return {}
 
-def _save_bindings(data):
-    """Безопасное сохранение привязок"""
-    try:
-        # Создаем директорию если нужно
-        dir_path = os.path.dirname(BINDINGS_FILE)
-        if dir_path:
-            os.makedirs(dir_path, exist_ok=True)
-        
-        # Конвертируем данные в правильный формат
-        save_data = {}
-        for k, v in data.items():
-            try:
-                save_data[str(k)] = int(v)
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Пропускаем некорректную запись при сохранении {k}: {v}, ошибка: {e}")
-                continue
-        
-        # Сохраняем с блокировкой
-        save_state(BINDINGS_FILE, save_data)
-        
-        logger.info("Сохранено привязок: %s", len(save_data))
-        
-    except Exception as e:
-        logger.error(f"Критическая ошибка сохранения привязок: {e}")
-
 @router.message(Command("start"))
 async def start_cmd(m: types.Message):
     """Обработка команды /start с улучшенной проверкой аргументов"""
@@ -114,7 +89,7 @@ async def start_cmd(m: types.Message):
         
         if main_user_id is None:
             existing_bindings = _load_bindings()
-            if str(m.chat.id) in existing_bindings or m.chat.id in existing_bindings.values():
+            if m.chat.id in existing_bindings.values():
                 await m.answer(
                     "✅ <b>Оповещения уже подключены</b>\n\n"
                     "Этот чат привязан для получения уведомлений. Все новые объявления по вашим поискам приходят сюда.",
@@ -165,33 +140,14 @@ async def id_cmd(m: types.Message):
 async def status_cmd(m: types.Message):
     """Проверить статус привязок"""
     try:
-        # Детальная диагностика
-        logger.info("=== ДИАГНОСТИКА STATUS ===")
-        logger.info(f"Файл привязок: {BINDINGS_FILE}")
-        logger.info(f"Файл существует: {os.path.exists(BINDINGS_FILE)}")
-        
-        if os.path.exists(BINDINGS_FILE):
-            try:
-                logger.info("Файл привязок доступен")
-            except Exception as read_e:
-                logger.error(f"Ошибка чтения файла: {read_e}")
-        
         data = _load_bindings()
-        logger.info(f"Текущий chat_id: {m.chat.id} (тип: {type(m.chat.id)})")
-        
-        # Ищем привязку для текущего chat_id
-        found_bindings = []
-        for main_user_id, alert_chat_id in data.items():
-            logger.info(f"Проверяем: main_user_id={main_user_id} (тип: {type(main_user_id)}), alert_chat_id={alert_chat_id} (тип: {type(alert_chat_id)})")
-            try:
-                if int(alert_chat_id) == int(m.chat.id):
-                    found_bindings.append(main_user_id)
-                    logger.info(f"Найдено совпадение: {main_user_id}")
-            except Exception as comp_e:
-                logger.error(f"Ошибка сравнения для {main_user_id}->{alert_chat_id}: {comp_e}")
-        
-        logger.info(f"Найденные привязки: {found_bindings}")
-        
+        found_bindings = [
+            main_user_id
+            for main_user_id, alert_chat_id in data.items()
+            if alert_chat_id == m.chat.id
+        ]
+        logger.info("status: chat_id=%s привязок=%d", m.chat.id, len(found_bindings))
+
         if found_bindings:
             await m.answer("✅ <b>Оповещения подключены</b>\nБот готов принимать новые объявления.")
         else:

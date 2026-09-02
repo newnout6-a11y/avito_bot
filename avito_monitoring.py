@@ -569,11 +569,7 @@ class Watcher:
                 now = time.time()
                 for ad in ads:
                     was_seen = ad.ad_id in self.seen
-                    global_dedup = app.dedup_global_enabled()
-                    global_delivered = global_dedup and app.sent_global_was_delivered(ad.ad_id)
                     for sub in list(self.subscribers.values()):
-                        if global_delivered:
-                            break
                         if was_seen and sub.only_new:
                             continue
                         if not app.license.is_active(sub.user_id):
@@ -624,9 +620,6 @@ class Watcher:
                             if self.on_deliver:
                                 self.on_deliver(sub.user_id, ad)
                             app.sent_mark(sub.user_id, ad.ad_id, now)
-                            if global_dedup:
-                                app.sent_global_mark(ad.ad_id, now)
-                                global_delivered = True
                             found_new = True
                             new_count += 1
                             logger.info(
