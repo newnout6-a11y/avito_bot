@@ -1,6 +1,6 @@
 # language: Python, file: avito_pow.py
 # Решатель Avito firewall PoW (429/439 challenge) без браузера.
-# Механика (из challenge_page.html, живой захват 2026-08-27):
+# Механика (из research/challenge_page.html, живой захват 2026-08-27):
 #   1) 439-ответ ставит куку pow_challenge
 #   2) POST /web/3/firewallPow/get {challenge} -> challenge_jwt
 #   3) JWT payload: {id, compl} — ищем nonce: sha256(f"{id}:{nonce}") с compl ведущими hex-нулями
