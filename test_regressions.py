@@ -713,6 +713,46 @@ class RegressionTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_only_new_rejects_bumped_old_listing_by_id_frontier(self):
+        # Avito stamps sortTimeStamp/allowTimeStamp = now when an old listing is
+        # bumped, so it looks fresh by time. The monotonic item-ID is the only
+        # tell: an ID below the freshness frontier is a re-surfaced old ad.
+        async def scenario():
+            bot = FakeBot()
+            bot.app = FakeDeliveryApp()
+            watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+            watcher._id_frontier = 8_400_000_000
+            watcher.add_sub(appmod.Subscription(
+                id=1, user_id=1, search_key="key", url=watcher.url,
+                only_new=True, started_ts=1_000,
+            ))
+            now_ish = time.time()
+            watcher._fetch_ads = AsyncMock(return_value=[
+                appmod.Ad(  # bumped: 5 weeks older ID, but timestamp says "now"
+                    ad_id="8200000001", url="https://www.avito.ru/8200000001",
+                    title="Bumped old", published_ts=now_ish, published_exact=True,
+                ),
+                appmod.Ad(  # genuinely new: ID above the frontier
+                    ad_id="8400000123", url="https://www.avito.ru/8400000123",
+                    title="Truly new", published_ts=now_ish, published_exact=True,
+                ),
+            ])
+
+            with patch.object(monitoring, "START_STRICT", True), patch.object(
+                monitoring, "ONLY_NEW_ID_GATE", True
+            ), patch(
+                "avito_monitoring.asyncio.sleep",
+                AsyncMock(side_effect=asyncio.CancelledError),
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await watcher._run()
+
+            self.assertEqual(bot.app.user_sent, {(1, "8400000123")})
+            self.assertEqual(watcher._id_frontier, 8_400_000_123)
+            watcher._client.close()
+
+        asyncio.run(scenario())
+
     def test_same_ad_reaches_every_subscribed_user_once(self):
         # Dedup is per user: two users watching the same search each get the ad
         # exactly once — one user's delivery never suppresses another's.

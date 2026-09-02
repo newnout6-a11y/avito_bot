@@ -27,6 +27,11 @@ SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/Multiscan_service1")
 PRIME_ON_START = os.getenv("PRIME_ON_START", "1") == "1"
 START_STRICT = os.getenv("START_STRICT", "1") == "1"
 START_GRACE_SEC = int(os.getenv("START_GRACE_SEC", "10"))
+# «Только новые»: отбрасывать объявления с item-ID ниже фронтира свежести.
+# Avito при поднятии/перепубликации ставит sortTimeStamp и allowTimeStamp в
+# текущий момент, поэтому по времени поднятое старьё неотличимо от нового —
+# единственный надёжный признак «создано только что» это монотонный item-ID.
+ONLY_NEW_ID_GATE = os.getenv("ONLY_NEW_ID_GATE", "1") == "1"
 DISPLAY_TZ_NAME = os.getenv("DISPLAY_TZ", "Europe/Moscow")
 DISPLAY_TZ_OFFSET_MIN = int(os.getenv("DISPLAY_TZ_OFFSET_MIN", "180"))
 

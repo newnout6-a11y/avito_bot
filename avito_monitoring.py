@@ -45,6 +45,7 @@ from avito_settings import (
     AVITO_PROXIES,
     AVITO_PROXY_CHANGE_URLS,
     AVITO_REQUEST_GAP_SEC,
+    ONLY_NEW_ID_GATE,
     POLL_PERIOD_MAX_SEC,
     POLL_PERIOD_SEC,
     PRIME_ON_START,
@@ -97,6 +98,7 @@ class Watcher:
         self._api_url: Optional[str] = None
         self._api_route_managed = False
         self._skip_initial_poll = False
+        self._id_frontier = 0
         self._blocked_until = 0.0
         self._consecutive_blocks = 0
         self._parole_polls_left = 0
@@ -217,6 +219,20 @@ class Watcher:
             allow_redirects=False,
             headers={"Accept-Language": "ru,en;q=0.9", "referer": "https://www.avito.ru/"},
         )
+
+    @staticmethod
+    def _numeric_id(ad_id: str) -> int:
+        """item-ID Avito как int (0 если не число — тогда id-калитка не применяется)."""
+        try:
+            return int(str(ad_id).strip())
+        except (TypeError, ValueError):
+            return 0
+
+    def _note_id_frontier(self, ads: List[Ad]) -> None:
+        """Поднять фронтир свежести до максимального item-ID в партии."""
+        batch_max = max((self._numeric_id(ad.ad_id) for ad in ads), default=0)
+        if batch_max > self._id_frontier:
+            self._id_frontier = batch_max
 
     @staticmethod
     def _fmt_price(value: Optional[int]) -> str:
@@ -494,6 +510,7 @@ class Watcher:
         to_prime = ads[:limit] if limit is not None else ads
         for ad in to_prime:
             self.seen[ad.ad_id] = time.time()
+        self._note_id_frontier(ads)
         self._skip_initial_poll = True
         logger.info("[Мониторинг] Инициализация %s завершена: запомнено %d объявлений, запущен мониторинг новых", name_hint, len(self.seen))
 
@@ -583,6 +600,18 @@ class Watcher:
                         if not app.license.is_active(sub.user_id):
                             logger.info("Пропуск %s для user=%s: лицензия неактивна", ad.ad_id, sub.user_id)
                             continue
+                        if (
+                            sub.only_new
+                            and ONLY_NEW_ID_GATE
+                            and self._id_frontier
+                            and 0 < self._numeric_id(ad.ad_id) <= self._id_frontier
+                        ):
+                            logger.info(
+                                "Пропуск %s (%s) для sub=%s: item-ID %s ≤ фронтира свежести %s "
+                                "— поднятое/перепубликованное старое",
+                                ad.ad_id, ad.title, sub.id, ad.ad_id, self._id_frontier,
+                            )
+                            continue
                         if sub.only_new and START_STRICT and (
                             not ad.published_exact or ad.published_ts is None
                         ):
@@ -641,6 +670,7 @@ class Watcher:
                             logger.warning("Не удалось отправить объявление %s: alert_chat=%s", ad.ad_id, chat_id)
                             await self._send_missing_alert_hint(app, sub.user_id)
                     self.seen[ad.ad_id] = now
+                self._note_id_frontier(ads)
                 if new_count == 0:
                     logger.info("[Мониторинг] %s: получено %d объявлений, новых нет. След. проверка через ~%dс", names_str, len(ads), int(self._interval))
                 else:
