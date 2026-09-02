@@ -143,7 +143,11 @@ def classify_block(status: int, headers: Any, text: str) -> Optional[AvitoBlock]
     if status == 200:
         # Only inspect challenge markers in HTML; listing JSON may contain the same words in ad text.
         is_html = "text/html" in content_type or body.lstrip().startswith(("<!doctype", "<html"))
-        if "too-many-requests" in body[:5000] or "too many requests" in body[:5000]:
+        head = body[:5000]
+        # A real throttle body is `{"too-many-requests": ...}`; match the JSON key
+        # shape so ad text that merely mentions the phrase is not misread as a block.
+        throttle_json = re.search(r'"too-?many-?requests"\s*:', head) is not None
+        if throttle_json or (is_html and ("too-many-requests" in head or "too many requests" in head)):
             return AvitoBlock("rate_limit", status, retry_after=_retry_after_seconds(headers))
         if is_html and any(marker in body for marker in _CHALLENGE_MARKERS):
             kind = "challenge"

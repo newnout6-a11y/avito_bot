@@ -25,6 +25,8 @@ py-modules = [
     "avito_settings",
     "alert_bot",
     "avito_api",
+    "avito_pow",
+    "avito_sitemap",
     "storage",
     "avito_ui",
     "avito_accounts",

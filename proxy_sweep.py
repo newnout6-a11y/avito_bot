@@ -110,7 +110,7 @@ def main() -> int:
     for r in results:
         st = r.get("status")
         statuses[str(st)] = statuses.get(str(st), 0) + 1
-    print(f"\n=== ИТОГ ===")
+    print("\n=== ИТОГ ===")
     print(f"проверено: {len(results)} | 200: {len(ok)} | статусы: {statuses}")
     for r in ok[:30]:
         print(f"  OK {r['addr']} {r['ms']}ms bytes={r.get('bytes')}")
