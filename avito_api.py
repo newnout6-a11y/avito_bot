@@ -1,19 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Транспортный слой Avito (версия 2026, JSON API).
+Транспортный слой Avito (версия 2026, JSON API + HTML).
 
-Почему не HTML: Авито больше не рендерит объявления на сервере —
-страница поиска отдаёт пустую JS-оболочку (проверено живыми тестами 08.2026).
-Рабочий источник данных — внутренний JSON API фронтенда:
-    https://www.avito.ru/web/1/js/items?categoryId=…&locationId=…&query=…&sort=date
+Основной путь — HTML-страница поисковой выдачи (get_search_page_items):
+Avito по-прежнему встраивает каталог объявлений в <script> (см.
+_embedded_catalog/_script_state_candidates), это добавлено 15.08 и допилено
+27.08 именно как обход конвертера SPFA. JSON API
+(https://www.avito.ru/web/1/js/items?categoryId=…&locationId=…&query=…&sort=date)
+— запасной путь, когда встроенного каталога в HTML нет (см. _fetch_api_fallback
+в avito_monitoring.py); строку SPFA-URL для него достаёт convert_url_to_api.
 
 Что здесь реализовано:
-- AvitoHttpClient — curl_cffi-сессия с impersonate=chrome, прогревом cookies
-  и полным набором браузерных заголовков;
+- AvitoHttpClient — curl_cffi-сессия с impersonate=safari15_5, прогревом
+  cookies и полным набором браузерных заголовков;
 - классификация блокировок Qrator: 403 JSON too-many-requests (лёгкий
   троттлинг), 429 (жёсткий IP-бан), 439 (security-challenge);
 - convert_url_to_api — преобразование публичной ссылки Авито в API URL
-  через бесплатный endpoint SPFA (лимит 2/мин, результат кэшируется навсегда);
+  через бесплатный endpoint SPFA (лимит 2/мин); результат кэшируется на
+  API_ROUTE_TTL_SEC (7 суток) с retry-метаданными, не навсегда;
 - parse_api_items — разбор JSON в плоские словари под dataclass Ad бота.
 """
 
@@ -168,7 +172,7 @@ def classify_block(status: int, headers: Any, text: str) -> Optional[AvitoBlock]
 
 class AvitoHttpClient:
     """
-    curl_cffi-сессия под Avito: impersonate=chrome, прогрев cookies,
+    curl_cffi-сессия под Avito: impersonate=safari15_5, прогрев cookies,
     браузерные заголовки, один прокси со ссылкой смены IP (опционально).
     """
 

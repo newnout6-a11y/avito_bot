@@ -1,5 +1,8 @@
 # language: Python, file: avito_pow.py
-# Решатель Avito firewall PoW (429/439 challenge) без браузера.
+# Решатель Avito firewall PoW-challenge (http 439) без браузера.
+# 429 — отдельный случай (ip_block, см. classify_block в avito_api.py):
+# это не PoW-challenge, а троттлинг/бан по IP, решателя тут не зовут —
+# только backoff и, если задан, смена прокси. PoW относится строго к 439.
 # Механика (из research/challenge_page.html, живой захват 2026-08-27):
 #   1) 439-ответ ставит куку pow_challenge
 #   2) POST /web/3/firewallPow/get {challenge} -> challenge_jwt
