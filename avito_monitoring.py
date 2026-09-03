@@ -717,6 +717,11 @@ class Watcher:
                 new_count = 0
                 now = time.time()
                 self._watch_feed_window(ads, names_str)
+                # Снимок состояния на весь цикл, а не полное чтение на каждую
+                # пару (ad, sub). sent_mark ниже всё равно пишет сразу, снимок
+                # держим согласованным вручную.
+                sent_snapshot = app.dedup_snapshot()
+                bindings_snapshot = app.bindings_snapshot()
                 for ad in ads:
                     was_seen = ad.ad_id in self.seen
                     for sub in list(self.subscribers.values()):
@@ -780,17 +785,19 @@ class Watcher:
                                 ad.title,
                             )
                             continue
-                        if app.sent_was_delivered(sub.user_id, ad.ad_id):
+                        if ad.ad_id in sent_snapshot.get(str(sub.user_id), {}):
                             continue
                         if AVITO_ENRICH and ad.url not in self._enrich_cache:
                             await self._enrich_ad_details(ad)
-                        chat_id = app.get_alert_chat_id(sub.user_id)
+                        raw_chat_id = bindings_snapshot.get(str(sub.user_id))
+                        chat_id = int(raw_chat_id) if raw_chat_id else None
                         if chat_id and await app.send_to_alert(
                             chat_id, self._build_caption(ad), ad.image_url, item_url=ad.url
                         ):
                             if self.on_deliver:
                                 self.on_deliver(sub.user_id, ad)
                             app.sent_mark(sub.user_id, ad.ad_id, now)
+                            sent_snapshot.setdefault(str(sub.user_id), {})[ad.ad_id] = now
                             found_new = True
                             new_count += 1
                             logger.info(

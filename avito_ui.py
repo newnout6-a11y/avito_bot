@@ -1741,6 +1741,19 @@ class App:
         inner = data.get(str(user_id), {})
         return ad_id in inner
 
+    def dedup_snapshot(self) -> Dict[str, Dict[str, float]]:
+        """Один снимок всей dedup-таблицы на цикл опроса.
+
+        sent_was_delivered делал полный _load_sent() на каждую пару (ad, sub);
+        при 50 объявлениях и N подписчиках это 50×N чтений состояния за опрос.
+        Хендлер читает снимок один раз, sent_mark по-прежнему пишет сразу.
+        """
+        return self._load_sent()
+
+    def bindings_snapshot(self) -> Dict[str, int]:
+        """Аналогично для main_user_id -> alert_chat_id (см. dedup_snapshot)."""
+        return self._load_bindings()
+
     def sent_mark(self, user_id: int, ad_id: str, ts: Optional[float] = None) -> None:
         def mark(data):
             data.setdefault(str(user_id), {})[ad_id] = float(ts or time.time())

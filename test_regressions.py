@@ -53,18 +53,39 @@ class FakeState:
         self.state = state
 
 
+class _IdentityBindings(dict):
+    """alert_chat_id == user_id for every subscriber, no pre-population."""
+
+    def get(self, key, default=None):
+        try:
+            return int(key)
+        except (TypeError, ValueError):
+            return default
+
+
 class FakeDeliveryApp:
     def __init__(self):
         self.license = MagicMock()
         self.license.is_active.return_value = True
         self.user_sent = set()
         self.deliveries = []
+        self.snapshot_calls = 0
 
     def sent_was_delivered(self, user_id, ad_id):
         return (user_id, ad_id) in self.user_sent
 
     def sent_mark(self, user_id, ad_id, ts=None):
         self.user_sent.add((user_id, ad_id))
+
+    def dedup_snapshot(self):
+        self.snapshot_calls += 1
+        snap = {}
+        for uid, ad_id in self.user_sent:
+            snap.setdefault(str(uid), {})[ad_id] = 0.0
+        return snap
+
+    def bindings_snapshot(self):
+        return _IdentityBindings()
 
     def get_alert_chat_id(self, user_id):
         return user_id
@@ -881,6 +902,31 @@ class RegressionTests(unittest.TestCase):
 
             self.assertEqual(sorted(bot.app.deliveries), [1, 2])
             self.assertEqual(bot.app.user_sent, {(1, "1"), (2, "1")})
+            watcher._client.close()
+
+        asyncio.run(scenario())
+
+    def test_dedup_state_is_read_once_per_cycle_not_per_ad(self):
+        async def scenario():
+            bot = FakeBot()
+            bot.app = FakeDeliveryApp()
+            watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+            watcher.add_sub(appmod.Subscription(
+                id=1, user_id=1, search_key="key", url=watcher.url, only_new=False
+            ))
+            watcher.add_sub(appmod.Subscription(
+                id=2, user_id=2, search_key="key", url=watcher.url, only_new=False
+            ))
+            ads = [appmod.Ad(ad_id=str(i), url=f"https://www.avito.ru/{i}", title="x")
+                   for i in range(10)]
+            watcher._fetch_ads = AsyncMock(return_value=ads)
+            with patch("avito_monitoring.asyncio.sleep",
+                       AsyncMock(side_effect=asyncio.CancelledError)):
+                with self.assertRaises(asyncio.CancelledError):
+                    await watcher._run()
+            # one snapshot for the whole 10-ad × 2-sub cycle, not 20
+            self.assertEqual(bot.app.snapshot_calls, 1)
+            self.assertEqual(len(bot.app.deliveries), 20)
             watcher._client.close()
 
         asyncio.run(scenario())
