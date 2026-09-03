@@ -388,18 +388,33 @@ class Watcher:
             payload = await asyncio.to_thread(self._client.get_items, self._api_url)
         except asyncio.CancelledError:
             raise
+        except AvitoBlock as block:
+            # Троттлинг/бан по IP — временное состояние запроса, не признак
+            # того, что маршрут (URL) сам по себе стал невалидным. Инвалидация
+            # тут стирала бы рабочий api_url на весь ip_block backoff (до часа)
+            # и роняла резервный путь в SPFA (31с, 2/мин) вместо простого ожидания.
+            self.last_http_status = block.status
+            self.last_block_kind = block.kind
+            self.conversion_status = "retry"
+            self.conversion_error = str(block)
+            raise
         except Exception as api_error:
             self.last_http_status = getattr(api_error, "status", self._client.last_status)
             self.last_block_kind = getattr(api_error, "kind", None)
             self.conversion_status = "retry"
             self.conversion_error = str(api_error)
-            if self._api_route_managed:
+            # Инвалидировать маршрут только когда сам URL подтверждённо плох
+            # (сервер прямо сказал "нет такого"), а не на любую ошибку сети.
+            is_route_invalid = isinstance(api_error, AvitoHttpError) and api_error.status in (
+                400, 404, 410, 422,
+            )
+            if self._api_route_managed and is_route_invalid:
                 try:
                     await self._invalidate_api_route(str(api_error))
                 except Exception as cache_error:
                     logger.warning("Could not invalidate API route: %s", cache_error)
-            self._api_url = None
-            self._api_route_managed = False
+                self._api_url = None
+                self._api_route_managed = False
             raise
 
         parsed = parse_api_feed(payload, limit=50)
@@ -412,9 +427,16 @@ class Watcher:
             self._api_url = None
             self._api_route_managed = False
             return None
-        if not parsed.items:
-            return None
         self.last_http_status = self._client.last_status
+        if not parsed.items:
+            # Валидный ответ, схема цела, но пусто. Это либо реально нулевая
+            # выдача, либо известная «мягкая» отдача Avito сразу после PoW
+            # (research/probe_zero_items.py). Маршрут не трогаем, но и статус
+            # не оставляем протухшим со старого удачного цикла.
+            self.parser_health = "empty" if not parsed.warnings else "warning"
+            self.conversion_status = "ready"
+            self.conversion_error = "; ".join(parsed.warnings) or None
+            return None
         self.parser_health = "warning" if parsed.warnings else "ok"
         self.conversion_status = "ready"
         self.conversion_error = None
@@ -458,6 +480,17 @@ class Watcher:
                     self.conversion_status = "ready"
                     self.conversion_error = None
                     return [Ad(**item) for item in raw_items]
+
+                # Если HTML-путь уже упёрся в бан/троттлинг по IP — не отправлять
+                # второй запрос за JSON на том же IP. Тот же принцип, что и в
+                # 20-минутном backoff для ip_block: лишний стук продлевает бан.
+                # 439 (challenge) — исключение: он решаемый, и cookie pow_challenge
+                # после HTML-попытки может пропустить API-запрос.
+                if isinstance(primary_error, AvitoBlock) and primary_error.kind in (
+                    "ip_block",
+                    "rate_limit",
+                ):
+                    raise primary_error
 
                 await self._wait_global_rate_limit()
                 try:
@@ -625,8 +658,21 @@ class Watcher:
             ads = await self._fetch_ads()
             if ads is None:
                 route_until = Watcher._route_blocked_until.get(self._route_key(), 0.0)
-                remaining = max(1, int(max(self._blocked_until, route_until) - time.monotonic()))
-                logger.info("[Мониторинг] %s: пауза защиты от блокировок (ещё ~%dс до следующего опроса)", names_str, remaining)
+                cooldown = max(self._blocked_until, route_until) - time.monotonic()
+                if cooldown > 0:
+                    logger.info(
+                        "[Мониторинг] %s: пауза защиты от блокировок (ещё ~%dс до следующего опроса)",
+                        names_str, int(cooldown),
+                    )
+                else:
+                    # None без активного cooldown = запрос не дал данных и не
+                    # выставил блок (пустой валидный ответ, сетевой сбой на
+                    # ретраях и т.п.). Не называть это «защитой от блокировок».
+                    logger.info(
+                        "[Мониторинг] %s: опрос без данных (%s), повтор через ~%dс",
+                        names_str, self.last_block_kind or self.parser_health or "нет ответа",
+                        int(self._interval),
+                    )
             elif not ads:
                 logger.info("[Мониторинг] %s: получено 0 объявлений от Avito API", names_str)
             else:

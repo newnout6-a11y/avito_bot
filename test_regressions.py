@@ -1290,6 +1290,50 @@ class RegressionTests(unittest.TestCase):
             watcher._client.close()
         asyncio.run(scenario())
 
+    def test_ip_block_on_html_path_skips_the_json_fallback(self):
+        # HTML request itself gets ip_block -> do NOT fire a second request at
+        # the JSON endpoint on the same banned IP.
+        async def scenario():
+            appmod.Watcher._route_blocked_until.clear()
+            watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", FakeBot())
+            watcher._api_url = "https://www.avito.ru/web/1/js/items?q=test&sort=date"
+            watcher._client.get_search_page_items = MagicMock(
+                side_effect=avito_api.AvitoBlock("ip_block", 429, 30)
+            )
+            watcher._client.get_items = MagicMock()
+            watcher._client.reset = MagicMock()
+            watcher._client.request_new_ip = MagicMock(return_value=False)
+            with patch.object(watcher, "_wait_global_rate_limit", AsyncMock()), \
+                    patch("avito_api.random.uniform", return_value=0):
+                self.assertIsNone(await watcher._fetch_ads())
+            watcher._client.get_items.assert_not_called()
+            self.assertEqual(watcher.last_block_kind, "ip_block")
+            watcher._client.close()
+            appmod.Watcher._route_blocked_until.clear()
+        asyncio.run(scenario())
+
+    def test_challenge_on_html_path_still_tries_the_json_fallback(self):
+        # 439 is solvable; the pow_challenge cookie set during the HTML attempt
+        # may let the API through, so the fallback is still worth trying.
+        async def scenario():
+            appmod.Watcher._route_blocked_until.clear()
+            watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", FakeBot())
+            watcher._api_url = "https://www.avito.ru/web/1/js/items?q=test&sort=date"
+            watcher._api_route_managed = True
+            watcher._client.get_search_page_items = MagicMock(
+                side_effect=avito_api.AvitoBlock("challenge", 439)
+            )
+            watcher._client.get_items = MagicMock(return_value={"catalog": {"items": [{
+                "id": 9, "urlPath": "/moskva/x_9999999", "title": "via fallback",
+            }]}})
+            with patch.object(watcher, "_wait_global_rate_limit", AsyncMock()):
+                ads = await watcher._fetch_ads()
+            self.assertEqual([ad.ad_id for ad in ads], ["9"])
+            watcher._client.get_items.assert_called_once()
+            watcher._client.close()
+            appmod.Watcher._route_blocked_until.clear()
+        asyncio.run(scenario())
+
     def test_block_cooldown_is_shared_by_watchers_on_same_route(self):
         async def scenario():
             appmod.Watcher._route_blocked_until.clear()
@@ -1349,6 +1393,30 @@ class RegressionTests(unittest.TestCase):
                 self.assertIsNone(await watcher._fetch_ads())
             self.assertIsNone(watcher._api_url)
             invalidate.assert_called_once_with(watcher.url, "http 404: gone")
+            watcher._client.close()
+            appmod.Watcher._route_blocked_until.clear()
+        asyncio.run(scenario())
+
+    def test_ip_block_on_api_fallback_keeps_the_route(self):
+        # An ip_block during the JSON fallback must NOT wipe a valid api_url —
+        # the route is fine, the IP is just cooling down.
+        async def scenario():
+            appmod.Watcher._route_blocked_until.clear()
+            watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", FakeBot())
+            watcher._api_url = "https://www.avito.ru/web/1/js/items?q=live&sort=date"
+            watcher._api_route_managed = True
+            watcher._client.get_search_page_items = MagicMock(return_value=[])
+            watcher._client.get_items = MagicMock(
+                side_effect=avito_api.AvitoBlock("ip_block", 429)
+            )
+            with patch.object(watcher, "_wait_global_rate_limit", AsyncMock()), \
+                    patch.object(watcher.route_resolver, "invalidate") as invalidate:
+                self.assertIsNone(await watcher._fetch_ads())
+            self.assertEqual(
+                watcher._api_url, "https://www.avito.ru/web/1/js/items?q=live&sort=date"
+            )
+            self.assertTrue(watcher._api_route_managed)
+            invalidate.assert_not_called()
             watcher._client.close()
             appmod.Watcher._route_blocked_until.clear()
         asyncio.run(scenario())
