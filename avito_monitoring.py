@@ -141,6 +141,19 @@ class Watcher:
     def has_subscribers(self):
         return bool(self.subscribers)
 
+    @property
+    def consecutive_blocks(self) -> int:
+        return self._consecutive_blocks
+
+    def cooldown_remaining(self) -> float:
+        """Секунд до конца паузы защиты от блокировок (0 — не в паузе).
+
+        Публичный доступ для UI (get_watcher_status/diag), чтобы avito_ui не
+        лез в приватные _blocked_until / _route_key / _route_blocked_until.
+        """
+        route_until = Watcher._route_blocked_until.get(self._route_key(), 0.0)
+        return max(0.0, max(self._blocked_until, route_until) - time.monotonic())
+
     def add_sub(self, sub: Subscription):
         self.subscribers[sub.id] = sub
 

@@ -18,8 +18,10 @@ robots.txt и sitemap/*.xml.gz продолжают отдавать 200 — э�
 
 import gzip
 import logging
+import os
 import re
 import threading
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -28,6 +30,10 @@ from curl_cffi import requests as curl_requests
 logger = logging.getLogger(__name__)
 
 SITEMAP_INDEX = "https://www.avito.ru/sitemap/index.xml"
+# index.xml перечисляет ~4.3k карт; последний блок каждой категории
+# инкрементальный (свежесть в пробах ~13–14 ч). Кэш процесса без TTL в боте,
+# который живёт неделями, застревал бы на устаревшем перечне блоков.
+INDEX_TTL_SEC = float(os.getenv("SITEMAP_INDEX_TTL_SEC", str(6 * 3600)))
 _ITEM_MAP_RE = re.compile(r"/sitemap/site/item_([a-z0-9_]+?)_(\d+)_(\d+)\.xml\.gz$")
 _LOC_RE = re.compile(r"<loc>([^<]+)</loc>")
 _BLOCK_RE = re.compile(r"<url>(.*?)</url>", re.S)
@@ -35,7 +41,16 @@ _LOC_IN_BLOCK_RE = re.compile(r"<loc>([^<]+)</loc>")
 _LASTMOD_RE = re.compile(r"<lastmod>([^<]+)</lastmod>")
 
 _index_cache: Dict[str, List[str]] = {}
+_index_cache_at = 0.0
 _index_cache_lock = threading.Lock()
+
+
+def clear_index_cache() -> None:
+    """Сбросить кэш index.xml (тесты / ручной рефреш)."""
+    global _index_cache_at
+    with _index_cache_lock:
+        _index_cache.clear()
+        _index_cache_at = 0.0
 
 
 @dataclass(frozen=True)
@@ -53,9 +68,11 @@ def _new_session() -> "curl_requests.Session":
 
 
 def fetch_index(timeout: float = 30.0, use_cache: bool = True) -> List[ItemSitemap]:
-    """Все item-саймапы из index.xml (с кэшем процесса)."""
+    """Все item-саймапы из index.xml (кэш процесса с TTL INDEX_TTL_SEC)."""
+    global _index_cache_at
     with _index_cache_lock:
-        if use_cache and _index_cache:
+        fresh = _index_cache and (time.monotonic() - _index_cache_at) < INDEX_TTL_SEC
+        if use_cache and fresh:
             return _decode_index(_index_cache["locs"])
     s = _new_session()
     r = s.get(SITEMAP_INDEX, timeout=timeout)
@@ -63,6 +80,7 @@ def fetch_index(timeout: float = 30.0, use_cache: bool = True) -> List[ItemSitem
     locs = _LOC_RE.findall(r.text or "")
     with _index_cache_lock:
         _index_cache["locs"] = locs
+        _index_cache_at = time.monotonic()
     return _decode_index(locs)
 
 

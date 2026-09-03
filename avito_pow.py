@@ -27,18 +27,33 @@ def _b64url_json(segment: str) -> dict:
     return json.loads(raw.decode("utf-8"))
 
 
-def solve_nonce(challenge_id: str, complexity: int) -> int:
+class PowTooHard(RuntimeError):
+    """Сложность challenge выше подъёмной за отведённое время.
+
+    Нормальная сложность (замер probe_pow.json) — 4–5, это 0.1–0.3с.
+    Если Avito поднимет её, перебор без границы подвесил бы поток (он берётся
+    из общего пула asyncio, min(32, cpu+4)). Ловим это и откатываемся к
+    обычному backoff вместо зависания.
+    """
+
+
+def solve_nonce(challenge_id: str, complexity: int, max_seconds: float = 8.0) -> int:
     """Перебор nonce: sha256(id:nonce) с complexity ведущими hex-нулями."""
     prefix = "0" * complexity
     nonce = 0
-    t0 = time.time()
+    t0 = time.monotonic()
     while True:
         digest = hashlib.sha256(f"{challenge_id}:{nonce}".encode()).hexdigest()
         if digest.startswith(prefix):
-            dt = time.time() - t0
+            dt = time.monotonic() - t0
             logger.info("pow solved: nonce=%d, complexity=%d, %.2fs", nonce, complexity, dt)
             return nonce
         nonce += 1
+        if nonce & 0xFFFF == 0 and time.monotonic() - t0 > max_seconds:
+            raise PowTooHard(
+                f"PoW complexity={complexity} не решён за {max_seconds:.0f}с "
+                f"({nonce} попыток) — откат к backoff"
+            )
 
 
 def solve_pow_challenge(session, block_response) -> bool:
@@ -77,7 +92,11 @@ def solve_pow_challenge(session, block_response) -> bool:
     cid = payload["id"]
     compl = int(payload["compl"])
 
-    nonce = solve_nonce(cid, compl)
+    try:
+        nonce = solve_nonce(cid, compl)
+    except PowTooHard as exc:
+        logger.warning("PoW: %s", exc)
+        return False
 
     r = session.post(
         VERIFY_URL,

@@ -118,6 +118,20 @@ _BUTTON_ICON_IDS = {
 }
 
 
+def _owner_id(event: Any) -> int:
+    """Единый ключ владельца подписок / лицензии / аккаунта.
+
+    Всё это создаётся с ключом chat.id (/add, мастер, привязка), поэтому и
+    колбэки должны искать по chat.id, а не from_user.id. В личке это одно и
+    то же; в группе from_user.id (кто нажал) ≠ chat.id (где нажали) — и
+    get_sub_by_id/list_user_subs молча не находили ничего.
+    """
+    msg = event if isinstance(event, types.Message) else getattr(event, "message", None)
+    if isinstance(msg, types.Message):
+        return msg.chat.id
+    return event.from_user.id
+
+
 def _inline_button(*, text: str, style: Optional[str] = None, **kwargs: Any):
     style = style or "primary"
     icon_id = _BUTTON_ICON_IDS.get(style)
@@ -796,7 +810,7 @@ async def support_callback(cq: types.CallbackQuery):
 @support_router.callback_query(F.data == "help")
 async def help_callback(cq: types.CallbackQuery):
     app = getattr(cq.bot, "app", None) or cast(Any, cq.bot).app
-    text, kb = build_help_content(app, cq.from_user.id)
+    text, kb = build_help_content(app, _owner_id(cq))
     if isinstance(cq.message, types.Message):
         await cq.message.edit_text(text, reply_markup=kb, disable_web_page_preview=True)
     await cq.answer()
@@ -872,9 +886,7 @@ def get_watcher_status(
     if w.conversion_status == "retry":
         return "🟡 повтор"
 
-    now = time.monotonic()
-    route_until = Watcher._route_blocked_until.get(w._route_key(), 0.0)
-    wait = int(max(w._blocked_until, route_until) - now)
+    wait = int(w.cooldown_remaining())
     if wait > 0:
         return f"🟡 {_short_wait(wait)}"
     if w.last_http_status and w.last_http_status != 200:
@@ -1031,7 +1043,7 @@ async def searches_screen(message: types.Message, state: FSMContext):
 async def cb_menu_searches(cq: types.CallbackQuery, state: FSMContext):
     await state.clear()
     if isinstance(cq.message, types.Message):
-        await _edit_searches_screen(cq.message, cq.from_user.id)
+        await _edit_searches_screen(cq.message, _owner_id(cq))
     await cq.answer()
 
 
@@ -1045,7 +1057,7 @@ async def cb_force_update(cq: types.CallbackQuery):
         return
 
     app = cast(Any, cq.bot).app
-    sub = app.manager.get_sub_by_id(cq.from_user.id, sub_id)
+    sub = app.manager.get_sub_by_id(_owner_id(cq), sub_id)
     if not sub:
         await cq.answer("Поиск не найден", show_alert=True)
         return
@@ -1103,6 +1115,15 @@ async def cb_slot_new(cq: types.CallbackQuery, state: FSMContext):
     if not isinstance(cq.message, types.Message):
         await cq.answer()
         return
+    # Лицензию проверяем на входе, а не после трёх шагов мастера (ссылка,
+    # фильтры, имя): раньше state.clear() в конце стирал всё введённое.
+    lic: LicenseManager = cast(Any, cq.bot).app.license
+    if not lic.is_active(_owner_id(cq)):
+        await cq.answer(
+            "Слот не активирован — получите ключ у поддержки и отправьте его боту.",
+            show_alert=True,
+        )
+        return
     await state.clear()
     await state.set_state(SearchWizard.url)
     await cq.message.answer(
@@ -1131,7 +1152,7 @@ async def cb_close_menu(cq: types.CallbackQuery, state: FSMContext):
 @searches_router.callback_query(F.data == "back_to_list")
 async def cb_back_to_list(cq: types.CallbackQuery):
     if isinstance(cq.message, types.Message):
-        await _edit_searches_screen(cq.message, cq.from_user.id)
+        await _edit_searches_screen(cq.message, _owner_id(cq))
     await cq.answer()
 
 
@@ -1144,7 +1165,7 @@ async def cb_open_sub(cq: types.CallbackQuery, state: FSMContext):
         await cq.answer()
         return
     mng = cast(Any, cq.bot).app.manager
-    sub = mng.get_sub_by_id(cq.from_user.id, sub_id)
+    sub = mng.get_sub_by_id(_owner_id(cq), sub_id)
     if not sub:
         await cq.answer("Подписка не найдена", show_alert=True)
         return
@@ -1168,7 +1189,7 @@ async def cb_sub_actions(cq: types.CallbackQuery, state: FSMContext):
     sub_id = int(m.group(1))
     action = m.group(2)
     mng = cast(Any, cq.bot).app.manager
-    sub = mng.get_sub_by_id(cq.from_user.id, sub_id)
+    sub = mng.get_sub_by_id(_owner_id(cq), sub_id)
     if not sub:
         await cq.answer("Подписка не найдена", show_alert=True)
         return
@@ -1260,9 +1281,9 @@ async def cb_sub_actions(cq: types.CallbackQuery, state: FSMContext):
         return
 
     if action == "delete_confirm":
-        ok = await mng.remove_subscription(cq.from_user.id, sub.id)
+        ok = await mng.remove_subscription(_owner_id(cq), sub.id)
         if isinstance(cq.message, types.Message):
-            text, kb = _searches_view(cast(Any, cq.bot).app, cq.from_user.id)
+            text, kb = _searches_view(cast(Any, cq.bot).app, _owner_id(cq))
             notice = "Поиск удалён.\n\n" if ok else "Не удалось удалить поиск.\n\n"
             await cq.message.edit_text(notice + text, reply_markup=kb)
         await cq.answer()
@@ -1510,10 +1531,10 @@ async def account_show(m: types.Message, state: FSMContext):
 @account_router.callback_query(F.data == "account")
 async def account_callback(cq: types.CallbackQuery):
     app = cast(Any, cq.bot).app
-    app.account_register_if_needed(cq.from_user.id)
+    app.account_register_if_needed(_owner_id(cq))
     if isinstance(cq.message, types.Message):
         await cq.message.edit_text(
-            account_panel_text(app, cq.from_user.id),
+            account_panel_text(app, _owner_id(cq)),
             reply_markup=build_account_kb(),
         )
     await cq.answer()
@@ -1522,7 +1543,7 @@ async def account_callback(cq: types.CallbackQuery):
 @account_router.callback_query(F.data == "account:expired")
 async def account_expired(cq: types.CallbackQuery):
     app = cast(Any, cq.bot).app
-    acc = app.account_get(cq.from_user.id) or {}
+    acc = app.account_get(_owner_id(cq)) or {}
     items = []
     now = time.time()
     for k in acc.get("keys") or []:
@@ -1546,6 +1567,10 @@ class App:
             token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML)
         )
         cast(Any, self.bot).app = self
+        # MemoryStorage осознанно: FSM держит только шаги незаконченного
+        # мастера создания поиска. Рестарт их теряет — пользователь просто
+        # запускает /newsearch заново. Готовые подписки живут в SQLite
+        # (WatcherManager.save), не в FSM.
         self.dp = Dispatcher(storage=MemoryStorage())
         self.manager = WatcherManager(self.bot)
         self.license = LicenseManager()
@@ -1993,17 +2018,11 @@ class App:
             ]
             if watchers:
                 lines.append("Ключи вотчеров:")
-                now_mono = time.monotonic()
                 for key, watcher in watchers:
-                    route_until = Watcher._route_blocked_until.get(
-                        watcher._route_key(), 0.0
-                    )
-                    cooldown = max(
-                        0, int(max(watcher._blocked_until, route_until) - now_mono)
-                    )
+                    cooldown = int(watcher.cooldown_remaining())
                     status = str(watcher.last_http_status or "-")
                     block = watcher.last_block_kind or "ok"
-                    consec = watcher._consecutive_blocks
+                    consec = watcher.consecutive_blocks
                     lines.append(
                         f"• {html.escape(key)[:55]} | http={status} | "
                         f"{html.escape(block)} | wait={cooldown}s | consec={consec} | "

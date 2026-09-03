@@ -953,6 +953,12 @@ class RegressionTests(unittest.TestCase):
         digest4 = hashlib.sha256(f"test-id-4:{nonce4}".encode()).hexdigest()
         self.assertTrue(digest4.startswith("0000"))
 
+    def test_pow_solver_bails_out_of_impossible_complexity(self):
+        # 64 leading hex zeros is unreachable; must give up, not hang the
+        # shared asyncio thread pool.
+        with self.assertRaises(avito_pow.PowTooHard):
+            avito_pow.solve_nonce("x", 64, max_seconds=0.2)
+
     def test_pow_b64url_jwt_payload(self):
         payload = {"id": "abc", "compl": 4}
         segment = base64.urlsafe_b64encode(
@@ -1101,6 +1107,55 @@ class RegressionTests(unittest.TestCase):
             client.reset()
             self.assertEqual(client._session.cookies.get("keep"), "kept")
             client.close()
+
+    def test_sitemap_index_cache_has_a_ttl(self):
+        avito_sitemap.clear_index_cache()
+        self.addCleanup(avito_sitemap.clear_index_cache)
+        calls = []
+
+        class _Resp:
+            text = "<loc>https://www.avito.ru/sitemap/site/item_telefony_84_3.xml.gz</loc>"
+
+            def raise_for_status(self):
+                pass
+
+        class _Sess:
+            def get(self, *a, **k):
+                calls.append(1)
+                return _Resp()
+
+        with patch.object(avito_sitemap, "_new_session", lambda: _Sess()):
+            with patch.object(avito_sitemap, "INDEX_TTL_SEC", 9999):
+                avito_sitemap.fetch_index()
+                avito_sitemap.fetch_index()
+                self.assertEqual(len(calls), 1)  # served from cache
+            with patch.object(avito_sitemap, "INDEX_TTL_SEC", -1):
+                avito_sitemap.fetch_index()
+                self.assertEqual(len(calls), 2)  # TTL expired -> refetched
+
+    def test_watcher_cooldown_remaining_is_public(self):
+        w = appmod.Watcher("k", "https://www.avito.ru/moskva", FakeBot())
+        try:
+            self.assertEqual(w.cooldown_remaining(), 0.0)
+            w._blocked_until = time.monotonic() + 42
+            self.assertGreater(w.cooldown_remaining(), 40)
+            self.assertEqual(w.consecutive_blocks, 0)
+        finally:
+            w._client.close()
+
+    def test_owner_id_is_chat_not_actor(self):
+        from aiogram import types as tg_types
+
+        msg = MagicMock(spec=tg_types.Message)
+        msg.chat = MagicMock()
+        msg.chat.id = 555
+        cq = MagicMock()
+        cq.message = msg
+        cq.from_user = MagicMock()
+        cq.from_user.id = 999
+        self.assertEqual(avito_ui._owner_id(cq), 555)
+        cq.message = None
+        self.assertEqual(avito_ui._owner_id(cq), 999)
 
     def test_sitemap_index_decodes_item_maps(self):
         # Из index.xml достаём item_<slug>_<catId>_<block>.xml.gz-карты.
