@@ -98,6 +98,8 @@ class Watcher:
         self._api_url: Optional[str] = None
         self._api_route_managed = False
         self._skip_initial_poll = False
+        self._wake = asyncio.Event()
+        self._sleep_task: Optional[asyncio.Task] = None
         self._id_frontier = 0
         self._prev_batch_max_id = 0
         self._window_cap = 0.0
@@ -633,6 +635,42 @@ class Watcher:
             )
         return delay
 
+    def request_poll_now(self) -> None:
+        """Разбудить цикл опроса немедленно («Обновить сейчас»), не переинициализируя.
+
+        Прайминг (Watcher.start) помечает всю текущую выдачу как виденную —
+        то есть глушит ровно те объявления, ради которых пользователь и жмёт
+        кнопку. Здесь мы только просим цикл проснуться раньше срока.
+        """
+        self._wake.set()
+        sleep_task = self._sleep_task
+        if sleep_task is not None and not sleep_task.done():
+            sleep_task.cancel()
+
+    async def _sleep_or_wake(self, delay: float) -> None:
+        """Спать `delay` секунд, но проснуться раньше по request_poll_now().
+
+        Идёт через asyncio.sleep (а не Event.wait), чтобы отмена/патч сна
+        работали как раньше. request_poll_now() отменяет именно этот сон и
+        ставит флаг — отличаем «разбудили» от stop()/реальной отмены по флагу.
+        """
+        if self._wake.is_set():  # poke пришёл, пока шёл сетевой запрос
+            self._wake.clear()
+            return
+        sleep_task = asyncio.ensure_future(asyncio.sleep(max(0.0, delay)))
+        self._sleep_task = sleep_task
+        try:
+            await sleep_task
+        except asyncio.CancelledError:
+            if self._wake.is_set():
+                self._wake.clear()
+                return
+            raise
+        finally:
+            self._sleep_task = None
+            if not sleep_task.done():
+                sleep_task.cancel()
+
     def _cleanup_seen(self, ttl=7 * 24 * 3600):
         now = time.time()
         if len(self.seen) > 20000:
@@ -650,7 +688,7 @@ class Watcher:
         logger.info("[Мониторинг] Фоновый процесс активен для %s (интервал: ~%d сек)", name_hint, int(self._interval))
         if self._skip_initial_poll:
             self._skip_initial_poll = False
-            await asyncio.sleep(max(1.0, self._interval) * random.uniform(0.9, 1.1))
+            await self._sleep_or_wake(max(1.0, self._interval) * random.uniform(0.9, 1.1))
         while self.has_subscribers():
             found_new = False
             sub_names = [s.name or f"Поиск #{s.id}" for s in self.subscribers.values()]
@@ -764,7 +802,7 @@ class Watcher:
                     logger.info("[Мониторинг] %s: найдено и отправлено новых объявлений: %d! След. проверка через ~%dс", names_str, new_count, int(self._interval))
             self._cleanup_seen()
             self._bump_interval(found_new)
-            await asyncio.sleep(self._poll_delay())
+            await self._sleep_or_wake(self._poll_delay())
 
     async def _send_missing_alert_hint(self, app: Any, user_id: int) -> None:
         if not app.missing_alert_hint_once(user_id):

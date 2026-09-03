@@ -757,6 +757,29 @@ class RegressionTests(unittest.TestCase):
         finally:
             watcher._client.close()
 
+    def test_request_poll_now_wakes_the_idle_loop_without_repriming(self):
+        # "Обновить сейчас" must not re-prime (that marks the whole feed seen
+        # and swallows the very ads the user wants); it just wakes the sleep.
+        async def scenario():
+            watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", FakeBot())
+            try:
+                watcher.seen = {"already": time.time()}
+                primed = []
+                watcher._prime_seen = AsyncMock(side_effect=lambda *a, **k: primed.append(1))
+
+                task = asyncio.create_task(watcher._sleep_or_wake(30.0))
+                await asyncio.sleep(0.05)
+                started = time.monotonic()
+                watcher.request_poll_now()
+                await asyncio.wait_for(task, timeout=1.0)
+
+                self.assertLess(time.monotonic() - started, 1.0)
+                self.assertEqual(primed, [])          # never re-primed
+                self.assertEqual(watcher.seen, {"already": watcher.seen["already"]})
+            finally:
+                watcher._client.close()
+        asyncio.run(scenario())
+
     def test_only_new_rejects_bumped_old_listing_by_id_frontier(self):
         # Avito stamps sortTimeStamp/allowTimeStamp = now when an old listing is
         # bumped, so it looks fresh by time. The monotonic item-ID is the only

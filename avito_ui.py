@@ -1026,11 +1026,17 @@ async def cb_force_update(cq: types.CallbackQuery):
         return
 
     try:
-        await watcher.stop()
-        await watcher.start()
+        if watcher.task is None or watcher.task.done():
+            # Цикл не бежит — поднимаем его (прайминг тут уместен: терять
+            # нечего). В обычном случае просто будим опрос без переинициализации,
+            # иначе прайминг пометил бы всю выдачу виденной и заглушил именно
+            # те объявления, ради которых нажали кнопку.
+            await watcher.start()
+        else:
+            watcher.request_poll_now()
     except Exception as exc:
         logger.warning("force_update failed for %s: %s", sub.search_key, exc)
-        await cq.answer("Не удалось перезапустить", show_alert=True)
+        await cq.answer("Не удалось запустить проверку", show_alert=True)
         return
 
     await cq.answer("Проверка запущена")
