@@ -737,21 +737,28 @@ class Watcher:
                                 ad.ad_id, ad.title, sub.id, ad.ad_id, self._id_frontier,
                             )
                             continue
-                        if sub.only_new and START_STRICT and (
-                            not ad.published_exact or ad.published_ts is None
-                        ):
+                        if sub.only_new and START_STRICT and ad.published_ts is None:
                             logger.info(
-                                "Пропуск %s (%s) для sub=%s: нет точного времени публикации",
+                                "Пропуск %s (%s) для sub=%s: нет времени публикации",
                                 ad.ad_id,
                                 ad.title,
                                 sub.id,
                             )
                             continue
+                        # Точное время (sortTimeStamp из каталога) — узкий grace.
+                        # Относительная дата из DOM-фолбэка («N минут/часов назад»)
+                        # огрублена до часа — иначе эта ветка вообще не может ничего
+                        # доставить при дефолтах. От поднятого старья тут страхует
+                        # калитка по item-ID выше, а не флаг published_exact.
+                        freshness_grace = (
+                            START_GRACE_SEC if ad.published_exact
+                            else max(START_GRACE_SEC, 3600)
+                        )
                         if (
                             sub.only_new
                             and START_STRICT
                             and ad.published_ts is not None
-                            and ad.published_ts + START_GRACE_SEC < sub.started_ts
+                            and ad.published_ts + freshness_grace < sub.started_ts
                         ):
                             logger.info(
                                 "Пропуск %s (%s) для sub=%s: старое%s объявление "

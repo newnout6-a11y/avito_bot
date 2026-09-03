@@ -26,10 +26,12 @@ import aiohttp
 from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import ErrorEvent
 
 from avito_accounts import AccountService
 from avito_api import parse_api_items as parse_api_items
@@ -878,6 +880,25 @@ def get_watcher_status(
     if w.last_http_status and w.last_http_status != 200:
         return "🟡"
     return "🟢"
+
+
+def _format_sub_list_line(s: Subscription) -> str:
+    """Одна строка /list. parse_mode=HTML глобальный, а name/keywords/url —
+    свободный текст: без html.escape одиночный «<» ломает весь ответ
+    (400 can't parse entities) и команда молча не отвечает."""
+    desc = []
+    if s.name:
+        desc.append(f"name={html.escape(s.name)}")
+    if s.flt.keywords_all:
+        desc.append(f"kw={html.escape(','.join(s.flt.keywords_all))}")
+    if s.flt.keywords_stop:
+        desc.append(f"stop={html.escape(','.join(s.flt.keywords_stop))}")
+    if s.flt.price_min is not None:
+        desc.append(f"min={s.flt.price_min}")
+    if s.flt.price_max is not None:
+        desc.append(f"max={s.flt.price_max}")
+    tail = f" ({' ; '.join(desc)})" if desc else ""
+    return f"{s.id}: {html.escape(s.url)}{tail}"
 
 
 def format_sub_panel(
@@ -1756,6 +1777,40 @@ class App:
         self.dp.include_router(searches_router)
         self.dp.include_router(account_router)
 
+        _BENIGN_TG_ERRORS = (
+            "message is not modified",
+            "message to edit not found",
+            "message can't be deleted",
+            "query is too old",
+            "message to delete not found",
+        )
+
+        @self.dp.errors()
+        async def on_unhandled_error(event: ErrorEvent) -> bool:
+            """Единственная сеть безопасности на весь UI.
+
+            Без неё исключение из хендлера (частый случай — повторный тап
+            «Назад»/«Отмена» даёт TelegramBadRequest "message is not modified")
+            вылетает наверх, cq.answer() не вызывается, и у пользователя
+            кнопка «крутится» до таймаута.
+            """
+            exc = event.exception
+            benign = isinstance(exc, TelegramBadRequest) and any(
+                marker in str(exc).lower() for marker in _BENIGN_TG_ERRORS
+            )
+            if not benign:
+                logger.exception("Необработанная ошибка в хендлере: %s", exc)
+            cq = getattr(event.update, "callback_query", None)
+            if cq is not None:
+                try:
+                    await cq.answer(
+                        None if benign else "Что-то пошло не так, попробуйте ещё раз",
+                        show_alert=not benign,
+                    )
+                except Exception:
+                    pass
+            return True
+
         @self.dp.message(Command("test_alert"))
         async def test_alert(m: types.Message):
             if ADMIN_CHAT_ID is None or m.chat.id != ADMIN_CHAT_ID:
@@ -1855,8 +1910,8 @@ class App:
             await m.reply(
                 _br(
                     f"Подписка добавлена: <b>{sub.id}</b>\\n"
-                    f"Ссылка: {parsed_url.canonical_url}\\n"
-                    f"Конвертация API: <b>{_conversion_text(watcher)}</b>\\n"
+                    f"Ссылка: {html.escape(parsed_url.canonical_url)}\\n"
+                    f"Конвертация API: <b>{html.escape(_conversion_text(watcher))}</b>\\n"
                     "Карточки будут приходить в бот-оповещатель."
                     + warning_text
                 ),
@@ -1870,22 +1925,7 @@ class App:
             if not subs:
                 await m.reply(_br("У вас нет активных подписок."))
                 return
-            lines = ["Ваши подписки:"]
-            for s in subs:
-                desc = []
-                if s.name:
-                    desc.append(f"name={s.name}")
-                if s.flt.keywords_all:
-                    desc.append(f"kw={','.join(s.flt.keywords_all)}")
-                if s.flt.keywords_stop:
-                    desc.append(f"stop={','.join(s.flt.keywords_stop)}")
-                if s.flt.price_min is not None:
-                    desc.append(f"min={s.flt.price_min}")
-                if s.flt.price_max is not None:
-                    desc.append(f"max={s.flt.price_max}")
-                lines.append(
-                    f"{s.id}: {s.url} " + (f"({' ; '.join(desc)})" if desc else "")
-                )
+            lines = ["Ваши подписки:"] + [_format_sub_list_line(s) for s in subs]
             lines.append(
                 "\\nПодсказка: карточки приходят в бот-оповещатель после привязки."
             )

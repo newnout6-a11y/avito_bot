@@ -713,6 +713,45 @@ class RegressionTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_dom_fallback_ads_deliver_on_relative_timestamp(self):
+        # The CSS-selector fallback in parse_html_feed sets published_exact=False
+        # but does derive a timestamp from "N минут назад". only_new+START_STRICT
+        # must still let a fresh one through (wider grace), and still drop one
+        # that the relative date puts well before the subscription started.
+        async def scenario():
+            bot = FakeBot()
+            bot.app = FakeDeliveryApp()
+            watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+            started = 100_000.0
+            watcher.add_sub(appmod.Subscription(
+                id=1, user_id=1, search_key="key", url=watcher.url,
+                only_new=True, started_ts=started,
+            ))
+            watcher._fetch_ads = AsyncMock(return_value=[
+                appmod.Ad(
+                    ad_id="8400000900", url="https://www.avito.ru/8400000900",
+                    title="fresh dom", published_ts=started + 30,
+                    published_exact=False,
+                ),
+                appmod.Ad(
+                    ad_id="8400000901", url="https://www.avito.ru/8400000901",
+                    title="hour-old dom", published_ts=started - 7200,
+                    published_exact=False,
+                ),
+            ])
+            with patch.object(monitoring, "START_STRICT", True), patch.object(
+                monitoring, "ONLY_NEW_ID_GATE", False
+            ), patch(
+                "avito_monitoring.asyncio.sleep",
+                AsyncMock(side_effect=asyncio.CancelledError),
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await watcher._run()
+            self.assertEqual(bot.app.user_sent, {(1, "8400000900")})
+            watcher._client.close()
+
+        asyncio.run(scenario())
+
     def test_feed_window_gap_detection_and_cadence_cap(self):
         bot = FakeBot()
         bot.app = FakeDeliveryApp()
@@ -1621,6 +1660,24 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(
             copy_button["copy_text"]["text"], "https://www.avito.ru/123456789"
         )
+
+    def test_list_line_escapes_free_user_text(self):
+        sub = appmod.Subscription(
+            id=3,
+            user_id=1,
+            search_key="k",
+            url="https://www.avito.ru/moskva/telefony?q=a&b=1",
+            flt=appmod.SubscriberFilter(
+                keywords_all=["Samsung & LG"], keywords_stop=["<коп>"]
+            ),
+            name="телефон <50000",
+        )
+        line = avito_ui._format_sub_list_line(sub)
+        self.assertNotIn("<50000", line)
+        self.assertIn("&lt;50000", line)
+        self.assertIn("Samsung &amp; LG", line)
+        self.assertIn("&lt;коп&gt;", line)
+        self.assertIn("q=a&amp;b=1", line)
 
     def test_alert_keyboard_link_cannot_be_hijacked_by_ad_title(self):
         # Seller-controlled title text that looks like a link / an avito.ru
