@@ -263,11 +263,20 @@ def _extract_avito_url_text(text: str) -> Optional[str]:
     return match.group(0) if match else None
 
 
-def _alert_reply_markup(caption: str) -> Optional[Dict[str, Any]]:
-    url = _extract_avito_url_text(html.unescape(caption or ""))
-    if not url:
-        return None
-    url = url.rstrip(".,;:!?)]}'\"")
+def _alert_reply_markup(
+    caption: str, item_url: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    # The ad URL is authoritative when passed in. Falling back to scraping it
+    # out of the rendered caption is unsafe: the caption opens with the ad
+    # title (seller-controlled), so `.search()` would grab the first avito.ru
+    # match there — which could be plain title text or "avito.ru" embedded in
+    # a phishing host. Anything from the caption is validated before use.
+    url = (item_url or "").strip()
+    if not url or not is_valid_avito_url(url):
+        url = _extract_avito_url_text(html.unescape(caption or "")) or ""
+        url = url.rstrip(".,;:!?)]}'\"")
+        if not url or not is_valid_avito_url(url):
+            return None
     rows = [
         [
             _inline_button(
@@ -1580,14 +1589,18 @@ class App:
         return True
 
     async def send_to_alert(
-        self, alert_chat_id: int, caption: str, image_url: Optional[str]
+        self,
+        alert_chat_id: int,
+        caption: str,
+        image_url: Optional[str],
+        item_url: Optional[str] = None,
     ) -> bool:
         """Send a notification through the alert bot's reusable HTTP session."""
         if not self.alert_token:
             return False
         api = f"https://api.telegram.org/bot{self.alert_token}"
         safe_caption = _br(caption)
-        reply_markup = _alert_reply_markup(safe_caption)
+        reply_markup = _alert_reply_markup(safe_caption, item_url)
         if self._alert_session is None or self._alert_session.closed:
             self._alert_session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=10)

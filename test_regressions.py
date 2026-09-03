@@ -69,7 +69,7 @@ class FakeDeliveryApp:
     def get_alert_chat_id(self, user_id):
         return user_id
 
-    async def send_to_alert(self, chat_id, caption, image_url):
+    async def send_to_alert(self, chat_id, caption, image_url, item_url=None):
         self.deliveries.append(chat_id)
         return True
 
@@ -1608,7 +1608,8 @@ class RegressionTests(unittest.TestCase):
     def test_alert_keyboard_uses_styles_copy_text_and_custom_emoji(self):
         with patch.dict(avito_ui._BUTTON_ICON_IDS, {"primary": "emoji-1"}):
             markup = avito_ui._alert_reply_markup(
-                "<b>Samsung</b>\nhttps://www.avito.ru/123456789"
+                "<b>Samsung</b>\nhttps://www.avito.ru/123456789",
+                "https://www.avito.ru/123456789",
             )
 
         self.assertIsNotNone(markup)
@@ -1620,6 +1621,25 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(
             copy_button["copy_text"]["text"], "https://www.avito.ru/123456789"
         )
+
+    def test_alert_keyboard_link_cannot_be_hijacked_by_ad_title(self):
+        # Seller-controlled title text that looks like a link / an avito.ru
+        # subdomain of a phishing host must never become the button URL.
+        real = "https://www.avito.ru/moskva/telefony/iphone_7654321"
+        hijack_caption = (
+            "<b>iPhone 15 https://avito.ru.evil-phish.com/pay СРОЧНО</b>\n"
+            "50 000 ₽\n" + real
+        )
+        # authoritative item_url wins outright
+        markup = avito_ui._alert_reply_markup(hijack_caption, real)
+        open_button = markup["inline_keyboard"][0][0]
+        self.assertEqual(open_button["url"], real)
+        # and even with no item_url, the phishing host fails validation ->
+        # no button rather than a poisoned one
+        poisoned = avito_ui._alert_reply_markup(
+            "<b>avito.ru.evil-phish.com/pay</b>\nfree phone", None
+        )
+        self.assertIsNone(poisoned)
 
     def test_alert_message_effect_retries_without_effect(self):
         class FakeResponse:

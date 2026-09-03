@@ -778,7 +778,9 @@ class Watcher:
                         if AVITO_ENRICH and ad.url not in self._enrich_cache:
                             await self._enrich_ad_details(ad)
                         chat_id = app.get_alert_chat_id(sub.user_id)
-                        if chat_id and await app.send_to_alert(chat_id, self._build_caption(ad), ad.image_url):
+                        if chat_id and await app.send_to_alert(
+                            chat_id, self._build_caption(ad), ad.image_url, item_url=ad.url
+                        ):
                             if self.on_deliver:
                                 self.on_deliver(sub.user_id, ad)
                             app.sent_mark(sub.user_id, ad.ad_id, now)
