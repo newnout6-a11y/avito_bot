@@ -1497,7 +1497,7 @@ def account_panel_text(app: Any, user_id: int) -> str:
 
     header = "👤 <b>Аккаунт</b>" + ("  🛠 <b>DEVELOPER</b>" if is_dev else "")
     if unlimited:
-        access_txt = "♾ <b>Безлимит</b>"
+        access_txt = "<b>♾</b>"
     elif exp_dt:
         access_txt = f"<b>{exp_dt.strftime('%d.%m.%Y %H:%M')}</b>"
     else:
