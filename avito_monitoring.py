@@ -98,6 +98,7 @@ class Watcher:
         self._api_url: Optional[str] = None
         self._api_route_managed = False
         self._skip_initial_poll = False
+        self._primed = False
         self._license_skip_logged = False
         self._wake = asyncio.Event()
         self._sleep_task: Optional[asyncio.Task] = None
@@ -124,9 +125,18 @@ class Watcher:
                 cookie_store=self._cookie_store_path(),
             )
             self._client_closed = False
-        if PRIME_ON_START:
+        # Восстановленная подписка может принадлежать пользователю с уже
+        # истёкшей лицензией (WatcherManager.restore — при старте бота их
+        # может быть много). Прайминг — реальный запрос к Avito впустую,
+        # раз доставлять всё равно некому; отложить до первого подписчика
+        # с активной лицензией (см. _run) вместо запроса на каждый рестарт.
+        app = cast(Any, self.bot).app
+        if PRIME_ON_START and self._has_active_subscriber(app):
             await self._prime_seen(None)
         self.task = asyncio.create_task(self._run(), name=f"watch:{self.search_key}")
+
+    def _has_active_subscriber(self, app: Any) -> bool:
+        return any(app.license.is_active(sub.user_id) for sub in self.subscribers.values())
 
     async def stop(self):
         if self.task:
@@ -596,6 +606,7 @@ class Watcher:
         self._note_id_frontier(ads)
         self._watch_feed_window(ads, name_hint)
         self._skip_initial_poll = True
+        self._primed = True
         logger.info("[Мониторинг] Инициализация %s завершена: запомнено %d объявлений, запущен мониторинг новых", name_hint, len(self.seen))
 
     @staticmethod
@@ -707,7 +718,7 @@ class Watcher:
             found_new = False
             sub_names = [s.name or f"Поиск #{s.id}" for s in self.subscribers.values()]
             names_str = ", ".join(f"«{n}»" for n in sub_names) if sub_names else self.search_key[:40]
-            if not any(app.license.is_active(sub.user_id) for sub in self.subscribers.values()):
+            if not self._has_active_subscriber(app):
                 # Ни у кого из подписчиков нет активного ключа — доставлять
                 # всё равно некому. Раньше вотчер продолжал долбить Avito на
                 # полном темпе ради ads, которые тут же отбрасывались в цикле
@@ -723,6 +734,15 @@ class Watcher:
                 await self._sleep_or_wake(self._poll_delay())
                 continue
             self._license_skip_logged = False
+            if PRIME_ON_START and not self._primed:
+                # start() пропустил прайминг (тогда активных не было) — теперь
+                # кто-то активировался. Один тихий запрос на baseline seen,
+                # без доставки, чтобы не вывалить на него весь текущий фид
+                # пачкой «новых» — так же, как обычный прайминг на старте.
+                await self._prime_seen(None)
+                self._bump_interval(found_new=False)
+                await self._sleep_or_wake(self._poll_delay())
+                continue
             ads = await self._fetch_ads()
             if ads is None:
                 route_until = Watcher._route_blocked_until.get(self._route_key(), 0.0)

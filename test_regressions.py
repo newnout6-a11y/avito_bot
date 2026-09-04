@@ -664,6 +664,7 @@ class RegressionTests(unittest.TestCase):
             bot = FakeBot()
             bot.app = FakeDeliveryApp()
             watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+            watcher._primed = True  # simulate start() already having primed
             ad = appmod.Ad(ad_id="1", url="https://www.avito.ru/1", title="Phone")
             watcher.seen[ad.ad_id] = time.time()
             watcher.add_sub(appmod.Subscription(
@@ -688,6 +689,7 @@ class RegressionTests(unittest.TestCase):
             bot = FakeBot()
             bot.app = FakeDeliveryApp()
             watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+            watcher._primed = True  # simulate start() already having primed
             watcher.add_sub(appmod.Subscription(
                 id=1,
                 user_id=1,
@@ -759,12 +761,16 @@ class RegressionTests(unittest.TestCase):
         asyncio.run(scenario())
 
     def test_any_active_subscriber_resumes_fetching(self):
+        # Watcher already primed (e.g. start() primed it while someone was
+        # active) — an unrelated inactive subscriber must not block delivery
+        # to the one who is active.
         async def scenario():
             bot = FakeBot()
             bot.app = FakeDeliveryApp()
             bot.app.license = MagicMock()
             bot.app.license.is_active.side_effect = lambda uid: uid == 2
             watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+            watcher._primed = True
             watcher.add_sub(appmod.Subscription(
                 id=1, user_id=1, search_key="key", url=watcher.url, only_new=False
             ))
@@ -780,6 +786,60 @@ class RegressionTests(unittest.TestCase):
             watcher._client.close()
         asyncio.run(scenario())
 
+    def test_reactivation_primes_silently_before_first_real_fetch(self):
+        # A restored watcher whose owner's license had lapsed skips priming in
+        # start() (see test_license_gate_skips_priming_in_start below). Once
+        # license.is_active flips true, _run must prime silently (baseline
+        # seen, no delivery) on the transition cycle, then fetch for real on
+        # the next one — never dump the whole current feed as "new".
+        async def scenario():
+            bot = FakeBot()
+            bot.app = FakeDeliveryApp()
+            watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+            self.assertFalse(watcher._primed)
+            watcher.add_sub(appmod.Subscription(
+                id=1, user_id=1, search_key="key", url=watcher.url, only_new=True
+            ))
+            baseline_ad = appmod.Ad(ad_id="1", url="https://www.avito.ru/1", title="old")
+            watcher._fetch_ads = AsyncMock(return_value=[baseline_ad])
+
+            sleeps = []
+
+            async def fake_sleep(_delay):
+                sleeps.append(1)
+                if len(sleeps) >= 2:
+                    raise asyncio.CancelledError
+
+            with patch("avito_monitoring.asyncio.sleep", fake_sleep):
+                with self.assertRaises(asyncio.CancelledError):
+                    await watcher._run()
+
+            # primed (seen baselined) but nothing delivered — same ad both times
+            self.assertTrue(watcher._primed)
+            self.assertEqual(bot.app.deliveries, [])
+            self.assertIn("1", watcher.seen)
+            watcher._client.close()
+        asyncio.run(scenario())
+
+    def test_license_gate_skips_priming_in_start(self):
+        async def scenario():
+            bot = FakeBot()
+            bot.app = FakeDeliveryApp()
+            bot.app.license = MagicMock()
+            bot.app.license.is_active.return_value = False
+            watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+            watcher.add_sub(appmod.Subscription(
+                id=1, user_id=1, search_key="key", url=watcher.url, only_new=False
+            ))
+            watcher._prime_seen = AsyncMock(
+                side_effect=AssertionError("must not prime for an inactive-only watcher")
+            )
+            with patch.object(monitoring, "PRIME_ON_START", True):
+                await watcher.start()
+            self.assertFalse(watcher._primed)
+            await watcher.stop()
+        asyncio.run(scenario())
+
     def test_dom_fallback_ads_deliver_on_relative_timestamp(self):
         # The CSS-selector fallback in parse_html_feed sets published_exact=False
         # but does derive a timestamp from "N минут назад". only_new+START_STRICT
@@ -789,6 +849,7 @@ class RegressionTests(unittest.TestCase):
             bot = FakeBot()
             bot.app = FakeDeliveryApp()
             watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+            watcher._primed = True  # simulate start() already having primed
             started = 100_000.0
             watcher.add_sub(appmod.Subscription(
                 id=1, user_id=1, search_key="key", url=watcher.url,
@@ -894,6 +955,7 @@ class RegressionTests(unittest.TestCase):
             bot = FakeBot()
             bot.app = FakeDeliveryApp()
             watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+            watcher._primed = True  # simulate start() already having primed
             watcher._id_frontier = 8_400_000_000
             watcher.add_sub(appmod.Subscription(
                 id=1, user_id=1, search_key="key", url=watcher.url,
@@ -933,6 +995,7 @@ class RegressionTests(unittest.TestCase):
             bot = FakeBot()
             bot.app = FakeDeliveryApp()
             watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+            watcher._primed = True  # simulate start() already having primed
             ad = appmod.Ad(ad_id="1", url="https://www.avito.ru/1", title="Phone")
             watcher.add_sub(appmod.Subscription(
                 id=1, user_id=1, search_key="key", url=watcher.url, only_new=False
@@ -957,6 +1020,7 @@ class RegressionTests(unittest.TestCase):
             bot = FakeBot()
             bot.app = FakeDeliveryApp()
             watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+            watcher._primed = True  # simulate start() already having primed
             watcher.add_sub(appmod.Subscription(
                 id=1, user_id=1, search_key="key", url=watcher.url, only_new=False
             ))
