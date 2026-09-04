@@ -988,6 +988,71 @@ class RegressionTests(unittest.TestCase):
                 watcher._client.close()
         asyncio.run(scenario())
 
+    def test_id_frontier_is_not_poisoned_by_a_single_outlier(self):
+        # Live 04.09.2026, «самсунг, вся Россия»: one ordinary listing carried
+        # an ID 44M above the next-highest in the same feed, while the newest
+        # ad by time sat 45M BELOW the max — Avito hands out IDs from several
+        # ranges. A strict max() ratchet parked the frontier a week ahead and
+        # silenced the feed completely. The frontier must ignore that outlier.
+        bot = FakeBot()
+        bot.app = FakeDeliveryApp()
+        watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+        try:
+            ids = [
+                8200682292, 8251954634, 8254517513, 8270282581, 8273836185,
+                8292838532, 8294177997, 8295614124, 8334941990, 8335203119,
+                8345738580, 8357368871, 8362219252, 8362527011, 8393067331,
+                8393469900, 8415308111, 8415588245, 8417103868, 8417322882,
+                8461395275,  # <- выброс, 44M выше следующего
+            ]
+            batch = [
+                appmod.Ad(ad_id=str(i), url=f"https://www.avito.ru/{i}", title="x")
+                for i in ids
+            ]
+            watcher._note_id_frontier(batch)
+            self.assertLess(watcher._id_frontier, 8461395275)
+            self.assertGreaterEqual(watcher._id_frontier, 8415308111)
+        finally:
+            watcher._client.close()
+
+    def test_fresh_ad_below_the_outlier_still_gets_delivered(self):
+        # Same feed shape: the genuinely newest listing (8415588245) must not
+        # be rejected just because some other range reached 8461M.
+        async def scenario():
+            bot = FakeBot()
+            bot.app = FakeDeliveryApp()
+            watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+            watcher._primed = True
+            watcher._id_frontier = 8_417_322_882  # p90 of the live batch
+            watcher.add_sub(appmod.Subscription(
+                id=1, user_id=1, search_key="key", url=watcher.url,
+                only_new=True, started_ts=1_000,
+            ))
+            now_ish = time.time()
+            watcher._fetch_ads = AsyncMock(return_value=[
+                appmod.Ad(  # свежее, но из «нижнего» диапазона ID
+                    ad_id="8415588245", url="https://www.avito.ru/8415588245",
+                    title="Samsung Galaxy A17", published_ts=now_ish,
+                    published_exact=True,
+                ),
+                appmod.Ad(  # реально древнее — 217M ниже фронтира
+                    ad_id="8200682292", url="https://www.avito.ru/8200682292",
+                    title="Samsung Galaxy A15", published_ts=now_ish,
+                    published_exact=True,
+                ),
+            ])
+            with patch.object(monitoring, "START_STRICT", True), patch.object(
+                monitoring, "ONLY_NEW_ID_GATE", True
+            ), patch(
+                "avito_monitoring.asyncio.sleep",
+                AsyncMock(side_effect=asyncio.CancelledError),
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await watcher._run()
+            self.assertEqual(bot.app.user_sent, {(1, "8415588245")})
+            watcher._client.close()
+        asyncio.run(scenario())
+
     def test_only_new_rejects_bumped_old_listing_by_id_frontier(self):
         # Avito stamps sortTimeStamp/allowTimeStamp = now when an old listing is
         # bumped, so it looks fresh by time. The monotonic item-ID is the only

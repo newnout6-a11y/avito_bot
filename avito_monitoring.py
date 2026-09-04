@@ -46,6 +46,7 @@ from avito_settings import (
     AVITO_PROXY_CHANGE_URLS,
     AVITO_REQUEST_GAP_SEC,
     ONLY_NEW_ID_GATE,
+    ONLY_NEW_ID_MARGIN,
     POLL_PERIOD_MAX_SEC,
     POLL_PERIOD_SEC,
     PRIME_ON_START,
@@ -257,10 +258,25 @@ class Watcher:
             return 0
 
     def _note_id_frontier(self, ads: List[Ad]) -> None:
-        """Поднять фронтир свежести до максимального item-ID в партии."""
-        batch_max = max((self._numeric_id(ad.ad_id) for ad in ads), default=0)
-        if batch_max > self._id_frontier:
-            self._id_frontier = batch_max
+        """Поднять фронтир свежести по верхнему перцентилю item-ID партии.
+
+        Строгий max() тут не годится: замер 04.09.2026 на «самсунг, вся
+        Россия» показал обычное объявление (type=item, categoryId=84) с ID на
+        44 млн выше следующего в той же ленте, при том что самое свежее по
+        времени было на 45 млн НИЖЕ максимума. ID у Avito раздаются не одной
+        монотонной последовательностью, а из нескольких диапазонов: у
+        объявлений-ровесников (17:39–18:00) разброс ID достигал 68 млн.
+        Один такой выброс задирал храповик-фронтир на неделю вперёд и
+        наглухо закрывал ленту — бот переставал находить что-либо вообще.
+        """
+        ids = sorted(i for i in (self._numeric_id(ad.ad_id) for ad in ads) if i)
+        if not ids:
+            return
+        # p90 отбрасывает единичные выбросы из верхнего диапазона.
+        index = max(0, int(round(0.9 * len(ids))) - 1)
+        batch_frontier = ids[index]
+        if batch_frontier > self._id_frontier:
+            self._id_frontier = batch_frontier
 
     @staticmethod
     def _feed_window_seconds(ads: List[Ad]) -> float:
@@ -780,16 +796,19 @@ class Watcher:
                         if not app.license.is_active(sub.user_id):
                             logger.info("Пропуск %s для user=%s: лицензия неактивна", ad.ad_id, sub.user_id)
                             continue
+                        ad_numeric_id = self._numeric_id(ad.ad_id)
                         if (
                             sub.only_new
                             and ONLY_NEW_ID_GATE
                             and self._id_frontier
-                            and 0 < self._numeric_id(ad.ad_id) <= self._id_frontier
+                            and 0 < ad_numeric_id
+                            and ad_numeric_id + ONLY_NEW_ID_MARGIN < self._id_frontier
                         ):
                             logger.info(
-                                "Пропуск %s (%s) для sub=%s: item-ID %s ≤ фронтира свежести %s "
-                                "— поднятое/перепубликованное старое",
-                                ad.ad_id, ad.title, sub.id, ad.ad_id, self._id_frontier,
+                                "Пропуск %s (%s) для sub=%s: item-ID %s ниже фронтира %s "
+                                "более чем на %s — заведомо старое",
+                                ad.ad_id, ad.title, sub.id, ad.ad_id,
+                                self._id_frontier, ONLY_NEW_ID_MARGIN,
                             )
                             continue
                         if sub.only_new and START_STRICT and ad.published_ts is None:
