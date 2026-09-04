@@ -1783,8 +1783,43 @@ class RegressionTests(unittest.TestCase):
                 with patch.object(appmod.Watcher, "start", AsyncMock()):
                     original = await manager.add_subscription(9, "https://www.avito.ru/moskva?q=test")
                     restored = appmod.WatcherManager(FakeBot(), path)
+                    restored.bot.app = FakeDeliveryApp()
                     await restored.restore()
                     self.assertEqual(restored.list_user_subs(9)[0].id, original.id)
+        asyncio.run(scenario())
+
+    def test_restore_log_reports_live_vs_license_waiting_separately(self):
+        # "восстановлено" counts every persisted search regardless of owner;
+        # "поисков" is how many distinct watchers that makes; only the ones
+        # with an active-license subscriber are actually polling. All three
+        # numbers used to be conflated under one misleading "активных".
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                path = str(Path(tmp) / "subs.json")
+                update_json(path, [], lambda rows: rows.extend([
+                    {
+                        "id": 1, "user_id": 111,
+                        "url": "https://www.avito.ru/moskva?q=one",
+                        "search_key": "https://avito.ru/moskva?q=one",
+                    },
+                    {
+                        "id": 2, "user_id": 222,
+                        "url": "https://www.avito.ru/moskva?q=two",
+                        "search_key": "https://avito.ru/moskva?q=two",
+                    },
+                ]))
+                manager = appmod.WatcherManager(FakeBot(), path)
+                manager.bot.app = FakeDeliveryApp()
+                manager.bot.app.license = MagicMock()
+                manager.bot.app.license.is_active.side_effect = lambda uid: uid == 111
+                with patch.object(appmod.Watcher, "start", AsyncMock()):
+                    with self.assertLogs(monitoring.logger, level="INFO") as logs:
+                        await manager.restore()
+                summary = next(m for m in logs.output if "Восстановлено подписок" in m)
+                self.assertIn("подписок: 2", summary)
+                self.assertIn("поисков: 2", summary)
+                self.assertIn("опрашивается: 1", summary)
+                self.assertIn("ждут активной лицензии: 1", summary)
         asyncio.run(scenario())
 
     def test_restore_uses_original_url_fallback_and_keeps_filters(self):
@@ -1806,6 +1841,7 @@ class RegressionTests(unittest.TestCase):
                     ),
                 )
                 manager = appmod.WatcherManager(FakeBot(), path)
+                manager.bot.app = FakeDeliveryApp()
                 with patch.object(appmod.Watcher, "start", AsyncMock()):
                     await manager.restore()
                 restored = manager.list_user_subs(9)[0]

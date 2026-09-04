@@ -1035,7 +1035,13 @@ class WatcherManager:
             except (KeyError, TypeError, ValueError) as exc:
                 logger.warning("Пропущена поврежденная подписка: %s", exc)
         total_subs = sum(len(s) for s in self.subs_by_user.values())
-        logger.info("[Мониторинг] Восстановлено подписок: %d, активных поисков: %d", total_subs, len(self.watchers))
+        app = cast(Any, self.bot).app
+        live = sum(1 for w in self.watchers.values() if w._has_active_subscriber(app))
+        logger.info(
+            "[Мониторинг] Восстановлено подписок: %d, поисков: %d "
+            "(опрашивается: %d, ждут активной лицензии: %d)",
+            total_subs, len(self.watchers), live, len(self.watchers) - live,
+        )
         for watcher in self.watchers.values():
             await watcher.start()
 
