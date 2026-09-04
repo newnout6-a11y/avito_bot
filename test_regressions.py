@@ -395,6 +395,47 @@ class RegressionTests(unittest.TestCase):
         )
         self.assertFalse(appmod.Watcher._ad_passes_filters(latin_ad, stop))
 
+    def test_numeric_keyword_requires_a_digit_run_boundary(self):
+        # "24" as a required keyword matches "S24" (a letter right before a
+        # digit run is a real model-number boundary) but must not match
+        # inside a longer number like "2024" or a price like "824000".
+        year_ad = appmod.Ad(
+            ad_id="1", url="https://avito.ru/1",
+            title="Samsung Galaxy S24", description="2024 года выпуска, отличное состояние",
+        )
+        wants_24 = appmod.Subscription(
+            1, 1, "key", "https://avito.ru/moskva",
+            appmod.SubscriberFilter(keywords_all=["24"]),
+        )
+        self.assertTrue(appmod.Watcher._ad_passes_filters(year_ad, wants_24))
+
+        only_number_noise = appmod.Ad(
+            ad_id="2", url="https://avito.ru/2",
+            title="Samsung Galaxy S23", description="2024 года выпуска, цена 824000",
+        )
+        self.assertFalse(appmod.Watcher._ad_passes_filters(only_number_noise, wants_24))
+
+    def test_letter_keyword_matching_is_unchanged_substring(self):
+        # Letters deliberately keep plain substring matching — Russian
+        # inflection needs it (a fixed word-boundary would break "самсунг"
+        # matching "самсунга"/"самсунгу"), so this is unaffected by the
+        # digit-boundary fix above.
+        ad = appmod.Ad(
+            ad_id="1", url="https://avito.ru/1",
+            title="Продам самсунга (опечатка в объявлении)", description="",
+        )
+        sub = appmod.Subscription(
+            1, 1, "key", "https://avito.ru/moskva",
+            appmod.SubscriberFilter(keywords_all=["самсунг"]),
+        )
+        self.assertTrue(appmod.Watcher._ad_passes_filters(ad, sub))
+
+    def test_guessed_keywords_drop_single_character_tokens(self):
+        filters, _warnings = avito_domain.parse_filters(
+            "https://www.avito.ru/all/telefony?q=" + "самсунг+с+24"
+        )
+        self.assertEqual(filters.keywords_all, ["самсунг", "24"])
+
     def test_add_options_preserve_full_filter_contract(self):
         spec = appmod.parse_avito_url(
             "https://avito.ru/moskva?q=Samsung&pmin=10000&pmax=70000"

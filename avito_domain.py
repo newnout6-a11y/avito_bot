@@ -7,6 +7,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import List, Literal, Optional
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
@@ -342,6 +343,30 @@ def translit_to_cyrillic(text: str) -> str:
     return "".join(_SINGLE_TRANSLIT.get(ch, ch) for ch in res)
 
 
+@lru_cache(maxsize=2048)
+def _digit_run_start_pattern(word: str) -> re.Pattern:
+    return re.compile(r"(?<!\d)" + re.escape(word))
+
+
+def _word_prefix_in(word: str, haystack: str) -> bool:
+    """True if `word` occurs in `haystack`, with digit runs boundary-checked.
+
+    Plain substring containment let a short numeric keyword match noise it
+    was never meant to: a required "24" matched inside a price like "824000"
+    or a year like "2024". A purely-numeric keyword must instead start a
+    digit run (not preceded by another digit) — "24" still matches "S24" or
+    "iPhone24" (letter right before a digit run is fine, that's how model
+    numbers are written), just not a longer number that happens to contain it.
+    Letter keywords keep plain substring matching: Russian inflection needs
+    it (самсунг must still match самсунга/самсунгу/самсунгом).
+    """
+    if not word:
+        return False
+    if not word.isdigit():
+        return word in haystack
+    return _digit_run_start_pattern(word).search(haystack) is not None
+
+
 def keyword_in_text(keyword: str, haystack_casefold: str, haystack_translit: str) -> bool:
     """True if keyword occurs in the text, ignoring case and latin/cyrillic script.
 
@@ -351,9 +376,9 @@ def keyword_in_text(keyword: str, haystack_casefold: str, haystack_translit: str
     word = (keyword or "").strip().casefold()
     if not word:
         return False
-    if word in haystack_casefold:
+    if _word_prefix_in(word, haystack_casefold):
         return True
-    return translit_to_cyrillic(word) in haystack_translit
+    return _word_prefix_in(translit_to_cyrillic(word), haystack_translit)
 
 
 def extract_url_metadata(url_str: str) -> dict[str, object]:
@@ -623,6 +648,17 @@ def _first_query_price(query: dict[str, list[str]], keys: tuple[str, ...]) -> Op
     return None
 
 
+def _is_guessable_keyword(word: str) -> bool:
+    """Drop tokens too short to ever filter anything on their own.
+
+    These are auto-guessed from Avito's own q=/f= params, not typed by a
+    person: a 1-character token matches virtually every word as a prefix
+    (see _word_prefix_in) and adds no filtering value while looking, in the
+    UI, like a real required word.
+    """
+    return len(word) >= 2
+
+
 def _parse_query_filters(query: dict[str, list[str]]) -> SubscriberFilter:
     result = SubscriberFilter(
         price_min=_first_query_price(query, _PRICE_MIN_KEYS),
@@ -630,7 +666,8 @@ def _parse_query_filters(query: dict[str, list[str]]) -> SubscriberFilter:
     )
     for value in query.get("q", []):
         result.keywords_all.extend(
-            word for word in re.split(r"[,\s]+", value.strip()) if word
+            word for word in re.split(r"[,\s]+", value.strip())
+            if _is_guessable_keyword(word)
         )
     return result
 
@@ -697,7 +734,8 @@ def _parse_encoded_filter(encoded_filter: str) -> SubscriberFilter:
         pick(parameter, _PARAM_TEXT_KEYS)
     for text_part in text_parts:
         result.keywords_all.extend(
-            word for word in re.split(r"[,\s/]+", text_part) if word.strip()
+            word for word in re.split(r"[,\s/]+", text_part)
+            if _is_guessable_keyword(word.strip())
         )
     return result
 
