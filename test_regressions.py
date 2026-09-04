@@ -1855,6 +1855,38 @@ class RegressionTests(unittest.TestCase):
                 self.assertIsNone(alert_bot._consume_link_token("secret"))
                 self.assertIsNone(alert_bot._consume_link_token("777"))
 
+    def test_account_panel_shows_infinity_and_dev_badge_for_long_lived_keys(self):
+        from datetime import datetime, timedelta, timezone
+
+        def fake_app(user_id, expires_in_days, admin_id):
+            app = MagicMock()
+            app.license.expiry_dt.return_value = (
+                datetime.now(timezone.utc) + timedelta(days=expires_in_days)
+                if expires_in_days is not None else None
+            )
+            app.account_get.return_value = {
+                "registered": time.time(), "keys": [{"key": "abcd-1234", "expires": time.time() + 1}]
+            }
+            app.manager.list_user_subs.return_value = []
+            return app
+
+        with patch.object(avito_ui, "ADMIN_CHAT_ID", 111):
+            # dev account, key valid 100 years -> infinity + DEVELOPER badge
+            text = avito_ui.account_panel_text(fake_app(111, 36500, 111), 111)
+            self.assertIn("♾", text)
+            self.assertIn("DEVELOPER", text)
+            self.assertNotIn("не активен", text)
+
+            # regular 24h key on a non-admin account -> plain date, no badge
+            text2 = avito_ui.account_panel_text(fake_app(222, 1, 111), 222)
+            self.assertNotIn("♾", text2)
+            self.assertNotIn("DEVELOPER", text2)
+
+            # admin with a short-lived key still gets the badge, not infinity
+            text3 = avito_ui.account_panel_text(fake_app(111, 1, 111), 111)
+            self.assertIn("DEVELOPER", text3)
+            self.assertNotIn("♾", text3)
+
     def test_alert_keyboard_uses_styles_copy_text_and_custom_emoji(self):
         with patch.dict(avito_ui._BUTTON_ICON_IDS, {"primary": "emoji-1"}):
             markup = avito_ui._alert_reply_markup(

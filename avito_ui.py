@@ -1467,11 +1467,18 @@ async def accept_key_regexp(m: types.Message, state: FSMContext):
 account_router = Router(name="account")
 
 
+UNLIMITED_ACCESS_THRESHOLD_SEC = 10 * 365 * 86400  # ключ на 10+ лет = «безлимит», не дата
+
+
 def account_panel_text(app: Any, user_id: int) -> str:
     lic: LicenseManager = app.license
     acc = app.account_get(user_id)
     subs = app.manager.list_user_subs(user_id)
     exp_dt = lic.expiry_dt(user_id)
+    is_dev = ADMIN_CHAT_ID is not None and user_id == ADMIN_CHAT_ID
+    unlimited = exp_dt is not None and (
+        exp_dt.timestamp() - time.time() > UNLIMITED_ACCESS_THRESHOLD_SEC
+    )
 
     key_txt = "—"
     if acc and acc.get("keys"):
@@ -1488,13 +1495,21 @@ def account_panel_text(app: Any, user_id: int) -> str:
         key_value = str(current.get("key", ""))
         key_txt = f"•••• {key_value[-4:]}" if key_value else "—"
 
+    header = "👤 <b>Аккаунт</b>" + ("  🛠 <b>DEVELOPER</b>" if is_dev else "")
+    if unlimited:
+        access_txt = "♾ <b>Безлимит</b>"
+    elif exp_dt:
+        access_txt = f"<b>{exp_dt.strftime('%d.%m.%Y %H:%M')}</b>"
+    else:
+        access_txt = "<b>не активен</b>"
+
     lines = [
-        "👤 <b>Аккаунт</b>",
+        header,
         f"ID: <code>{user_id}</code>",
         f"Регистрация: {_fmt_dt((acc or {}).get('registered')) if acc else '—'}",
         "",
         f"Ключ: <code>{key_txt}</code>",
-        f"Доступ до: <b>{exp_dt.strftime('%d.%m.%Y %H:%M') if exp_dt else 'не активен'}</b>",
+        f"Доступ до: {access_txt}",
         f"Поисков: <b>{len(subs)}</b>",
     ]
     return "\n".join(lines)
