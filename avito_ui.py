@@ -167,7 +167,7 @@ MAIN_INLINE_KB = types.InlineKeyboardMarkup(
         ],
         [
             _inline_button(text="ℹ️ Помощь", callback_data="help", style="primary"),
-            _inline_button(text="Поддержка", callback_data="support", style="primary"),
+            _inline_button(text="Поддержка", callback_data="support", style="success"),
         ],
     ],
 )
