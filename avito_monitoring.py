@@ -98,6 +98,7 @@ class Watcher:
         self._api_url: Optional[str] = None
         self._api_route_managed = False
         self._skip_initial_poll = False
+        self._license_skip_logged = False
         self._wake = asyncio.Event()
         self._sleep_task: Optional[asyncio.Task] = None
         self._id_frontier = 0
@@ -706,6 +707,22 @@ class Watcher:
             found_new = False
             sub_names = [s.name or f"Поиск #{s.id}" for s in self.subscribers.values()]
             names_str = ", ".join(f"«{n}»" for n in sub_names) if sub_names else self.search_key[:40]
+            if not any(app.license.is_active(sub.user_id) for sub in self.subscribers.values()):
+                # Ни у кого из подписчиков нет активного ключа — доставлять
+                # всё равно некому. Раньше вотчер продолжал долбить Avito на
+                # полном темпе ради ads, которые тут же отбрасывались в цикле
+                # доставки: тратили бюджет запросов (и риск бана) в никуда.
+                if not self._license_skip_logged:
+                    logger.info(
+                        "[Мониторинг] %s: ни у одного подписчика нет активной лицензии — "
+                        "опрос Avito приостановлен без сетевых запросов (проверка раз в ~%dс)",
+                        names_str, int(self.interval_max),
+                    )
+                    self._license_skip_logged = True
+                self._interval = self.interval_max
+                await self._sleep_or_wake(self._poll_delay())
+                continue
+            self._license_skip_logged = False
             ads = await self._fetch_ads()
             if ads is None:
                 route_until = Watcher._route_blocked_until.get(self._route_key(), 0.0)

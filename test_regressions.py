@@ -734,6 +734,52 @@ class RegressionTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_no_active_license_skips_fetch_entirely(self):
+        # A watcher whose only subscriber's key has lapsed must not keep
+        # hitting Avito every cycle for ads nobody can receive.
+        async def scenario():
+            bot = FakeBot()
+            bot.app = FakeDeliveryApp()
+            bot.app.license = MagicMock()
+            bot.app.license.is_active.return_value = False
+            watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+            watcher.add_sub(appmod.Subscription(
+                id=1, user_id=1, search_key="key", url=watcher.url, only_new=False
+            ))
+            watcher._fetch_ads = AsyncMock(
+                side_effect=AssertionError("_fetch_ads must not be called")
+            )
+            with patch("avito_monitoring.asyncio.sleep",
+                       AsyncMock(side_effect=asyncio.CancelledError)):
+                with self.assertRaises(asyncio.CancelledError):
+                    await watcher._run()
+            watcher._fetch_ads.assert_not_called()
+            self.assertEqual(watcher._interval, watcher.interval_max)
+            watcher._client.close()
+        asyncio.run(scenario())
+
+    def test_any_active_subscriber_resumes_fetching(self):
+        async def scenario():
+            bot = FakeBot()
+            bot.app = FakeDeliveryApp()
+            bot.app.license = MagicMock()
+            bot.app.license.is_active.side_effect = lambda uid: uid == 2
+            watcher = appmod.Watcher("key", "https://www.avito.ru/moskva", bot)
+            watcher.add_sub(appmod.Subscription(
+                id=1, user_id=1, search_key="key", url=watcher.url, only_new=False
+            ))
+            watcher.add_sub(appmod.Subscription(
+                id=2, user_id=2, search_key="key", url=watcher.url, only_new=False
+            ))
+            watcher._fetch_ads = AsyncMock(return_value=[])
+            with patch("avito_monitoring.asyncio.sleep",
+                       AsyncMock(side_effect=asyncio.CancelledError)):
+                with self.assertRaises(asyncio.CancelledError):
+                    await watcher._run()
+            watcher._fetch_ads.assert_called_once()
+            watcher._client.close()
+        asyncio.run(scenario())
+
     def test_dom_fallback_ads_deliver_on_relative_timestamp(self):
         # The CSS-selector fallback in parse_html_feed sets published_exact=False
         # but does derive a timestamp from "N минут назад". only_new+START_STRICT
